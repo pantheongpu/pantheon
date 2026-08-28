@@ -72,3 +72,47 @@ def test_rt_virus_probes_for_optix_rather_than_assuming_it():
 
     makefile = Path("Makefile").read_text(encoding="utf-8")
     assert "OPTIX_PATH" in makefile, "the OptiX include path must be overridable"
+
+
+def test_no_file_forbids_its_own_redistribution():
+    """This tree is meant to be publishable, so nothing in it may carry terms
+    that prohibit redistribution.
+
+    The standing example is the NVIDIA OptiX headers, which state that
+    distribution without an express licence agreement is prohibited. They are
+    not carried here; rt_virus probes for them instead. Without a check, the
+    next vendored header to arrive would quietly make the tree unpublishable.
+    """
+    import re
+    import subprocess
+
+    # Licence text wraps mid-sentence, so match on whitespace-normalised
+    # content rather than a literal phrase -- a naive grep for the phrase finds
+    # nothing and gives false confidence.
+    forbids = re.compile(
+        r"(distribution|reproduction)[^.]{0,160}(is\s+)?strictly\s+prohibited"
+        r"|without\s+an\s+express\s+licen[sc]e\s+agreement[^.]{0,160}prohibited",
+        re.I,
+    )
+    # Files that describe licensing rather than being subject to it. They quote
+    # the prohibition on purpose; publishing them is the point.
+    describes_licensing = {"NOTICE", "LICENSE", "CONTRIBUTING.md", "SECURITY.md"}
+
+    tracked = subprocess.check_output(["git", "ls-files"], text=True).split()
+    offenders = []
+    for name in tracked:
+        path = Path(name)
+        # This file quotes the prohibition in order to test for it.
+        if path.resolve() == Path(__file__).resolve() or name in describes_licensing:
+            continue
+        try:
+            body = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if forbids.search(" ".join(body.split())):
+            offenders.append(name)
+
+    assert offenders == [], (
+        "these files forbid redistribution and cannot ship in a public tree: "
+        f"{offenders}"
+    )
