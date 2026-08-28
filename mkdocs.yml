@@ -10,7 +10,6 @@ nav:
   - AI Workloads: ai_workloads.md
   - Memory Diagnostics: memory_diagnostics.md
   - Live Benchmarks: benchmarks.md
-  - Release Process: release_process.md
 
 
 theme:

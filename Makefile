@@ -202,17 +202,3 @@ clean:
 	@echo "[CLEAN] Removing build artifacts..."
 	@rm -rf $(BUILD_DIR)
 	@rm -rf $(VENDOR_DIR)
-
-# --- Release Packaging ---
-.PHONY: release
-
-release:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "Error: VERSION is not set."; \
-		echo "Usage: make release VERSION=1.0.4"; \
-		exit 1; \
-	fi
-	@echo "============================================================"
-	@echo "[RELEASE] Packaging binary-only release artifacts for Version $(VERSION)..."
-	@echo "============================================================"
-	@VERSION="$(VERSION)" packaging/build_release_bundle.sh

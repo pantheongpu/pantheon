@@ -56,41 +56,26 @@ Pantheon is a cross-platform (CUDA/ROCm) stress testing tool designed to isolate
 
 ## Requirements
 
-### Binary Package Install
-Official releases are distributed as binary-only Debian packages. The installed command is:
+### Running From Source
+
+This repository is the source tree. It does not build installable packages or
+a standalone executable; run the checked-out runner directly:
 
 ```bash
-pantheon --test baseline_metrics --duration 10
-pantheon --test tensor_virus --duration 60 --gpu 0
+python3 pantheon.py --test baseline_metrics --duration 10
+python3 pantheon.py --test tensor_virus --duration 60 --gpu 0
 ```
 
-Pantheon auto-detects CUDA, ROCm/HIP, or mock mode at runtime. Do not pass `--platform cuda` for normal installed use.
+Pantheon auto-detects CUDA, ROCm/HIP, or mock mode at runtime. Do not pass
+`--platform cuda` for normal use.
 
-To install a downloaded package locally:
+Kernels are compiled on first use, or explicitly:
 
 ```bash
-sudo apt install ./dist/pantheongpu_1.0.19_amd64.deb
+make PLATFORM=CUDA      # NVIDIA
+make PLATFORM=HIP       # AMD
+make PLATFORM=MOCK      # CPU backend, no GPU required
 ```
-
-The public website repository can publish the same `.deb` through an APT repository so users can install with `sudo apt-get install pantheongpu`.
-
-### Uninstall
-
-If Pantheon was installed from the Debian package:
-
-```bash
-sudo apt-get remove pantheongpu
-```
-
-Use `sudo apt-get purge pantheongpu` instead to request complete package
-removal. If Pantheon was installed with a portable bundle's `install.sh`, run:
-
-```bash
-sudo ./uninstall.sh
-```
-
-Pass the same custom `PREFIX` or `BINDIR` values used during installation.
-The portable uninstaller removes the invoking user's compiled workload cache.
 
 ### Runtime Dependencies
 - **Hardware Drivers:** Latest NVIDIA or AMD Linux drivers for the target GPU.
@@ -100,7 +85,7 @@ The portable uninstaller removes the invoking user's compiled workload cache.
 
 ### Supported Linux Versions
 
-The release workflow installs and runs every release bundle in containers for:
+Upstream continuous integration builds and runs the suite in containers for:
 
 | Distribution | Minimum tested version |
 | :--- | :--- |
@@ -392,80 +377,3 @@ The website reads the checked-in `docs/assets/web_data.json` dataset. Start the 
 mkdocs serve
 ```
 Open http://127.0.0.1:8000 in your browser to view the performance leaderboard.
-
-## Creating a Release
-When cutting a new version of Pantheon, use the release workflow instead of manually zipping the repository. Official downloads are binary-only release artifacts; do not publish source archives from this private repository.
-
-### Local Release Build
-Build all binary release artifacts:
-
-```bash
-make release VERSION=1.0.19
-```
-
-This creates:
-
-```text
-dist/pantheongpu_1.0.19_amd64.deb
-dist/pantheongpu_1.0.19_amd64.tar.gz
-dist/pantheongpu_1.0.19_amd64.zip
-```
-
-The `.deb` installs binary wrappers only:
-
-```text
-/usr/bin/pantheon
-/opt/pantheongpu/bin/pantheon
-```
-
-It does not ship Python entrypoint files, kernel `.cpp` sources, or the private repository tree.
-
-Release build environment setup is documented in [docs/release_process.md](docs/release_process.md).
-
-The `.tar.gz` and `.zip` files are binary distribution bundles. They include the `.deb`, standalone binaries, `INSTALL.md`, release notes, license, and install instructions for Ubuntu/Debian, RHEL-family systems, and generic Linux. They do not include the private source tree.
-
-`build_pantheon.sh` builds the standalone binary directory without creating old-style archives by default. Official releases use `make release` / `packaging/build_release_bundle.sh` to create the curated binary bundles.
-
-### Local Install Smoke Test
-
-```bash
-sudo apt install ./dist/pantheongpu_1.0.19_amd64.deb
-pantheon --test baseline_metrics --duration 10
-pantheon --test fp64_virus --duration 30 --gpu 0
-```
-
-Remove the smoke-test installation when finished:
-
-```bash
-sudo apt remove pantheongpu
-```
-
-Do not pass `--platform cuda` for normal use. Pantheon auto-detects CUDA, ROCm/HIP, or mock mode at runtime and builds the local GPU workload binaries for the current machine.
-
-Installed Pantheon builds cache compiled workload binaries by version, platform, and GPU target under `${XDG_CACHE_HOME:-$HOME/.cache}/pantheongpu/builds/`, for example `hip-gfx942`, `hip-gfx950`, or `cuda-86`. To use a different writable cache:
-
-```bash
-PANTHEON_BUILD_CACHE_DIR="$HOME/.cache/pantheongpu/builds" pantheon --test baseline_metrics --duration 10
-```
-
-### Official GitHub Release
-Update `VERSION`, commit the change, and push the branch:
-```bash
-printf "1.0.19\n" > VERSION
-git add VERSION
-git commit -m "Bump version to 1.0.19"
-git push
-```
-The release workflow runs tests, builds docs, compiles mock kernels, builds portable GLIBC 2.28 release artifacts, and tests the exact candidate across the supported Linux matrix. Only after every compatibility job passes does it create the matching `v<version>` tag and publish the `.deb`, `.tar.gz`, `.zip`, and `SHA256SUMS` files.
-
-After publishing the Pantheon GitHub Release, the workflow also dispatches a website release event to `pantheongpu/pantheongpu_website`. Configure the `PANTHEON_WEBSITE_RELEASE_TOKEN` repository secret with permission to create repository dispatch events in the website repo. The website workflow should listen for:
-```yaml
-on:
-  repository_dispatch:
-    types: [pantheongpu_released]
-```
-
-To verify downloaded release files:
-```bash
-sha256sum -c SHA256SUMS
-```
