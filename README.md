@@ -1,55 +1,3 @@
-[![Daily container workload smoke tests](https://github.com/pantheongpu/pantheongpu/actions/workflows/daily-container-smoke.yml/badge.svg?branch=main)](https://github.com/pantheongpu/pantheongpu/actions/workflows/daily-container-smoke.yml)
-
-<!-- DAILY_SMOKE_STATUS:START -->
-### Daily container smoke status
-
-Last completed: [2026-08-27 15:57 UTC](https://github.com/pantheongpu/pantheongpu/actions/runs/33086925129)<br>
-Result: **14/14 passed**. These are short mock-backend checks of every workload inside disposable containers.
-
-| Operating system | Latest result |
-| --- | --- |
-| AlmaLinux 8 | ✅ Passed |
-| AlmaLinux 9 | ✅ Passed |
-| CentOS Stream 9 | ✅ Passed |
-| Debian 11 | ✅ Passed |
-| Debian 12 | ✅ Passed |
-| Fedora 43 | ✅ Passed |
-| Fedora 44 | ✅ Passed |
-| RHEL UBI 8 | ✅ Passed |
-| RHEL UBI 9 | ✅ Passed |
-| Rocky Linux 8 | ✅ Passed |
-| Rocky Linux 9 | ✅ Passed |
-| Ubuntu 20.04 | ✅ Passed |
-| Ubuntu 22.04 | ✅ Passed |
-| Ubuntu 24.04 | ✅ Passed |
-<!-- DAILY_SMOKE_STATUS:END -->
-
-<!-- TOOLKIT_MATRIX_STATUS:START -->
-### Toolkit compile matrix
-
-Last completed: [2026-08-25 21:34 UTC](https://github.com/pantheongpu/pantheongpu/actions/runs/32898044184)<br>
-Result: **8/8 passed**. Weekly compile-only builds of every kernel against real CUDA and ROCm toolchains in disposable containers.
-
-| Toolkit | Latest result |
-| --- | --- |
-| CUDA 11.8 | ✅ Passed |
-| CUDA 12.4 | ✅ Passed |
-| CUDA 12.6 | ✅ Passed |
-| CUDA 12.8 | ✅ Passed |
-| CUDA 13.0 | ✅ Passed |
-| CUDA 13.2 | ✅ Passed |
-| ROCm 6.4 (gfx942) | ✅ Passed |
-| ROCm 7.1 (gfx942) | ✅ Passed |
-<!-- TOOLKIT_MATRIX_STATUS:END -->
-
-## Disclaimer: Data Sources & Affiliation
-
-> **Important:** The performance metrics and benchmark data displayed on the **Pantheon Leadership Board** are generated from independent testing conducted on physical hardware instances sourced from third-party cloud compute providers, including but not limited to **Vast.ai** and **Runpod.io**.
-
-* **Independent Methodology:** These results represent the physical limits and performance characteristics of hardware as deployed in public data center environments.
-* **Non-Official Data:** This data is **not** generated, verified, or endorsed by internal **AMD** or **NVIDIA** engineering teams. These benchmarks are conducted independently of official vendor performance labs.
-* **Environment Variance:** Metrics reflect the specific driver versions, power limits, and thermal conditions provided by the respective cloud platforms at the time of execution.
-
 # Pantheon: Universal GPU Stress & Diagnostics Suite
 
 Pantheon is a cross-platform (CUDA/ROCm) stress testing tool designed to isolate and hammer specific GPU subsystems. Unlike generic benchmarks (Furmark, 3DMark), Pantheon allows you to test specific silicon limits.
@@ -83,23 +31,6 @@ make PLATFORM=MOCK      # CPU backend, no GPU required
 - **System tools:** `make` and a C++ compiler such as `g++`.
 - **Linux compatibility:** Official x86-64 binaries are built in a `manylinux_2_28` environment and require GLIBC 2.28 or newer.
 
-### Supported Linux Versions
-
-Upstream continuous integration builds and runs the suite in containers for:
-
-| Distribution | Minimum tested version |
-| :--- | :--- |
-| Ubuntu | 20.04 LTS |
-| Debian | 11 |
-| Red Hat Enterprise Linux | RHEL UBI 8 |
-| CentOS | CentOS Stream 9 |
-| RHEL-compatible rebuilds | Rocky Linux 8 and AlmaLinux 8 |
-| Fedora | Current supported release |
-
-CI runs these checks as a parallel release matrix and also tests newer Ubuntu, Debian, RHEL UBI, CentOS Stream, Rocky Linux, and AlmaLinux versions. Red Hat UBI is the publicly available RHEL userspace used for RHEL compatibility validation. Other x86-64 distributions should work when they provide GLIBC 2.28 or newer, `make`, and a C++ compiler. Container checks run the mock backend; native CUDA or ROCm use still requires a compatible vendor driver and toolkit on the target host.
-
-Building against the oldest supported GLIBC baseline is intentional: binaries compiled directly on Ubuntu 24.04 can import symbols unavailable on older systems. CI scans the launcher and every embedded ELF library and rejects releases requiring GLIBC newer than 2.28.
-
 ### Compiler Requirements
 To run stress tests natively (and avoid **Mock Mode**), you must have the backend compiler for your specific GPU architecture installed:
 
@@ -119,54 +50,38 @@ sudo apt-get install hipcc
 
 ## Quick Start
 ```bash
-pantheon --version
+python3 pantheon.py --version
 
 # Run a specific "Power Virus" test
-pantheon --test tensor_virus --duration 60
+python3 pantheon.py --test tensor_virus --duration 60
 
 # Run a specific "VRM Cracker" test
-pantheon --test pulse_virus --duration 60
+python3 pantheon.py --test pulse_virus --duration 60
 
 # Run the inference-path stress suite on GPU 0
- pantheon --test inference --duration 60 --gpu 0 --mem 50
+ python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50
 ```
 
-## Inference-path stress tests
+## AI and inference workloads
 
-Pantheon's `inference` suite targets the GPU execution and memory patterns that
-are important to LLM serving. These are diagnostic workloads, not model
-benchmarks: they do not load model weights, measure model quality, or replace
-an end-to-end server benchmark such as vLLM or TensorRT-LLM.
-
-| Test | Focus | Primary result |
-| --- | --- | --- |
-| `llm_decode` | Autoregressive token generation with dependent KV-cache gathers and small projection-like math | `tokens/s` |
-| `llm_prefill` | Long-prompt processing with causal attention-style scans and projection-like math | `prompt-tokens/s` |
-| `kv_cache_churn` | Paged/ragged KV-cache reads and updates | `cache-updates/s` |
-
-Additional AI suites are available for attention, RoPE, quantized projection,
-mixed serving pressure, speculative decode, MoE routing, training-step pressure,
-runtime allocation/graph behavior, RAG embedding, and vision encoding. See
-[`docs/ai_workloads.md`](docs/ai_workloads.md) for commands and limitations.
-
-Run the suite or an individual test:
+The `inference`, `training` and `ai_auxiliary` suites exercise GPU execution
+and memory patterns relevant to model serving. They are diagnostic workloads,
+not model benchmarks: they load no weights, measure no model quality, and do
+not replace an end-to-end benchmark such as vLLM or TensorRT-LLM.
 
 ```bash
- pantheon --test inference --duration 60 --gpu 0 --mem 50
-pantheon --test llm_decode --duration 60 --gpu 0 --mem 50 --profile
+python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50
 ```
 
-`--mem` chooses the percentage of currently free VRAM reserved for the
-workload's synthetic context or KV-cache store. Begin with `--mem 25` on a GPU
-that is also serving workloads. Use `--profile` to correlate the result with
-SM activity, cache behavior, DRAM traffic, power, clocks, and throttling.
+See [`docs/ai_workloads.md`](docs/ai_workloads.md) for what each workload
+stresses and what its reported rate does and does not mean.
 
 ## Hardware Counter Profiling
 
 Add `--profile` to wrap each workload in the native vendor profiler:
 
 ```bash
-pantheon --test tensor_virus --duration 30 --gpu 0 --profile
+python3 pantheon.py --test tensor_virus --duration 30 --gpu 0 --profile
 ```
 
 `--profile` is an exhaustive diagnostic mode. Pantheon profiles every selected
@@ -235,69 +150,17 @@ different `--init_pattern`).
 
 ## Memory Diagnostics
 
-The bandwidth workloads answer "does this GPU move data correctly at speed".
-The `diagnostics` suite answers a different question — "**which cell is bad, and
-why**" — using structured patterns from memory-test literature rather than
-whichever access order runs fastest.
+The `diagnostics` suite looks for defective cells rather than measuring
+bandwidth: `march_test`, `memory_hammer`, `galpat`, `memory_retention` and
+`ras_validator`.
 
 ```bash
-pantheon --suite diagnostics --duration 300 --gpu 0 --mem 90
+python3 pantheon.py --suite diagnostics --duration 300 --gpu 0 --mem 90
 ```
 
-| Workload | Fault class | Cost |
-| :--- | :--- | :--- |
-| `march_test` | Stuck-at, transition, and coupling faults, via an ordered March C- sequence in both address directions | Linear |
-| `memory_hammer` | Disturbance — a victim cell that changes because of reads to its neighbours | Linear |
-| `galpat` | Address-decoder faults and coupling between arbitrary cell pairs, exhaustively within a region | Quadratic, so region-bounded |
-| `memory_retention` | Charge loss over time, with the payload left untouched | Linear |
-| `ras_validator` | Platform ECC/RAS counters agreeing with observed corruption | Linear |
-
-These compose as a funnel: run `march_test` and `memory_hammer` across all of
-memory to find suspect addresses cheaply, then aim `galpat` at the implicated
-region with `--region_offset` for the exhaustive check. Use `--fault_map` at
-every stage so the addresses carry from one to the next.
-
-Two caveats worth reading before trusting a result:
-
-* `memory_hammer` prints its aggressor footprint against the L2 size at
-  startup. If the footprint fits in L2 the reads never reach DRAM and the run
-  proves nothing — see `kernels/memory_hammer/README.md`.
-* `galpat` covers only the region it prints at startup, not all of memory.
-
-## Data Backgrounds (`--init_pattern`)
-
-Memory workloads take `--init_pattern` to select the data background written
-before verification. A cell can pass under one background and fail under
-another, so the pattern is a variable to sweep rather than a setting to pick
-once.
-
-| Name | Number | Background | Targets |
-| :--- | :--- | :--- | :--- |
-| `zeros` | 0 | All zeros | Stuck-at-1 cells |
-| `ones` | 1 | All ones | Stuck-at-0 cells |
-| `crosstalk` | 2 | `0xAAAA…`/`0x5555…` + entropy | Coupling between adjacent lines |
-| `rail_to_rail` | 3 | `0x0000…`/`0xFFFF…` + entropy | Maximum switching activity, worst-case droop |
-| `checkerboard` | 4 | `0xAAAA…`/`0x5555…`, no entropy | Adjacent-cell coupling |
-| `walking_ones` | 5 | One bit set per word | A single bit walking by address |
-| `walking_zeros` | 6 | One bit clear per word | A single bit walking by address |
-
-Names are the preferred form — `--init_pattern crosstalk` says what it does
-where `--init_pattern 2` has to be looked up. Matching ignores case and
-`-`/`_`, so `rail_to_rail`, `rail-to-rail`, and `railtorail` are the same
-background. The numbers still parse, so existing scripts and recorded fault
-maps keep working, and fault maps record both.
-
-An unrecognised name is refused with the list of valid ones rather than
-falling back to a default, because a typo silently testing zeros is worse than
-a run that will not start.
-
-Patterns 4-6 are deliberately not mixed with entropy: a checkerboard only
-exposes coupling if neighbouring values are actually complementary, and a
-walking pattern only walks if exactly one bit moves per address. `crosstalk`
-and `rail_to_rail` are reachable as the `memory_read_agg` and
-`memory_write_agg` aliases. All backgrounds come from one shared selector in
-`kernels/common/common.h`, so a pattern means the same thing in every workload
-that writes and verifies it.
+See [`docs/memory_diagnostics.md`](docs/memory_diagnostics.md) for what each
+one finds, how they compose as a funnel, the full `--init_pattern` table, and
+the caveats that decide whether a result means anything.
 
 ## Reliability checks on every run
 
@@ -320,18 +183,12 @@ Override or extend the default sets without editing the source:
 ```bash
 # Replace the NVIDIA metric list entirely
 PANTHEON_CUDA_METRICS="sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes_read.sum" \
-  pantheon --test memory_read --duration 30 --profile
+  python3 pantheon.py --test memory_read --duration 30 --profile
 
 # Add one AMD counter to Pantheon's default list
 PANTHEON_HIP_METRICS_APPEND="CUSTOM_COUNTER_NAME" \
-  pantheon --test memory_write --duration 30 --profile
+  python3 pantheon.py --test memory_write --duration 30 --profile
 ```
-
-## Tuning
-
-Automated tuning has been removed from this repository to keep Pantheon focused on the core GPU stress runner. A separate tuning repository may be created later.
-
-Detailed test documentation is maintained alongside each workload under `kernels/<test>/README.md`.
 
 ## Interpretation of Results
 
@@ -362,3 +219,16 @@ an active workload, so a results publisher can safely copy them while the
 remaining queue is still running. The aggregate report is still written at the
 end of the run. Reports marked `partial`, `failed`, or `incomplete` are
 excluded by downstream importers.
+
+## Per-workload documentation
+
+Each workload has its own page under `kernels/<test>/README.md` describing what
+it stresses, how to read a failure, and what its reported metric does not mean.
+
+## Disclaimer
+
+Pantheon is an independent project. It is not generated, verified, or endorsed
+by **AMD** or **NVIDIA**, and its results are not produced by official vendor
+performance labs. Measurements reflect the driver versions, power limits and
+thermal conditions of whatever machine they were taken on, so figures from
+different environments are not directly comparable.

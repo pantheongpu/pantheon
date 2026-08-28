@@ -6,7 +6,7 @@ why** — using structured patterns from memory-test literature rather than
 whichever access order happens to run fastest.
 
 ```bash
-pantheon --suite diagnostics --duration 300 --gpu 0 --mem 90
+python3 pantheon.py --suite diagnostics --duration 300 --gpu 0 --mem 90
 ```
 
 | Workload | Fault class | Cost |
@@ -24,7 +24,7 @@ addresses cheaply, then aim the quadratic one at what they implicate:
 
 ```bash
 # 1. Cheap, full-coverage sweep. Record every failing address.
-pantheon --test march_test --duration 600 --gpu 0 --mem 90 --verify
+python3 pantheon.py --test march_test --duration 600 --gpu 0 --mem 90 --verify
 ./build/memory_hammer 0 600 90 --verify --fault_map hammer.csv
 
 # 2. Exhaustive check of one implicated region.

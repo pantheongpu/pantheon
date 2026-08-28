@@ -12,10 +12,10 @@ end-to-end service benchmarks.
 | `ai_auxiliary` | `rag_embedding`, `vision_encoder` | Embedding and vision-encoder projection pressure. |
 
 ```bash
-pantheon --test inference --duration 60 --gpu 0 --mem 50 --verify --profile
-pantheon --test training --duration 60 --gpu 0 --mem 50 --verify --profile
-pantheon --test runtime --duration 60 --gpu 0 --mem 25 --verify --profile
-pantheon --test ai_auxiliary --duration 60 --gpu 0 --mem 50 --verify --profile
+python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50 --verify --profile
+python3 pantheon.py --test training --duration 60 --gpu 0 --mem 50 --verify --profile
+python3 pantheon.py --test runtime --duration 60 --gpu 0 --mem 25 --verify --profile
+python3 pantheon.py --test ai_auxiliary --duration 60 --gpu 0 --mem 50 --verify --profile
 ```
 
 `--mem` reserves a percentage of currently free VRAM for the synthetic working

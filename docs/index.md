@@ -10,7 +10,7 @@ maintenance. The workloads are diagnostic stress tests, not end-to-end model
 or model-quality benchmarks.
 
 ```bash
-pantheon --test inference --duration 60 --gpu 0 --mem 50 --verify --profile
+python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50 --verify --profile
 ```
 
 | Workload | Focus | Result |
