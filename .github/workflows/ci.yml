@@ -1,0 +1,113 @@
+name: CI
+
+# Runs entirely on GitHub-hosted runners with no GPU. That is deliberate: this
+# repository must be buildable and testable by anyone, so CI may not depend on
+# self-hosted hardware.
+#
+# What this cannot cover, and what still needs a real GPU:
+#   * verification against actual silicon
+#   * concurrency nondeterminism. The mock backend runs a single logical
+#     thread, so atomic ordering there is trivially deterministic. A kernel
+#     whose result depends on execution order verifies clean under mock and
+#     fails on hardware -- that class of bug is invisible here by construction.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and mock backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Build mock backend
+        run: |
+          make PLATFORM=MOCK -j"$(nproc)"
+          count="$(ls build | grep -vc '^\.')"
+          echo "Built ${count} binaries"
+          # A silently short build would otherwise pass every check below.
+          if [ "${count}" -lt 40 ]; then
+            echo "::error::Expected at least 40 binaries, built ${count}"
+            exit 1
+          fi
+
+      - name: Smoke test the runner
+        run: python3 pantheon.py --test baseline_metrics --duration 5 --mem 5
+
+      - name: Verification must pass clean and fail on an injected fault
+        run: |
+          # The point of this step is the second half. A workload whose
+          # verification silently does nothing passes the clean run too, so only
+          # the injected case proves the check is wired up.
+          fail=0
+          for w in memory_read memory_write march_test galpat memory_hammer \
+                   atomic_virus llm_decode moe_router allocation_fragmentation; do
+            if ! ./build/"$w" 0 2 5 --verify >/tmp/clean.log 2>&1; then
+              echo "::error::${w} failed a clean verification"; fail=1; continue
+            fi
+            if ./build/"$w" 0 2 5 --verify --inject_error >/tmp/inj.log 2>&1; then
+              if ! grep -q "Verification: FAIL\|SDC FAULT" /tmp/inj.log; then
+                echo "::error::${w} did not detect its injected fault"; fail=1
+              fi
+            fi
+          done
+          exit "${fail}"
+
+      - name: Documentation builds
+        run: python -m mkdocs build --strict
+
+  cuda-compile:
+    name: CUDA compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - name: Bootstrap container
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git make g++ findutils
+
+      - uses: actions/checkout@v4
+
+      # No GPU here, and none needed: nvcc compiles without one. Architecture
+      # detection finds no nvidia-smi and falls back to a default, and OptiX is
+      # absent so rt_virus builds its dummy kernel. This catches the syntax and
+      # intrinsic errors the mock backend's stubs hide -- a device intrinsic
+      # missing from the mock still has to compile for real hardware.
+      - name: Compile every kernel for CUDA
+        run: |
+          make PLATFORM=CUDA -j"$(nproc)"
+          count="$(ls build | grep -vc '^\.')"
+          echo "Compiled ${count} binaries"
+          if [ "${count}" -lt 40 ]; then
+            echo "::error::Expected at least 40 binaries, compiled ${count}"
+            exit 1
+          fi
