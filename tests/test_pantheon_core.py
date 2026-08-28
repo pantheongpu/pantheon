@@ -1184,8 +1184,9 @@ def test_documented_init_patterns_are_all_implemented():
     repo = Path(__file__).resolve().parent.parent
     selector = (repo / "kernels" / "common" / "common.h").read_text()
     body = selector[selector.index("pantheon_pattern_value"):]
-    documented = re.findall(r"^\| `[a-z_]+` \| (\d) \|", (repo / "README.md").read_text(), re.M)
-    assert documented, "README no longer documents an --init_pattern table"
+    patterns_doc = (repo / "docs" / "memory_diagnostics.md").read_text()
+    documented = re.findall(r"^\| `[a-z_]+` \| (\d) \|", patterns_doc, re.M)
+    assert documented, "docs/memory_diagnostics.md no longer documents an --init_pattern table"
     handled = set(re.findall(r"case (\d+):", body))
     # 2 and 3 fall through to pantheon_pattern_base rather than having a case arm.
     handled |= {"2", "3"}
@@ -1216,8 +1217,9 @@ def test_pattern_names_resolve_to_the_numbers_the_aliases_replaced():
     assert mapping["zeros"] == 0 and mapping["ones"] == 1
 
     # Every name the README documents must exist in the header table.
-    documented = set(re.findall(r"^\| `([a-z_]+)` \| \d+ \|", (repo / "README.md").read_text(), re.M))
-    assert documented, "README no longer documents a named pattern table"
+    patterns_doc = (repo / "docs" / "memory_diagnostics.md").read_text()
+    documented = set(re.findall(r"^\| `([a-z_]+)` \| \d+ \|", patterns_doc, re.M))
+    assert documented, "docs/memory_diagnostics.md no longer documents a named pattern table"
     assert documented <= set(mapping), f"documented but unknown: {documented - set(mapping)}"
 
 
