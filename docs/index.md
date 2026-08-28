@@ -19,8 +19,3 @@ pantheon --test inference --duration 60 --gpu 0 --mem 50 --verify --profile
 | `llm_prefill` | Causal context scans and projection-like work | `prompt-tokens/s` |
 | `kv_cache_churn` | Paged/ragged cache reads and updates | `cache-updates/s` |
 
-Use the benchmark page to inspect the checked-in `docs/assets/web_data.json` dataset:
-
-```bash
-mkdocs serve
-```

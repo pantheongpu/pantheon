@@ -3,7 +3,6 @@ pandas
 openpyxl
 numpy
 cmake
-nuitka
 mkdocs-material
 nvidia-ml-py
 pytest

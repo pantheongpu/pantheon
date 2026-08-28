@@ -9,7 +9,6 @@ nav:
   - Home: index.md
   - AI Workloads: ai_workloads.md
   - Memory Diagnostics: memory_diagnostics.md
-  - Live Benchmarks: benchmarks.md
 
 
 theme:
@@ -60,6 +59,3 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
-extra_javascript:
-  - https://cdn.jsdelivr.net/npm/apexcharts
-  - js/charts.js

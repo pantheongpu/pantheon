@@ -455,23 +455,6 @@ def test_detect_build_target_skips_rocm_cpu_agent(monkeypatch):
     assert pantheon.detect_build_target("HIP") == "gfx90a"
 
 
-def test_nuitka_packaged_app_uses_user_build_cache(monkeypatch, tmp_path):
-    cache_home = tmp_path / "cache"
-
-    monkeypatch.setitem(pantheon.__dict__, "__compiled__", object())
-    monkeypatch.setattr(pantheon, "BUILD_DIR", pantheon.BUILD_DIR)
-    monkeypatch.setattr(pantheon, "BUILD_CACHE_FILE", pantheon.BUILD_CACHE_FILE)
-    monkeypatch.setattr(pantheon, "PANTHEON_VERSION", "9.9.9")
-    monkeypatch.delenv("PANTHEON_BUILD_CACHE_DIR", raising=False)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
-
-    build_dir = pantheon.configure_build_directory("MOCK")
-
-    assert build_dir == str(cache_home / "pantheongpu" / "builds" / "9.9.9" / "mock-mock")
-    assert pantheon.BUILD_CACHE_FILE == str(
-        cache_home / "pantheongpu" / "builds" / "9.9.9" / "mock-mock" / ".pantheon_build_cache.json"
-    )
-
 
 def test_build_kernels_passes_selected_build_dir_to_make(tmp_path, monkeypatch):
     base = tmp_path / "base"

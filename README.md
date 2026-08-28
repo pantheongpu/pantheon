@@ -353,27 +353,12 @@ The summary report (`results/<timestamp>/summary.xlsx`) contains detailed "Pro" 
     * For `memory_read` / `memory_write`, this should be within 90% of your card's theoretical max bandwidth.
     * Low throughput = Memory Controller instability or aggressive error correction (ECC) kicking in.
 
-## Website Dashboard
+## Incremental Reports
 
-For long `--test all` runs, Pantheon also writes one atomic
+For long `--test all` runs, Pantheon writes one atomic
 `database/pantheon_report_<run>_<sequence>_<workload>_gpu<id>.json` file when
 each workload finishes. These are complete workload records, not snapshots of
 an active workload, so a results publisher can safely copy them while the
-remaining queue is still running. The aggregate report is still written at
-the end of the run. Reports marked `partial`, `failed`, or `incomplete` remain
-excluded by the website importer.
-
-Pantheon includes a built-in web dashboard to visualize your benchmark results and compare different GPUs.
-
-### 1. Install Dependencies
-The dashboard is built with MkDocs. Install the Python dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Run Local Server
-The website reads the checked-in `docs/assets/web_data.json` dataset. Start the live preview server:
-```bash
-mkdocs serve
-```
-Open http://127.0.0.1:8000 in your browser to view the performance leaderboard.
+remaining queue is still running. The aggregate report is still written at the
+end of the run. Reports marked `partial`, `failed`, or `incomplete` are
+excluded by downstream importers.
