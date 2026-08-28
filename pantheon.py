@@ -1744,13 +1744,18 @@ def throughput_variance_percent(out):
 
 def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats, status="PASS", commands=None, profile_commands=None, profile_files=None, counter_summary=None, throughput_variance="N/A"):
     eff = 0
-    if throughput != "N/A" and stats.get("avg_pwr", 0) > 0:
+    # avg_pwr is "N/A" when the card exposed no power sensor, so this cannot
+    # assume a number. Comparing a string to 0 raises in Python 3.
+    avg_pwr = stats.get("avg_pwr", 0)
+    if not isinstance(avg_pwr, (int, float)):
+        avg_pwr = 0
+    if throughput != "N/A" and avg_pwr > 0:
         if unit == "GB/s":
-            eff = round((throughput * 1024) / stats.get("avg_pwr"), 2)
+            eff = round((throughput * 1024) / avg_pwr, 2)
         elif unit == "TFLOPS":
-            eff = round((throughput * 1000) / stats.get("avg_pwr"), 2)
+            eff = round((throughput * 1000) / avg_pwr, 2)
         else:
-            eff = round(throughput / stats.get("avg_pwr"), 2)
+            eff = round(throughput / avg_pwr, 2)
 
     row = {
         "Test Name": test_name,

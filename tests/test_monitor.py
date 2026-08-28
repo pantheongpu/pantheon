@@ -22,10 +22,15 @@ def test_mock_monitor_is_cpu_only_and_writes_named_time_series(tmp_path, monkeyp
     stats = monitor.stop_collection()
 
     assert monitor.get_gpu_count() == 1
-    assert stats[0]["avg_temp"] == 0
-    assert stats[0]["avg_pwr"] == 0
-    assert stats[0]["avg_gpu_util"] == 0
-    assert stats[0]["peak_mem_used"] == 0
+    # The mock backend has no GPU, so no sensor is ever read. These report
+    # "N/A" rather than 0 for the same reason a card with no memory-temperature
+    # sensor does: a number here would be a measurement nobody took.
+    assert stats[0]["avg_temp"] == "N/A"
+    assert stats[0]["avg_pwr"] == "N/A"
+    assert stats[0]["avg_gpu_util"] == "N/A"
+    assert stats[0]["peak_mem_used"] == "N/A"
+    # Energy is integrated from the power series, so an empty series gives 0
+    # joules rather than "unknown" -- no power was drawn by a GPU that is not there.
     assert stats[0]["energy_wh"] == 0
 
     with (tmp_path / "time_series.csv").open(newline="", encoding="utf-8") as f:
@@ -142,3 +147,53 @@ def test_amd_poll_prefers_junction_temperature_over_edge(monkeypatch):
 
     assert monitor.history[0]["temp_core"] == [91.0]
     assert monitor.history[0]["temp_mem"] == [82.0]
+
+
+def test_absent_sensor_reports_na_not_zero():
+    """A sensor the card does not have must not become a reading of zero.
+
+    Appending 0 when NVML raised made "no memory-temperature sensor"
+    indistinguishable from "VRAM at 0 C". The published leaderboard carried
+    that zero for 1234 of 1315 rows, next to guidance telling readers to keep
+    memory temperature under 100 C.
+    """
+    mon = HardwareMonitor("MOCK")
+    mon.history = {
+        0: {
+            "temp_core": [60.0, 62.0, 64.0],
+            "temp_mem": [],          # this card has no memory temperature sensor
+            "pwr": [100.0, 110.0, 120.0],
+            "clk_core": [1800, 1800, 1750],
+            "fan_pct": [40, 42, 44],
+            "gpu_util": [99, 99, 98],
+            "elapsed": [0.0, 1.0, 2.0],
+            "throttle": ["None", "None", "None"],
+            "pcie_gen": [4, 4, 4],
+            "pcie_width": [16, 16, 16],
+            "temp_hotspot": [],
+            "volts_core": [],
+            "volts_soc": [],
+            "mem_used": [100, 100, 100],
+        }
+    }
+    stats = mon._aggregate()[0]
+
+    assert stats["avg_mem_temp"] == "N/A"
+    assert stats["max_mem_temp"] == "N/A"
+    # Sensors that did report must still produce numbers.
+    assert stats["avg_temp"] == 62.0
+    assert stats["max_pwr"] == 120.0
+
+
+def test_efficiency_survives_an_absent_power_sensor():
+    """avg_pwr is "N/A" when no power sensor exists, and comparing a string to
+    a number raises in Python 3. This crashed the run rather than skipping the
+    efficiency figure."""
+    import pantheon
+
+    row = pantheon.build_result_row("memory_read", 0, 10, 50, 340.0, "GB/s",
+                                    {"avg_pwr": "N/A"})
+    assert row is not None
+    row_ok = pantheon.build_result_row("memory_read", 0, 10, 50, 340.0, "GB/s",
+                                       {"avg_pwr": 250.0})
+    assert row_ok is not None
