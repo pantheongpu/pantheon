@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory TSV Thrasher flow</title><desc id="desc">Animated diagram showing high-low bus toggling across memory traces.</desc>
+  <style>.bg{fill:#101820}.t{font:16px monospace;fill:#f9fafb}.s{font:13px monospace;fill:#d1d5db}.trace{stroke:#60a5fa;stroke-width:8;stroke-linecap:round}.pulse{fill:#facc15}</style>
+  <rect class="bg" width="820" height="220"/><text class="t" x="80" y="52">Alternating HIGH / LOW vector stores</text>
+  <line class="trace" x1="100" y1="95" x2="720" y2="95"/><line class="trace" x1="100" y1="130" x2="720" y2="130"/><line class="trace" x1="100" y1="165" x2="720" y2="165"/>
+  <rect class="pulse" x="110" y="84" width="36" height="22" rx="3"><animate attributeName="x" values="110;680;110" dur="1.2s" repeatCount="indefinite"/><animate attributeName="fill" values="#facc15;#111827;#facc15" dur="0.6s" repeatCount="indefinite"/></rect>
+  <text class="s" x="255" y="202">Goal: maximize physical trace toggle rate and crosstalk</text>
+</svg>

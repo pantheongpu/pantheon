@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">P2P Thrasher execution flow</title>
+  <desc id="desc">Animated diagram showing bidirectional peer-to-peer DMA between two GPUs.</desc>
+  <style>
+    .bg{fill:#111827}.gpu{fill:#1f2937;stroke:#c084fc;stroke-width:3}.text{font:17px monospace;fill:#faf5ff}.small{font:13px monospace;fill:#e9d5ff}.link{stroke:#c084fc;stroke-width:8;stroke-linecap:round}.packet{fill:#22d3ee}.verify{fill:#facc15}
+  </style>
+  <rect class="bg" width="900" height="260"/>
+  <rect class="gpu" x="70" y="65" width="230" height="130" rx="10"/>
+  <text class="text" x="128" y="110">GPU N</text>
+  <text class="small" x="112" y="145">source buffer</text>
+  <rect class="gpu" x="600" y="65" width="230" height="130" rx="10"/>
+  <text class="text" x="650" y="110">GPU N+1</text>
+  <text class="small" x="642" y="145">peer buffer</text>
+  <line class="link" x1="300" y1="112" x2="600" y2="112"/>
+  <line class="link" x1="600" y1="156" x2="300" y2="156"/>
+  <text class="small" x="390" y="88">NVLink / PCIe P2P</text>
+  <rect class="packet" x="314" y="101" width="34" height="22" rx="3">
+    <animate attributeName="x" values="314;552;314" dur="1.6s" repeatCount="indefinite"/>
+  </rect>
+  <rect class="packet" x="552" y="145" width="34" height="22" rx="3">
+    <animate attributeName="x" values="552;314;552" dur="1.6s" repeatCount="indefinite"/>
+  </rect>
+  <circle class="verify" cx="185" cy="180" r="8">
+    <animate attributeName="opacity" values="0.25;1;0.25" dur="1.4s" repeatCount="indefinite"/>
+  </circle>
+  <text class="small" x="288" y="230">Goal: saturate bidirectional peer DMA and catch link/data corruption</text>
+</svg>

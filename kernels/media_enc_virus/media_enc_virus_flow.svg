@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Media Encode Virus flow</title><desc id="desc">Animated diagram showing frame generation, NVENC encode, and bitstream verification.</desc>
+  <style>.bg{fill:#111827}.box{fill:#1f2937;stroke:#f59e0b;stroke-width:2}.t{font:16px monospace;fill:#fffbeb}.s{font:13px monospace;fill:#fde68a}.a{stroke:#f59e0b;stroke-width:4;marker-end:url(#m)}.p{fill:#22d3ee}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#f59e0b"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="45" y="65" width="170" height="90" rx="8"/><text class="t" x="78" y="105">ARGB Frame</text><text class="s" x="78" y="130">4K gradient</text>
+  <rect class="box" x="315" y="65" width="170" height="90" rx="8"/><text class="t" x="360" y="105">NVENC</text><text class="s" x="345" y="130">HEVC IDR</text>
+  <rect class="box" x="595" y="65" width="175" height="90" rx="8"/><text class="t" x="635" y="105">Bitstream</text><text class="s" x="630" y="130">verify bytes</text>
+  <line class="a" x1="215" y1="110" x2="315" y2="110"/><line class="a" x1="485" y1="110" x2="595" y2="110"/>
+  <rect class="p" x="242" y="98" width="26" height="24" rx="3"><animate attributeName="x" values="242;555;242" dur="1.8s" repeatCount="indefinite"/></rect>
+</svg>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Cache Fracture flow</title><desc id="desc">Animated diagram showing threads split across separate cache lines.</desc>
+  <style>.bg{fill:#111827}.t{font:16px monospace;fill:#f9fafb}.s{font:13px monospace;fill:#d1d5db}.line{fill:#374151;stroke:#22d3ee;stroke-width:2}.p{fill:#fb7185}</style>
+  <rect class="bg" width="820" height="220"/><text class="t" x="70" y="48">256-byte separated thread reads</text>
+  <rect class="line" x="80" y="85" width="120" height="44"/><rect class="line" x="250" y="85" width="120" height="44"/><rect class="line" x="420" y="85" width="120" height="44"/><rect class="line" x="590" y="85" width="120" height="44"/>
+  <text class="s" x="108" y="112">line A</text><text class="s" x="278" y="112">line B</text><text class="s" x="448" y="112">line C</text><text class="s" x="618" y="112">line D</text>
+  <circle class="p" cx="140" cy="155" r="7"><animate attributeName="cx" values="140;310;480;650;140" dur="1.7s" repeatCount="indefinite"/></circle>
+  <text class="s" x="250" y="185">Goal: defeat coalescing and fan out fetch queues</text>
+</svg>

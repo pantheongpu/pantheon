@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" role="img" aria-labelledby="title desc">
+  <title id="title">RT Virus execution flow</title>
+  <desc id="desc">Animated diagram showing geometry initialization, repeated BVH builds, and AABB verification.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#cbd5e1"/></marker>
+    <filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <style>.label{fill:#f8fafc;font:700 19px Arial,sans-serif}.small{fill:#cbd5e1;font:14px Arial,sans-serif}.box{fill:#0f172a;stroke:#64748b;stroke-width:2;rx:8}.lane{stroke:#cbd5e1;stroke-width:3;fill:none;marker-end:url(#arrow)}</style>
+  </defs>
+  <rect width="900" height="360" fill="#111827"/>
+  <text x="32" y="42" class="label">RT Virus: repeated BVH build pressure</text>
+  <text x="32" y="66" class="small">Generated triangle geometry is fed into hardware/API acceleration builds to stress RT/fixed-function paths.</text>
+  <rect x="50" y="116" width="176" height="90" class="box"/><text x="86" y="150" class="label">Geometry</text><text x="76" y="176" class="small">triangles + spread</text>
+  <rect x="350" y="88" width="220" height="146" class="box"/><text x="400" y="126" class="label">BVH build</text><text x="382" y="152" class="small">kernel_loops per sync</text>
+  <polygon points="438,180 470,136 504,180" fill="#f97316" filter="url(#glow)"><animateTransform attributeName="transform" type="scale" values="1;1.08;1" dur="1.5s" repeatCount="indefinite" additive="sum"/></polygon>
+  <rect x="704" y="116" width="150" height="90" class="box"/><text x="746" y="150" class="label">AABB</text><text x="726" y="176" class="small">bounds output</text>
+  <path d="M226 162 C284 162 304 162 350 162" class="lane"/><path d="M570 162 C626 162 650 162 704 162" class="lane"/>
+  <circle r="10" fill="#facc15" filter="url(#glow)"><animateMotion dur="2.4s" repeatCount="indefinite" path="M226 162 C284 162 304 162 350 162"/></circle>
+  <circle r="10" fill="#38bdf8" filter="url(#glow)"><animateMotion dur="2.4s" begin="0.9s" repeatCount="indefinite" path="M570 162 C626 162 650 162 704 162"/></circle>
+  <text x="50" y="286" class="small">Verification snapshots the golden bounding box and compares later BVH build outputs for geometry corruption.</text>
+</svg>

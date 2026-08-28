@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Omni Virus flow</title><desc id="desc">Animated diagram showing memory, FP16, FP32, and SFU streams running concurrently.</desc>
+  <style>.bg{fill:#111827}.lane{fill:#1f2937;stroke:#a78bfa;stroke-width:2}.t{font:15px monospace;fill:#f5f3ff}.p{fill:#22d3ee}</style>
+  <rect class="bg" width="820" height="220"/><rect class="lane" x="80" y="35" width="660" height="32" rx="6"/><rect class="lane" x="80" y="80" width="660" height="32" rx="6"/><rect class="lane" x="80" y="125" width="660" height="32" rx="6"/><rect class="lane" x="80" y="170" width="660" height="32" rx="6"/>
+  <text class="t" x="105" y="57">Memory stream</text><text class="t" x="105" y="102">FP16 stream</text><text class="t" x="105" y="147">FP32 stream</text><text class="t" x="105" y="192">SFU stream</text>
+  <circle class="p" cx="260" cy="51" r="7"><animate attributeName="cx" values="260;710;260" dur="1.1s" repeatCount="indefinite"/></circle><circle class="p" cx="340" cy="96" r="7"><animate attributeName="cx" values="340;710;340" dur="1.4s" repeatCount="indefinite"/></circle><circle class="p" cx="420" cy="141" r="7"><animate attributeName="cx" values="420;710;420" dur="1.2s" repeatCount="indefinite"/></circle><circle class="p" cx="500" cy="186" r="7"><animate attributeName="cx" values="500;710;500" dur="1.6s" repeatCount="indefinite"/></circle>
+</svg>

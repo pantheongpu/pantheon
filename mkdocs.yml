@@ -1,0 +1,66 @@
+site_name: PANTHEON
+site_description: Universal GPU Stress & Diagnostics Suite
+site_url: https://pantheongpu.com
+repo_url: https://github.com/pantheongpu/pantheongpu
+repo_name: pantheongpu/pantheongpu
+edit_uri: ""
+
+nav:
+  - Home: index.md
+  - AI Workloads: ai_workloads.md
+  - Memory Diagnostics: memory_diagnostics.md
+  - Live Benchmarks: benchmarks.md
+  - Release Process: release_process.md
+
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - content.action.view
+  palette:
+    # Dark Mode (Default)
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    # Light Mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+
+plugins:
+  - search
+
+# Extensions for better tables, grid layouts, and code blocks
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/apexcharts
+  - js/charts.js

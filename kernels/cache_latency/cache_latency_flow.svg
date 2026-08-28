@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">Cache Latency execution flow</title>
+  <desc id="desc">Animated diagram showing an LCG pointer graph and a dependent pointer-chasing chain through cache and VRAM.</desc>
+  <style>
+    .bg{fill:#0f172a}.panel{fill:#1e293b;stroke:#60a5fa;stroke-width:2}.text{font:16px monospace;fill:#eff6ff}.small{font:13px monospace;fill:#bfdbfe}.arrow{stroke:#60a5fa;stroke-width:4;marker-end:url(#arrow)}.node{fill:#334155;stroke:#f472b6;stroke-width:2}.dot{fill:#f472b6}
+  </style>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#60a5fa"/></marker></defs>
+  <rect class="bg" width="900" height="260"/>
+  <rect class="panel" x="35" y="68" width="165" height="112" rx="8"/>
+  <text class="text" x="67" y="112">LCG Graph</text>
+  <text class="small" x="56" y="142">next indices</text>
+  <rect class="panel" x="290" y="42" width="250" height="168" rx="8"/>
+  <text class="text" x="348" y="78">Pointer Chase</text>
+  <circle class="node" cx="335" cy="130" r="18"/>
+  <circle class="node" cx="415" cy="102" r="18"/>
+  <circle class="node" cx="485" cy="150" r="18"/>
+  <path class="arrow" d="M352 124 L397 108"/>
+  <path class="arrow" d="M432 108 L468 140"/>
+  <path class="arrow" d="M485 168 C455 205 350 190 335 148" fill="none"/>
+  <rect class="panel" x="665" y="68" width="175" height="112" rx="8"/>
+  <text class="text" x="724" y="112">Sink</text>
+  <text class="small" x="695" y="142">final index hash</text>
+  <line class="arrow" x1="200" y1="124" x2="290" y2="124"/>
+  <line class="arrow" x1="540" y1="124" x2="665" y2="124"/>
+  <circle class="dot" cx="335" cy="130" r="7">
+    <animate attributeName="cx" values="335;415;485;335" dur="2.4s" repeatCount="indefinite"/>
+    <animate attributeName="cy" values="130;102;150;130" dur="2.4s" repeatCount="indefinite"/>
+  </circle>
+  <text class="small" x="252" y="235">Goal: create dependent loads where each address waits on the last load</text>
+</svg>

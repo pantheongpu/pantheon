@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">SFU Stress execution flow</title>
+  <desc id="desc">Animated diagram showing seeded thread state passing through transcendental special function units and into a verification sink.</desc>
+  <style>
+    .bg{fill:#0b1220}.panel{fill:#182033;stroke:#38bdf8;stroke-width:2}.text{font:16px monospace;fill:#e0f2fe}.small{font:13px monospace;fill:#bae6fd}.arrow{stroke:#38bdf8;stroke-width:4;marker-end:url(#arrow)}.orb{fill:#f472b6}.hot{fill:#fb7185}
+  </style>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#38bdf8"/></marker></defs>
+  <rect class="bg" width="900" height="260"/>
+  <rect class="panel" x="35" y="70" width="160" height="110" rx="8"/>
+  <text class="text" x="72" y="112">Seed</text>
+  <text class="small" x="58" y="142">tid + pattern</text>
+  <rect class="panel" x="270" y="45" width="310" height="160" rx="8"/>
+  <text class="text" x="337" y="82">SFU Chain</text>
+  <text class="small" x="315" y="116">sin -> cos -> exp</text>
+  <text class="small" x="327" y="145">log -> rsqrt</text>
+  <text class="small" x="335" y="174">kernel_loops</text>
+  <rect class="panel" x="690" y="70" width="170" height="110" rx="8"/>
+  <text class="text" x="735" y="112">Sink</text>
+  <text class="small" x="710" y="142">bits accumulate</text>
+  <line class="arrow" x1="195" y1="125" x2="270" y2="125"/>
+  <line class="arrow" x1="580" y1="125" x2="690" y2="125"/>
+  <circle class="orb" cx="330" cy="125" r="10">
+    <animate attributeName="cx" values="330;520;330" dur="2s" repeatCount="indefinite"/>
+    <animate attributeName="r" values="8;18;8" dur="2s" repeatCount="indefinite"/>
+  </circle>
+  <rect class="hot" x="390" y="190" width="28" height="8">
+    <animate attributeName="width" values="28;115;28" dur="1.3s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.4;1;0.4" dur="1.3s" repeatCount="indefinite"/>
+  </rect>
+  <text class="small" x="272" y="235">Goal: saturate high-latency transcendental math paths</text>
+</svg>

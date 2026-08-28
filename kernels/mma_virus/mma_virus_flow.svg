@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">MMA Virus flow</title><desc id="desc">Animated diagram showing matrix fragments feeding MMA into an accumulator.</desc>
+  <style>.bg{fill:#0f172a}.box{fill:#1e293b;stroke:#34d399;stroke-width:2}.t{font:16px monospace;fill:#ecfdf5}.s{font:13px monospace;fill:#a7f3d0}.a{stroke:#34d399;stroke-width:4;marker-end:url(#m)}.p{fill:#f472b6}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#34d399"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="70" y="70" width="140" height="85" rx="8"/><text class="t" x="105" y="110">A/B</text><text class="s" x="90" y="132">half fragments</text>
+  <rect class="box" x="330" y="55" width="160" height="115" rx="8"/><text class="t" x="378" y="110">MMA</text><text class="s" x="356" y="135">matrix engine</text>
+  <rect class="box" x="620" y="70" width="145" height="85" rx="8"/><text class="t" x="650" y="110">C Frag</text><text class="s" x="645" y="132">FP32 acc</text>
+  <line class="a" x1="210" y1="112" x2="330" y2="112"/><line class="a" x1="490" y1="112" x2="620" y2="112"/>
+  <circle class="p" cx="410" cy="112" r="9"><animate attributeName="r" values="8;22;8" dur="1.1s" repeatCount="indefinite"/></circle>
+</svg>

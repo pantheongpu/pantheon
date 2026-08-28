@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Retention Bake flow</title><desc id="desc">Animated diagram showing payload write, thermal bake, and verification readback.</desc>
+  <style>.bg{fill:#111827}.box{fill:#1f2937;stroke:#fb7185;stroke-width:2}.t{font:16px monospace;fill:#fff1f2}.s{font:13px monospace;fill:#fecdd3}.a{stroke:#fb7185;stroke-width:4;marker-end:url(#m)}.heat{fill:#f97316}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#fb7185"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="45" y="65" width="160" height="90" rx="8"/><text class="t" x="82" y="105">Payload</text><text class="s" x="78" y="130">write once</text>
+  <rect class="box" x="310" y="65" width="160" height="90" rx="8"/><text class="t" x="350" y="105">Bake</text><text class="s" x="333" y="130">ALU heat</text>
+  <rect class="box" x="585" y="65" width="175" height="90" rx="8"/><text class="t" x="625" y="105">Verify</text><text class="s" x="615" y="130">read payload</text>
+  <line class="a" x1="205" y1="110" x2="310" y2="110"/><line class="a" x1="470" y1="110" x2="585" y2="110"/>
+  <circle class="heat" cx="390" cy="172" r="7"><animate attributeName="r" values="7;24;7" dur="1.2s" repeatCount="indefinite"/></circle>
+</svg>

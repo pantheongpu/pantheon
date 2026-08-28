@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">TLB Avalanche execution flow</title>
+  <desc id="desc">Animated diagram showing pseudo-random page jumps through the TLB and MMU page walker into VRAM.</desc>
+  <style>
+    .bg{fill:#111827}.panel{fill:#1f2937;stroke:#a3e635;stroke-width:2}.text{font:16px monospace;fill:#f7fee7}.small{font:13px monospace;fill:#d9f99d}.arrow{stroke:#a3e635;stroke-width:4;marker-end:url(#arrow)}.page{fill:#374151;stroke:#60a5fa;stroke-width:2}.miss{fill:#f97316}
+  </style>
+  <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#a3e635"/></marker></defs>
+  <rect class="bg" width="900" height="260"/>
+  <rect class="panel" x="35" y="70" width="155" height="110" rx="8"/>
+  <text class="text" x="70" y="112">LCG</text>
+  <text class="small" x="55" y="142">random jump</text>
+  <rect class="panel" x="270" y="70" width="170" height="110" rx="8"/>
+  <text class="text" x="330" y="112">TLB</text>
+  <text class="small" x="300" y="142">miss pressure</text>
+  <rect class="panel" x="515" y="70" width="170" height="110" rx="8"/>
+  <text class="text" x="548" y="112">Walker</text>
+  <text class="small" x="545" y="142">translate</text>
+  <rect class="panel" x="745" y="38" width="120" height="185" rx="8"/>
+  <text class="text" x="780" y="70">VRAM</text>
+  <rect class="page" x="775" y="92" width="60" height="16"/>
+  <rect class="page" x="775" y="122" width="60" height="16"/>
+  <rect class="page" x="775" y="152" width="60" height="16"/>
+  <rect class="page" x="775" y="182" width="60" height="16"/>
+  <line class="arrow" x1="190" y1="125" x2="270" y2="125"/>
+  <line class="arrow" x1="440" y1="125" x2="515" y2="125"/>
+  <line class="arrow" x1="685" y1="125" x2="745" y2="125"/>
+  <circle class="miss" cx="356" cy="125" r="9">
+    <animate attributeName="r" values="7;22;7" dur="1.2s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.3;1;0.3" dur="1.2s" repeatCount="indefinite"/>
+  </circle>
+  <circle class="miss" cx="805" cy="100" r="6">
+    <animate attributeName="cy" values="100;190;130;160;100" dur="2.1s" repeatCount="indefinite"/>
+  </circle>
+  <text class="small" x="274" y="235">Goal: break address locality and keep translation hardware busy</text>
+</svg>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory PC Ping-Pong flow</title><desc id="desc">Animated diagram showing data moving between two VRAM halves.</desc>
+  <style>.bg{fill:#0f172a}.box{fill:#1e293b;stroke:#c084fc;stroke-width:2}.t{font:16px monospace;fill:#faf5ff}.s{font:13px monospace;fill:#e9d5ff}.link{stroke:#c084fc;stroke-width:7;stroke-linecap:round}.p{fill:#22d3ee}</style>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="90" y="68" width="210" height="90" rx="8"/><text class="t" x="138" y="108">Half A</text><text class="s" x="135" y="132">source/dest</text>
+  <rect class="box" x="520" y="68" width="210" height="90" rx="8"/><text class="t" x="568" y="108">Half B</text><text class="s" x="565" y="132">dest/source</text>
+  <line class="link" x1="300" y1="100" x2="520" y2="100"/><line class="link" x1="520" y1="135" x2="300" y2="135"/>
+  <rect class="p" x="320" y="89" width="30" height="22" rx="3"><animate attributeName="x" values="320;470;320" dur="1.4s" repeatCount="indefinite"/></rect>
+  <rect class="p" x="470" y="124" width="30" height="22" rx="3"><animate attributeName="x" values="470;320;470" dur="1.4s" repeatCount="indefinite"/></rect>
+</svg>

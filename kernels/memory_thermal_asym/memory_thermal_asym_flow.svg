@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Thermal Asymmetry flow</title><desc id="desc">Animated diagram showing compute heat and localized memory writes.</desc>
+  <style>.bg{fill:#0f172a}.box{fill:#1e293b;stroke:#f97316;stroke-width:2}.t{font:16px monospace;fill:#fff7ed}.s{font:13px monospace;fill:#fed7aa}.hot{fill:#ef4444}.cold{fill:#334155;stroke:#60a5fa;stroke-width:2}</style>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="80" y="58" width="250" height="105" rx="8"/><text class="t" x="130" y="100">FP32 Heat</text><text class="s" x="122" y="128">FMA burn loop</text>
+  <rect class="box" x="500" y="38" width="230" height="145" rx="8"/><text class="t" x="548" y="75">VRAM Region</text><rect class="cold" x="545" y="100" width="145" height="52"/><rect class="hot" x="545" y="100" width="40" height="52"><animate attributeName="width" values="40;145;40" dur="1.4s" repeatCount="indefinite"/></rect>
+  <text class="s" x="270" y="195">Goal: create a hot compute core plus one hotter memory region</text>
+</svg>

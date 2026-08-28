@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">FP64 Virus execution flow</title>
+  <desc id="desc">Animated diagram showing Pantheon launching FP64 thread blocks, running repeated double precision FMA chains, writing a sink buffer, and collecting telemetry.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#263238"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" x2="1">
+      <stop offset="0%" stop-color="#f97316"/>
+      <stop offset="55%" stop-color="#facc15"/>
+      <stop offset="100%" stop-color="#ef4444"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#cbd5e1"/>
+    </marker>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <style>
+      .label { fill: #f8fafc; font: 700 20px Arial, sans-serif; }
+      .small { fill: #cbd5e1; font: 15px Arial, sans-serif; }
+      .tiny { fill: #94a3b8; font: 13px Arial, sans-serif; }
+      .box { fill: rgba(15, 23, 42, 0.75); stroke: #64748b; stroke-width: 2; rx: 8; }
+      .lane { stroke: #cbd5e1; stroke-width: 3; fill: none; marker-end: url(#arrow); opacity: 0.9; }
+      .pulse { fill: url(#hot); filter: url(#glow); }
+      .chip { fill: #0f172a; stroke: #38bdf8; stroke-width: 3; rx: 10; }
+      .sink { fill: #172554; stroke: #93c5fd; stroke-width: 2; rx: 8; }
+    </style>
+  </defs>
+
+  <rect width="960" height="420" fill="url(#bg)"/>
+  <text x="34" y="44" class="label">FP64 Virus: double-precision FMA pressure loop</text>
+  <text x="34" y="70" class="small">Each active thread keeps four FP64 registers busy with repeated fused multiply-add chains.</text>
+
+  <rect x="40" y="110" width="180" height="96" class="box"/>
+  <text x="66" y="145" class="label">Launch grid</text>
+  <text x="66" y="172" class="small">blocks x threads</text>
+  <text x="66" y="194" class="tiny">auto or explicit grid_size</text>
+
+  <rect x="302" y="96" width="314" height="190" class="chip"/>
+  <text x="374" y="130" class="label">FP64 ALU lanes</text>
+  <text x="336" y="158" class="small">a,b,c,d stay in registers</text>
+
+  <g transform="translate(332 184)">
+    <rect x="0" y="0" width="72" height="44" fill="#1e293b" stroke="#facc15" stroke-width="2" rx="6"/>
+    <rect x="86" y="0" width="72" height="44" fill="#1e293b" stroke="#facc15" stroke-width="2" rx="6"/>
+    <rect x="172" y="0" width="72" height="44" fill="#1e293b" stroke="#facc15" stroke-width="2" rx="6"/>
+    <text x="16" y="28" class="small">FMA</text>
+    <text x="102" y="28" class="small">FMA</text>
+    <text x="188" y="28" class="small">FMA</text>
+    <circle cx="36" cy="22" r="8" class="pulse">
+      <animate attributeName="cx" values="36;122;208;36" dur="2.4s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.85;1;1" dur="2.4s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <text x="336" y="258" class="tiny">kernel_loops repeats the unrolled FMA chain before host sync</text>
+
+  <rect x="712" y="110" width="200" height="96" class="sink"/>
+  <text x="752" y="145" class="label">Sink buffer</text>
+  <text x="738" y="172" class="small">one double per thread</text>
+  <text x="738" y="194" class="tiny">prevents dead-code removal</text>
+
+  <rect x="708" y="278" width="220" height="74" class="box"/>
+  <text x="738" y="309" class="label">Telemetry</text>
+  <text x="734" y="334" class="small">power, temp, clocks, limits</text>
+
+  <path d="M220 158 C252 158 268 158 302 158" class="lane"/>
+  <path d="M616 158 C654 158 670 158 712 158" class="lane"/>
+  <path d="M812 206 C812 238 812 252 812 278" class="lane"/>
+
+  <circle r="11" class="pulse">
+    <animateMotion dur="2.8s" repeatCount="indefinite" path="M220 158 C252 158 268 158 302 158"/>
+  </circle>
+  <circle r="11" class="pulse">
+    <animateMotion dur="2.8s" begin="0.7s" repeatCount="indefinite" path="M616 158 C654 158 670 158 712 158"/>
+  </circle>
+  <circle r="9" fill="#38bdf8" filter="url(#glow)">
+    <animateMotion dur="2.8s" begin="1.4s" repeatCount="indefinite" path="M812 206 C812 238 812 252 812 278"/>
+  </circle>
+
+  <g transform="translate(48 302)">
+    <text x="0" y="0" class="small">Verification mode</text>
+    <text x="0" y="26" class="tiny">A 64-bit bitwise compare detects silent arithmetic corruption.</text>
+    <rect x="0" y="42" width="208" height="16" fill="#334155" rx="8"/>
+    <rect x="0" y="42" width="72" height="16" fill="#ef4444" rx="8">
+      <animate attributeName="width" values="24;208;24" dur="3.2s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+</svg>

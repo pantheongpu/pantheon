@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">RAS Validator flow</title><desc id="desc">Animated diagram showing pristine memory, ECC scrub reads, and error counting.</desc>
+  <style>.bg{fill:#0f172a}.box{fill:#1e293b;stroke:#22c55e;stroke-width:2}.t{font:16px monospace;fill:#f0fdf4}.s{font:13px monospace;fill:#bbf7d0}.a{stroke:#22c55e;stroke-width:4;marker-end:url(#m)}.err{fill:#ef4444}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#22c55e"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="55" y="65" width="180" height="90" rx="8"/><text class="t" x="95" y="105">Payload</text><text class="s" x="85" y="130">pristine VRAM</text>
+  <rect class="box" x="330" y="65" width="170" height="90" rx="8"/><text class="t" x="372" y="105">Scrub</text><text class="s" x="355" y="130">NT reads</text>
+  <rect class="box" x="610" y="65" width="150" height="90" rx="8"/><text class="t" x="650" y="105">Errors</text><text class="s" x="640" y="130">counter</text>
+  <line class="a" x1="235" y1="110" x2="330" y2="110"/><line class="a" x1="500" y1="110" x2="610" y2="110"/>
+  <circle class="err" cx="685" cy="170" r="6"><animate attributeName="opacity" values="0.2;1;0.2" dur="1.3s" repeatCount="indefinite"/></circle>
+</svg>

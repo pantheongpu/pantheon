@@ -1,0 +1,42 @@
+Pantheon GPU
+Copyright (c) Pantheon GPU contributors
+
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
+
+================================================================================
+Third-party components bundled in this repository
+================================================================================
+
+kernels/common/nvenc/nvEncodeAPI.h
+    Copyright (c) 2010-2024 NVIDIA Corporation.
+    Licensed under MIT-style terms that expressly permit use, copying,
+    modification, publication and distribution, provided the copyright notice
+    and permission notice are retained. The notice is preserved in the file.
+    Redistributable: yes.
+
+================================================================================
+Third-party components required but NOT bundled
+================================================================================
+
+NVIDIA OptiX SDK headers (optix.h, optix_stubs.h and friends)
+    Copyright (c) NVIDIA Corporation.
+    These headers state that use, reproduction, disclosure or distribution
+    without an express license agreement from NVIDIA is strictly prohibited.
+    They are therefore NOT redistributed with Pantheon.
+
+    Only the rt_virus workload needs them. The build probes for them and, when
+    they are absent, rt_virus builds a dummy kernel and reports its run as
+    skipped rather than failing the build. To build the real RT kernel, obtain
+    the OptiX SDK from NVIDIA and point the build at its include directory:
+
+        make PLATFORM=CUDA OPTIX_PATH=/path/to/optix/include
+
+AMD HIP-RT headers (hiprt/hiprt.h)
+    Copyright (c) Advanced Micro Devices, Inc.
+    Not bundled. Handled the same way: rt_virus builds its dummy kernel when
+    they are absent. See the HIP-RT vendoring target in the Makefile.
+
+================================================================================
+
+If you add a third-party file to this repository, record it above and confirm
+its license permits redistribution first.

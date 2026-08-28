@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" role="img" aria-labelledby="title desc">
+  <title id="title">Compute Virus FP32 execution flow</title>
+  <desc id="desc">Animated diagram showing FP32 state feeding an FMA chain, polarity flips, and a sink verification buffer.</desc>
+  <style>
+    .bg{fill:#101820}.panel{fill:#18242c;stroke:#77d7c8;stroke-width:2}.text{font:16px monospace;fill:#e9fbf7}.small{font:13px monospace;fill:#b8d8d2}.arrow{stroke:#77d7c8;stroke-width:4;marker-end:url(#arrow)}.pulse{fill:#ffcf5a}.hot{fill:#ff6b6b}.cool{fill:#6ee7b7}
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#77d7c8"/></marker>
+  </defs>
+  <rect class="bg" width="900" height="260"/>
+  <rect class="panel" x="35" y="70" width="170" height="110" rx="8"/>
+  <text class="text" x="65" y="115">FP32 State</text>
+  <text class="small" x="62" y="145">a,b,c,d per thread</text>
+  <rect class="panel" x="285" y="55" width="220" height="140" rx="8"/>
+  <text class="text" x="330" y="100">FMA Chain</text>
+  <text class="small" x="315" y="130">kernel_loops times</text>
+  <text class="small" x="322" y="155">fmaf(a,b,c)</text>
+  <rect class="panel" x="585" y="70" width="120" height="110" rx="8"/>
+  <text class="text" x="612" y="115">Clamp</text>
+  <text class="small" x="604" y="145">flip sign</text>
+  <rect class="panel" x="770" y="70" width="95" height="110" rx="8"/>
+  <text class="text" x="794" y="115">Sink</text>
+  <text class="small" x="784" y="145">verify</text>
+  <line class="arrow" x1="205" y1="125" x2="285" y2="125"/>
+  <line class="arrow" x1="505" y1="125" x2="585" y2="125"/>
+  <line class="arrow" x1="705" y1="125" x2="770" y2="125"/>
+  <path class="arrow" d="M640 70 C640 25 355 25 355 55" fill="none"/>
+  <circle class="pulse" cx="395" cy="125" r="10">
+    <animate attributeName="cx" values="320;465;320" dur="2.2s" repeatCount="indefinite"/>
+    <animate attributeName="fill" values="#ffcf5a;#ff6b6b;#ffcf5a" dur="2.2s" repeatCount="indefinite"/>
+  </circle>
+  <rect class="hot" x="610" y="165" width="20" height="8">
+    <animate attributeName="width" values="20;72;20" dur="1.6s" repeatCount="indefinite"/>
+  </rect>
+  <text class="small" x="340" y="225">Goal: maximum FP32 switching activity without arithmetic runaway</text>
+</svg>

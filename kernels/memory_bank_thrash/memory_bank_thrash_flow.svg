@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Bank Thrash flow</title><desc id="desc">Animated diagram showing 2 MiB row jumps across VRAM banks.</desc>
+  <style>.bg{fill:#0f172a}.box{fill:#1e293b;stroke:#60a5fa;stroke-width:2}.t{font:16px monospace;fill:#eff6ff}.s{font:13px monospace;fill:#bfdbfe}.a{stroke:#60a5fa;stroke-width:4;marker-end:url(#m)}.p{fill:#f97316}.bank{fill:#334155;stroke:#93c5fd;stroke-width:2}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#60a5fa"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><text class="t" x="65" y="50">2 MiB stride row misses</text>
+  <rect class="bank" x="80" y="82" width="110" height="70"/><rect class="bank" x="270" y="82" width="110" height="70"/><rect class="bank" x="460" y="82" width="110" height="70"/><rect class="bank" x="650" y="82" width="110" height="70"/>
+  <text class="s" x="108" y="122">Bank 0</text><text class="s" x="298" y="122">Bank 1</text><text class="s" x="488" y="122">Bank 2</text><text class="s" x="678" y="122">Bank 3</text>
+  <line class="a" x1="190" y1="117" x2="270" y2="117"/><line class="a" x1="380" y1="117" x2="460" y2="117"/><line class="a" x1="570" y1="117" x2="650" y2="117"/>
+  <circle class="p" cx="135" cy="117" r="8"><animate attributeName="cx" values="135;325;515;705;135" dur="2s" repeatCount="indefinite"/></circle>
+</svg>

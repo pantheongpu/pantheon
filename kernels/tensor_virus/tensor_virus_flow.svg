@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360" role="img" aria-labelledby="title desc">
+  <title id="title">Tensor Virus execution flow</title>
+  <desc id="desc">Animated diagram of FP16 half2 values flowing through repeated tensor-style FMA pressure and into a verification sink.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="#111827"/><stop offset="100%" stop-color="#1f2937"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#cbd5e1"/></marker>
+    <filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <style>
+      .label{fill:#f8fafc;font:700 19px Arial,sans-serif}.small{fill:#cbd5e1;font:14px Arial,sans-serif}.tiny{fill:#94a3b8;font:12px Arial,sans-serif}
+      .box{fill:#0f172a;stroke:#64748b;stroke-width:2;rx:8}.core{fill:#172554;stroke:#60a5fa;stroke-width:3;rx:10}.lane{stroke:#cbd5e1;stroke-width:3;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="900" height="360" fill="url(#bg)"/>
+  <text x="32" y="42" class="label">Tensor Virus: FP16 half2 FMA pressure</text>
+  <text x="32" y="66" class="small">Large grids run repeated half-precision vector FMA chains and accumulate a deterministic state hash.</text>
+  <rect x="46" y="116" width="168" height="88" class="box"/><text x="78" y="150" class="label">half2 state</text><text x="72" y="176" class="small">a, b, c registers</text>
+  <rect x="314" y="90" width="278" height="150" class="core"/><text x="378" y="124" class="label">FP16 FMA loop</text><text x="346" y="150" class="small">__hfma2 chains repeat kernel_loops</text>
+  <g transform="translate(350 176)">
+    <rect width="54" height="36" fill="#1e293b" stroke="#facc15" rx="5"/><rect x="72" width="54" height="36" fill="#1e293b" stroke="#facc15" rx="5"/><rect x="144" width="54" height="36" fill="#1e293b" stroke="#facc15" rx="5"/>
+    <text x="9" y="23" class="tiny">a*b+c</text><text x="81" y="23" class="tiny">b*c+a</text><text x="153" y="23" class="tiny">c*a+b</text>
+    <circle cx="16" cy="18" r="8" fill="#facc15" filter="url(#glow)"><animate attributeName="cx" values="16;88;160;16" dur="2s" repeatCount="indefinite"/></circle>
+  </g>
+  <rect x="698" y="116" width="154" height="88" class="box"/><text x="730" y="150" class="label">sink hash</text><text x="724" y="176" class="small">verification pool</text>
+  <path d="M214 160 C260 160 274 160 314 160" class="lane"/><path d="M592 160 C642 160 656 160 698 160" class="lane"/>
+  <circle r="10" fill="#38bdf8" filter="url(#glow)"><animateMotion dur="2.6s" repeatCount="indefinite" path="M214 160 C260 160 274 160 314 160"/></circle>
+  <circle r="10" fill="#f97316" filter="url(#glow)"><animateMotion dur="2.6s" begin="0.8s" repeatCount="indefinite" path="M592 160 C642 160 656 160 698 160"/></circle>
+  <text x="46" y="284" class="small">Verification: a golden pass computes expected hashes, then active launches are compared for FP16 state drift.</text>
+  <rect x="46" y="304" width="300" height="14" fill="#334155" rx="7"/><rect x="46" y="304" width="80" height="14" fill="#60a5fa" rx="7"><animate attributeName="width" values="40;300;40" dur="3s" repeatCount="indefinite"/></rect>
+</svg>

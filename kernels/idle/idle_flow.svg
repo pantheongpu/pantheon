@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="220" viewBox="0 0 820 220" role="img" aria-labelledby="title desc">
+  <title id="title">Idle baseline flow</title>
+  <desc id="desc">Animated diagram showing context setup, sleep, and telemetry capture.</desc>
+  <style>.bg{fill:#101820}.box{fill:#1f2937;stroke:#93c5fd;stroke-width:2}.t{font:16px monospace;fill:#eff6ff}.s{font:13px monospace;fill:#bfdbfe}.a{stroke:#93c5fd;stroke-width:4;marker-end:url(#m)}.p{fill:#22d3ee}</style>
+  <defs><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#93c5fd"/></marker></defs>
+  <rect class="bg" width="820" height="220"/><rect class="box" x="45" y="65" width="170" height="90" rx="8"/><text class="t" x="78" y="105">GPU Context</text><text class="s" x="82" y="130">hipSetDevice</text>
+  <rect class="box" x="325" y="65" width="150" height="90" rx="8"/><text class="t" x="374" y="105">Sleep</text><text class="s" x="345" y="130">no kernels</text>
+  <rect class="box" x="585" y="65" width="185" height="90" rx="8"/><text class="t" x="630" y="105">Monitor</text><text class="s" x="620" y="130">idle baseline</text>
+  <line class="a" x1="215" y1="110" x2="325" y2="110"/><line class="a" x1="475" y1="110" x2="585" y2="110"/>
+  <circle class="p" cx="400" cy="170" r="7"><animate attributeName="opacity" values="0.2;1;0.2" dur="1.4s" repeatCount="indefinite"/></circle>
+</svg>
