@@ -1,8 +1,8 @@
 site_name: PANTHEON
 site_description: Universal GPU Stress & Diagnostics Suite
 site_url: https://pantheongpu.com
-repo_url: https://github.com/pantheongpu/pantheongpu
-repo_name: pantheongpu/pantheongpu
+repo_url: https://github.com/pantheongpu/pantheon
+repo_name: pantheongpu/pantheon
 edit_uri: ""
 
 nav:
