@@ -173,20 +173,25 @@ class HardwareMonitor:
                     handle = pynvml.nvmlDeviceGetHandleByIndex(gid)
                     h = self.history[gid]
                     
+                    # A sensor this card does not have must not be recorded as a
+                    # reading of zero. Appending 0 on failure made "no memory
+                    # temperature sensor" indistinguishable from "VRAM at 0 C",
+                    # and the latter is what got published. Skip the sample
+                    # instead; the aggregate reports N/A when nothing was read.
                     try: h['temp_core'].append(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
-                    except: h['temp_core'].append(0)
-                    
+                    except Exception: pass
+
                     try: h['temp_mem'].append(pynvml.nvmlDeviceGetTemperature(handle, 2)) # 2 = Memory
-                    except: h['temp_mem'].append(0)
+                    except Exception: pass
 
                     try: h['pwr'].append(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
-                    except: h['pwr'].append(0)
-                    
+                    except Exception: pass
+
                     try: h['clk_core'].append(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS))
-                    except: h['clk_core'].append(0)
+                    except Exception: pass
 
                     try: h['gpu_util'].append(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-                    except: h['gpu_util'].append(0)
+                    except Exception: pass
 
                     try:
                         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -368,9 +373,12 @@ class HardwareMonitor:
                         key: [value for value, keep in zip(values, mask) if keep]
                         for key, values in data.items()
                     }
-            def safe_max(l): return float(round(np.max(l), 1)) if l else 0
-            def safe_mean(l): return float(round(np.mean(l), 1)) if l else 0
-            def safe_min(l): return float(round(np.min(l), 1)) if l else 0
+            # "N/A" rather than 0 when a series is empty: nothing was read, and
+            # reporting a number invents a measurement that was never taken.
+            # Consumers already treat "N/A" as missing.
+            def safe_max(l): return float(round(np.max(l), 1)) if l else "N/A"
+            def safe_mean(l): return float(round(np.mean(l), 1)) if l else "N/A"
+            def safe_min(l): return float(round(np.min(l), 1)) if l else "N/A"
             def mode_str(l): return max(set(l), key=l.count) if l else "N/A"
             power = np.asarray(samples.get('pwr', []), dtype=float)
             elapsed = np.asarray(samples.get('elapsed', []), dtype=float)
