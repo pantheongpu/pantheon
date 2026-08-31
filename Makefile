@@ -122,7 +122,10 @@ else
     endif
 endif
 
-BUILD_SIGNATURE := PLATFORM=$(PLATFORM);CUDA_ARCH=$(DETECTED_ARCH);AMD_GFX=$(DETECTED_GFX);TARGET_GFX=$(DETECTED_GFX);ENABLE_HIPRT=$(ENABLE_HIPRT)
+# OPTIX_PATH is part of the signature: setting it after a build without it
+# must invalidate the cached binaries, or rt_virus silently keeps running the
+# dummy kernel it compiled when the headers were absent.
+BUILD_SIGNATURE := PLATFORM=$(PLATFORM);CUDA_ARCH=$(DETECTED_ARCH);AMD_GFX=$(DETECTED_GFX);TARGET_GFX=$(DETECTED_GFX);ENABLE_HIPRT=$(ENABLE_HIPRT);OPTIX=$(OPTIX_PATH)
 
 # --- Auto-Discovery Logic ---
 

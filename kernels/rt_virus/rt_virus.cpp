@@ -555,7 +555,7 @@ int main(int argc, char* argv[]) {
     // ---------------------------------------------------------
     // FALLBACK
     // ---------------------------------------------------------
-    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping RT VIRUS (Requires NVIDIA OptiX or AMD HIP-RT headers)." << std::endl;
+    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping RT VIRUS (no ray tracing backend compiled in; set OPTIX_PATH to an NVIDIA OptiX SDK include directory, or ENABLE_HIPRT=1 on AMD, and rerun -- see README)." << std::endl;
     if (verify_mode) {
         // State this explicitly: a requested verification that cannot run
         // must never look like one that ran and passed.

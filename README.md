@@ -62,6 +62,23 @@ python3 pantheon.py --test pulse_virus --duration 60
  python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50
 ```
 
+## Ray tracing workload (rt_virus)
+
+NVIDIA's OptiX headers are proprietary and not redistributable, so this tree
+does not ship them and `rt_virus` builds a dummy kernel that reports
+`SKIP` by default. To run the real workload on NVIDIA hardware, download the
+[OptiX SDK](https://developer.nvidia.com/designworks/optix/download) (free
+NVIDIA developer account required) and point `OPTIX_PATH` at its `include`
+directory:
+
+```bash
+OPTIX_PATH=/opt/NVIDIA-OptiX-SDK-8.0.0/include python3 pantheon.py --test rt_virus --duration 60
+```
+
+The build cache keys on `OPTIX_PATH`, so setting or changing it triggers a
+rebuild automatically. On AMD hardware, build with `ENABLE_HIPRT=1` instead,
+which clones and builds HIP-RT itself.
+
 ## AI and inference workloads
 
 The `inference`, `training` and `ai_auxiliary` suites exercise GPU execution
