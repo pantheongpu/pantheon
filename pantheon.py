@@ -2355,7 +2355,8 @@ def main():
     run_had_errors = False
     parser = argparse.ArgumentParser(description="PANTHEON: Universal GPU Stress Suite")
     parser.add_argument("--version", action="version", version=f"%(prog)s {PANTHEON_VERSION}")
-    parser.add_argument("--test", type=str, default="all", help="Target: specific test name, suite name (core, memory, interconnect, inference, baseline), or 'all'")
+    parser.add_argument("--test", type=str, default="all",
+                        help=f"Target: a test name, a suite name ({', '.join(SUITES)}), or 'all'")
     parser.add_argument("--duration", type=int, default=30, help="Duration in seconds per test")
     parser.add_argument("--gpu", type=str, default="all", help="Comma separated list of GPU IDs (e.g. 0,1) or 'all'")
     parser.add_argument("--mem", type=int, default=99, help="Percentage of free VRAM to use (Default: 99)")
