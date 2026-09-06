@@ -161,6 +161,9 @@ def test_mock_gpu_static_info_is_synthetic():
         "power_limit": "N/A",
         "uuid": "MOCK-GPU-0",
         "serial": "Mock",
+        "memory_type": "Mock",
+        "memory_vendor": "Mock",
+        "memory_vendor_source": "mock",
     }]
 
 
@@ -1459,3 +1462,74 @@ def test_every_verifying_workload_reports_a_verdict():
         if not reports:
             silent.append(kernel.parent.name)
     assert silent == [], f"workloads that verify but never report a verdict: {silent}"
+
+
+def test_decode_memory_info_maps_driver_codes():
+    assert pantheon.decode_memory_info(0x11, 0x6) == ("GDDR6", "SK hynix")
+    assert pantheon.decode_memory_info(0x15, 0x1) == ("GDDR7", "Samsung")
+    assert pantheon.decode_memory_info(0x14, 0xF) == ("HBM3", "Micron")
+    assert pantheon.decode_memory_info(0x12, 0xF) == ("GDDR6X", "Micron")
+    # Unknown stays visible rather than being guessed away.
+    assert pantheon.decode_memory_info(0x0, 0xFFFFFFFF) == ("N/A", "N/A")
+    assert pantheon.decode_memory_info(0x7F, 0xB) == ("type 0x7f", "vendor 0xb")
+
+
+def test_nvidia_device_minor_comes_from_the_proc_entry(tmp_path):
+    gpu_dir = tmp_path / "driver" / "nvidia" / "gpus" / "0000:00:1e.0"
+    gpu_dir.mkdir(parents=True)
+    (gpu_dir / "information").write_text(
+        "Model:           NVIDIA L4\nIRQ:             33\nGPU UUID:        GPU-x\n"
+        "Video BIOS:      95.04.65.00.37\nBus Type:        PCIe\nDMA Size:        47 bits\n"
+        "DMA Mask:        0x7fffffffffff\nBus Location:    0000:00:1e.0\nDevice Minor:    3\n")
+    # nvidia-smi's spelling of the same bus id resolves to the same entry.
+    assert pantheon.nvidia_device_minor("00000000:00:1E.0", proc_root=str(tmp_path)) == 3
+    assert pantheon.nvidia_proc_bus_id("00000000:00:1E.0") == "0000:00:1e.0"
+    with pytest.raises(OSError):
+        pantheon.nvidia_device_minor("00000000:00:1F.0", proc_root=str(tmp_path))
+
+
+def test_nvidia_memory_info_degrades_to_na_without_device_nodes(tmp_path):
+    info = pantheon.nvidia_memory_info(0, "00000000:00:1E.0", dev_root=str(tmp_path), proc_root=str(tmp_path))
+    assert info["memory_type"] == "N/A"
+    assert info["memory_vendor"] == "N/A"
+    assert info["memory_vendor_source"].startswith("unavailable:")
+
+
+def test_amd_memory_info_names_the_vendor_rocm_smi_reports():
+    assert pantheon.amd_memory_info({"GPU memory vendor": "hynix"}) == {
+        "memory_type": "N/A", "memory_vendor": "SK hynix", "memory_vendor_source": "rocm-smi"}
+    assert pantheon.amd_memory_info({"GPU memory vendor": "samsung"})["memory_vendor"] == "Samsung"
+    assert pantheon.amd_memory_info({})["memory_vendor"] == "N/A"
+    assert pantheon.amd_memory_info({"GPU memory vendor": "unknown"})["memory_vendor_source"].startswith("unavailable")
+
+
+def test_mock_static_info_carries_memory_fields():
+    gpu = pantheon.get_gpu_static_info("MOCK")[0]
+    assert gpu["memory_type"] == "Mock" and gpu["memory_vendor"] == "Mock"
+    assert gpu["memory_vendor_source"] == "mock"
+
+
+def test_nvidia_static_info_includes_declared_memory(monkeypatch):
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+
+    def fake_check_output(cmd, **kwargs):
+        if "--query-gpu=index,name,memory.total,driver_version,power.limit,uuid,serial,pci.bus_id" in cmd:
+            return "0, NVIDIA L4, 23034, 595.91.07, 72.00, GPU-abc, 1234567890, 00000000:00:1E.0\n"
+        if cmd == ["nvidia-smi", "-q"]:
+            return "    Subsystem Vendor                  : NVIDIA\n"
+        raise AssertionError(f"unexpected command {cmd}")
+
+    seen = {}
+
+    def fake_memory_info(index, bus_id=None, **kwargs):
+        seen["args"] = (index, bus_id)
+        return {"memory_type": "GDDR6", "memory_vendor": "SK hynix", "memory_vendor_source": "nvidia-rm"}
+
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(pantheon, "nvidia_memory_info", fake_memory_info)
+
+    (gpu,) = pantheon.get_gpu_static_info("CUDA")
+    assert seen["args"] == (0, "00000000:00:1E.0")
+    assert gpu["uuid"] == "GPU-abc" and gpu["serial"] == "1234567890"
+    assert gpu["memory_type"] == "GDDR6" and gpu["memory_vendor"] == "SK hynix"
+    assert gpu["memory_vendor_source"] == "nvidia-rm"

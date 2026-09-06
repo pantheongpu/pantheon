@@ -20,6 +20,11 @@ import numpy as np
 import atexit
 import builtins
 import html
+import ctypes
+try:
+    import fcntl
+except ImportError:  # not Linux; the memory-vendor probe is Linux-only
+    fcntl = None
 from monitor import HardwareMonitor
 
 try:
@@ -934,6 +939,185 @@ def get_size(byte_count, suffix="B"):
             return f"{byte_count:.2f}{unit}{suffix}"
         byte_count /= factor
 
+# --- Memory type and vendor, as declared by the board -------------------------
+#
+# The driver reports the memory vendor its VBIOS memory table was configured
+# for: one value per board, chosen when the card was built. It is not a survey
+# of the chips, so a repaired card fitted with another vendor's parts still
+# reports the original (or whatever VBIOS the shop flashed). The field is
+# therefore the DECLARED vendor; what the chips actually do is what the memory
+# diagnostics measure.
+#
+# NVIDIA exposes it through the Resource Manager control API on /dev/nvidiactl
+# (NV2080_CTRL_CMD_FB_GET_INFO_V2, indices RAM_TYPE and MEMORYINFO_VENDOR_ID),
+# the same data GPU-Z shows on Windows. No root: the per-GPU node only has to
+# be registered to the control fd first, or the driver refuses the device
+# allocation with NV_ERR_INSUFFICIENT_PERMISSIONS. Verified on the proprietary
+# and the open kernel modules, GDDR6, GDDR7, x86 and arm64. AMD publishes the
+# vendor through amdgpu (rocm-smi --showmemvendor). Both use the JEDEC
+# manufacturer codes below.
+
+NVIDIA_MEMORY_TYPES = {
+    0x01: "SDRAM", 0x02: "DDR1", 0x03: "SDDR2", 0x04: "GDDR2", 0x05: "GDDR3",
+    0x06: "GDDR4", 0x07: "SDDR3", 0x08: "GDDR5", 0x09: "LPDDR2", 0x0C: "SDDR4",
+    0x0D: "LPDDR4", 0x0E: "HBM1", 0x0F: "HBM2", 0x10: "GDDR5X", 0x11: "GDDR6",
+    0x12: "GDDR6X", 0x13: "LPDDR5", 0x14: "HBM3", 0x15: "GDDR7", 0x16: "HBM4",
+}
+MEMORY_VENDOR_CODES = {
+    0x1: "Samsung", 0x2: "Qimonda", 0x3: "Elpida", 0x4: "Etron", 0x5: "Nanya",
+    0x6: "SK hynix", 0x7: "Mosel", 0x8: "Winbond", 0x9: "ESMT", 0xF: "Micron",
+}
+AMD_MEMORY_VENDOR_NAMES = {
+    "samsung": "Samsung", "infineon": "Infineon", "elpida": "Elpida", "etron": "Etron",
+    "nanya": "Nanya", "hynix": "SK hynix", "mosel": "Mosel", "winbond": "Winbond",
+    "esmt": "ESMT", "micron": "Micron",
+}
+MEMORY_INFO_UNAVAILABLE = {"memory_type": "N/A", "memory_vendor": "N/A", "memory_vendor_source": "unavailable"}
+
+_NV_IOCTL_MAGIC = ord("F")
+_NV_ESC_REGISTER_FD, _NV_ESC_RM_FREE, _NV_ESC_RM_CONTROL, _NV_ESC_RM_ALLOC = 201, 0x29, 0x2A, 0x2B
+_NV01_ROOT, _NV01_DEVICE_0, _NV20_SUBDEVICE_0 = 0x0, 0x80, 0x2080
+_NV2080_CTRL_CMD_FB_GET_INFO_V2 = 0x20801303
+_NV_FB_INFO_INDEX_RAM_TYPE, _NV_FB_INFO_INDEX_VENDOR_ID = 0x0D, 0x1C
+
+
+class _NVOS21_PARAMETERS(ctypes.Structure):  # RM alloc
+    _fields_ = [("hRoot", ctypes.c_uint32), ("hObjectParent", ctypes.c_uint32), ("hObjectNew", ctypes.c_uint32),
+                ("hClass", ctypes.c_uint32), ("pAllocParms", ctypes.c_uint64), ("paramsSize", ctypes.c_uint32),
+                ("status", ctypes.c_uint32)]
+
+
+class _NVOS54_PARAMETERS(ctypes.Structure):  # RM control
+    _fields_ = [("hClient", ctypes.c_uint32), ("hObject", ctypes.c_uint32), ("cmd", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32), ("params", ctypes.c_uint64), ("paramsSize", ctypes.c_uint32),
+                ("status", ctypes.c_uint32)]
+
+
+class _NVOS00_PARAMETERS(ctypes.Structure):  # RM free
+    _fields_ = [("hRoot", ctypes.c_uint32), ("hObjectParent", ctypes.c_uint32), ("hObjectOld", ctypes.c_uint32),
+                ("status", ctypes.c_uint32)]
+
+
+class _NV0080_ALLOC_PARAMETERS(ctypes.Structure):
+    _fields_ = [("deviceId", ctypes.c_uint32), ("hClientShare", ctypes.c_uint32), ("hTargetClient", ctypes.c_uint32),
+                ("hTargetDevice", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("vaSpaceSize", ctypes.c_uint64),
+                ("vaStartInternal", ctypes.c_uint64), ("vaLimitInternal", ctypes.c_uint64), ("vaMode", ctypes.c_uint32)]
+
+
+class _NV2080_ALLOC_PARAMETERS(ctypes.Structure):
+    _fields_ = [("subDeviceId", ctypes.c_uint32)]
+
+
+class _NV2080_CTRL_FB_INFO(ctypes.Structure):
+    _fields_ = [("index", ctypes.c_uint32), ("data", ctypes.c_uint32)]
+
+
+class _NV2080_CTRL_FB_GET_INFO_V2_PARAMS(ctypes.Structure):
+    _fields_ = [("fbInfoListSize", ctypes.c_uint32), ("fbInfoList", _NV2080_CTRL_FB_INFO * 128)]
+
+
+class _NV_IOCTL_REGISTER_FD(ctypes.Structure):
+    _fields_ = [("ctl_fd", ctypes.c_int)]
+
+
+def _nv_iowr(nr, size):
+    return (3 << 30) | (size << 16) | (_NV_IOCTL_MAGIC << 8) | nr
+
+
+def _nv_rm_alloc(ctl, root, parent, cls, params=None):
+    request = _NVOS21_PARAMETERS(
+        hRoot=root, hObjectParent=parent, hObjectNew=0, hClass=cls,
+        pAllocParms=ctypes.addressof(params) if params is not None else 0,
+        paramsSize=ctypes.sizeof(params) if params is not None else 0)
+    fcntl.ioctl(ctl, _nv_iowr(_NV_ESC_RM_ALLOC, ctypes.sizeof(request)), request)
+    if request.status:
+        raise RuntimeError(f"RM alloc of class 0x{cls:x} failed with status 0x{request.status:x}")
+    return request.hObjectNew
+
+
+def decode_memory_info(ram_code, vendor_code):
+    """Map the driver's RAM type and vendor codes to names; unknown codes stay visible as hex."""
+    memory_type = NVIDIA_MEMORY_TYPES.get(ram_code, "N/A" if ram_code == 0 else f"type 0x{ram_code:x}")
+    if vendor_code == 0xFFFFFFFF:
+        vendor = "N/A"
+    else:
+        vendor = MEMORY_VENDOR_CODES.get(vendor_code, f"vendor 0x{vendor_code:x}")
+    return memory_type, vendor
+
+
+def nvidia_proc_bus_id(bus_id):
+    """nvidia-smi prints 00000000:00:1E.0; /proc/driver/nvidia/gpus uses 0000:00:1e.0."""
+    text = str(bus_id or "").strip().lower()
+    if not text:
+        return ""
+    domain, _, rest = text.partition(":")
+    return f"{domain[-4:].rjust(4, '0')}:{rest}" if rest else text
+
+
+def nvidia_device_minor(bus_id, proc_root="/proc"):
+    """The /dev/nvidia<N> minor and RM device id for a GPU, from its /proc entry."""
+    info = os.path.join(proc_root, "driver", "nvidia", "gpus", nvidia_proc_bus_id(bus_id), "information")
+    with open(info, encoding="utf-8") as handle:
+        for line in handle:
+            if line.lower().startswith("device minor"):
+                return int(line.split(":", 1)[1].strip())
+    raise ValueError(f"no Device Minor line in {info}")
+
+
+def nvidia_memory_info(gpu_index, bus_id=None, dev_root="/dev", proc_root="/proc"):
+    """Declared memory type and vendor of one NVIDIA GPU, or N/A with the reason."""
+    if fcntl is None:
+        return dict(MEMORY_INFO_UNAVAILABLE, memory_vendor_source="unavailable: not Linux")
+    ctl = dev = None
+    try:
+        minor = gpu_index
+        if bus_id:
+            try:
+                minor = nvidia_device_minor(bus_id, proc_root)
+            except (OSError, ValueError):
+                pass
+        ctl = os.open(os.path.join(dev_root, "nvidiactl"), os.O_RDWR | os.O_CLOEXEC)
+        dev = os.open(os.path.join(dev_root, f"nvidia{minor}"), os.O_RDWR | os.O_CLOEXEC)
+        fcntl.ioctl(dev, _nv_iowr(_NV_ESC_REGISTER_FD, ctypes.sizeof(_NV_IOCTL_REGISTER_FD)),
+                    _NV_IOCTL_REGISTER_FD(ctl_fd=ctl))
+        root = _nv_rm_alloc(ctl, 0, 0, _NV01_ROOT)
+        try:
+            device = _nv_rm_alloc(ctl, root, root, _NV01_DEVICE_0,
+                                  _NV0080_ALLOC_PARAMETERS(deviceId=minor, hClientShare=root))
+            subdevice = _nv_rm_alloc(ctl, root, device, _NV20_SUBDEVICE_0, _NV2080_ALLOC_PARAMETERS(subDeviceId=0))
+            query = _NV2080_CTRL_FB_GET_INFO_V2_PARAMS(fbInfoListSize=2)
+            query.fbInfoList[0].index = _NV_FB_INFO_INDEX_RAM_TYPE
+            query.fbInfoList[1].index = _NV_FB_INFO_INDEX_VENDOR_ID
+            control = _NVOS54_PARAMETERS(hClient=root, hObject=subdevice, cmd=_NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                                         flags=0, params=ctypes.addressof(query), paramsSize=ctypes.sizeof(query))
+            fcntl.ioctl(ctl, _nv_iowr(_NV_ESC_RM_CONTROL, ctypes.sizeof(control)), control)
+            if control.status:
+                raise RuntimeError(f"FB_GET_INFO_V2 returned status 0x{control.status:x}")
+            memory_type, vendor = decode_memory_info(query.fbInfoList[0].data, query.fbInfoList[1].data)
+            return {"memory_type": memory_type, "memory_vendor": vendor, "memory_vendor_source": "nvidia-rm"}
+        finally:
+            release = _NVOS00_PARAMETERS(hRoot=root, hObjectParent=root, hObjectOld=root)
+            try:
+                fcntl.ioctl(ctl, _nv_iowr(_NV_ESC_RM_FREE, ctypes.sizeof(release)), release)
+            except OSError:
+                pass
+    except Exception as error:  # an optional field must never take the run down
+        return dict(MEMORY_INFO_UNAVAILABLE, memory_vendor_source=f"unavailable: {error}")
+    finally:
+        for handle in (dev, ctl):
+            if handle is not None:
+                os.close(handle)
+
+
+def amd_memory_info(card):
+    """Declared memory vendor of one AMD GPU from a rocm-smi --showmemvendor --json card entry."""
+    raw = str(card.get("GPU memory vendor", "")).strip().lower()
+    if not raw or raw == "unknown":
+        return dict(MEMORY_INFO_UNAVAILABLE, memory_vendor_source="unavailable: rocm-smi reports no vendor")
+    return {"memory_type": "N/A", "memory_vendor": AMD_MEMORY_VENDOR_NAMES.get(raw, raw.title()),
+            "memory_vendor_source": "rocm-smi"}
+
+
 def get_gpu_static_info(platform_name=None):
     """Detects static GPU details (Name, VRAM, Driver, TDP) via CLI tools."""
     if platform_name == "MOCK":
@@ -946,7 +1130,10 @@ def get_gpu_static_info(platform_name=None):
             "driver_version": "Mock",
             "power_limit": "N/A",
             "uuid": "MOCK-GPU-0",
-            "serial": "Mock"
+            "serial": "Mock",
+            "memory_type": "Mock",
+            "memory_vendor": "Mock",
+            "memory_vendor_source": "mock"
         }]
 
     gpu_list = []
@@ -954,7 +1141,7 @@ def get_gpu_static_info(platform_name=None):
     # 1. Try NVIDIA
     if platform_name in (None, "CUDA") and find_tool("nvidia-smi"):
         try:
-            cmd = ["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version,power.limit,uuid,serial", "--format=csv,noheader,nounits"]
+            cmd = ["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version,power.limit,uuid,serial,pci.bus_id", "--format=csv,noheader,nounits"]
             out = subprocess.check_output(cmd, encoding="utf-8").strip()
 
             vendor_out = subprocess.check_output(["nvidia-smi", "-q"], encoding="utf-8")
@@ -963,7 +1150,7 @@ def get_gpu_static_info(platform_name=None):
             for i, line in enumerate(out.split('\n')):
                 parts = line.split(", ")
                 if len(parts) >= 7:
-                    gpu_list.append({
+                    entry = {
                         "id": int(parts[0]),
                         "type": "NVIDIA",
                         "manufacturer": vendors[i] if i < len(vendors) else "NVIDIA",
@@ -973,7 +1160,9 @@ def get_gpu_static_info(platform_name=None):
                         "power_limit": float(parts[4]) if parts[4] != "[Not Supported]" else "N/A",
                         "uuid": parts[5],
                         "serial": parts[6] if parts[6] not in ["[Not Supported]", "N/A"] else "Unknown"
-                    })
+                    }
+                    entry.update(nvidia_memory_info(int(parts[0]), parts[7] if len(parts) > 7 else None))
+                    gpu_list.append(entry)
         except Exception as e: 
             print(f"[PANTHEON DEBUG] NVIDIA parsing failed: {e}")
 
@@ -987,6 +1176,7 @@ def get_gpu_static_info(platform_name=None):
                 "--showmaxpower",
                 "--showserial",
                 "--showuniqueid",
+                "--showmemvendor",
                 "--json"
             ], encoding="utf-8")
             data = json.loads(out)
@@ -1014,7 +1204,7 @@ def get_gpu_static_info(platform_name=None):
                 if "Oem id" in val:
                     manufacturer = val["Oem id"]
 
-                gpu_list.append({
+                entry = {
                     "id": idx,
                     "type": "AMD",
                     "manufacturer": manufacturer,
@@ -1024,7 +1214,9 @@ def get_gpu_static_info(platform_name=None):
                     "power_limit": pwr_limit,
                     "uuid": uuid,
                     "serial": serial
-                })
+                }
+                entry.update(amd_memory_info(val))
+                gpu_list.append(entry)
         except: pass
 
     return gpu_list
@@ -2430,7 +2622,10 @@ def main():
         print(f"Platform: {platform} (No detailed GPU info available via SMI)")
     else:
         for g in gpu_info:
-            print(f"GPU {g['id']}: [{g['manufacturer']}] {g['name']} | {g['memory_total']} VRAM | UUID: {g['uuid']}")
+            memory = ""
+            if g.get("memory_vendor") not in (None, "N/A"):
+                memory = f" | {g.get('memory_type', 'N/A')} ({g['memory_vendor']})"
+            print(f"GPU {g['id']}: [{g['manufacturer']}] {g['name']} | {g['memory_total']} VRAM{memory} | UUID: {g['uuid']}")
     print("="*60 + "\n")
 
     # --- Result Folder Setup ---
