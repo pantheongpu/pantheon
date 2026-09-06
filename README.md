@@ -237,6 +237,20 @@ remaining queue is still running. The aggregate report is still written at the
 end of the run. Reports marked `partial`, `failed`, or `incomplete` are
 excluded by downstream importers.
 
+## Memory type and vendor
+
+Each GPU entry in a report carries `memory_type` (GDDR6, GDDR6X, GDDR7, HBM3,
+...) and `memory_vendor` (Samsung, SK hynix, Micron, ...). On NVIDIA they are
+read from the driver's own memory information table through its control
+interface on `/dev/nvidiactl`, without root, the same data GPU-Z shows on
+Windows; on AMD from `rocm-smi --showmemvendor`. `memory_vendor_source` says
+which path answered, or why neither could.
+
+The vendor is the one the board was configured for, one value per card. A
+repaired card fitted with another vendor's chips still reports the original,
+so treat it as the declared vendor and read the memory diagnostics for what the
+chips actually do.
+
 ## Per-workload documentation
 
 Each workload has its own page under `kernels/<test>/README.md` describing what
