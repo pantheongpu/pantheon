@@ -256,6 +256,15 @@ chips actually do.
 Each workload has its own page under `kernels/<test>/README.md` describing what
 it stresses, how to read a failure, and what its reported metric does not mean.
 
+## Community
+
+Questions, results and ideas go to GitHub Discussions:
+https://github.com/pantheongpu/pantheon/discussions. Post the card, the driver,
+the command you ran and either the report file or the lines from the final
+summary you found interesting. Reproducible bugs go to Issues. Results that
+come with a report file can be submitted to the public database through the
+[website repository](https://github.com/pantheongpu/pantheongpu_website/issues/new?template=benchmark-submission.yml).
+
 ## Disclaimer
 
 Pantheon is an independent project. It is not generated, verified, or endorsed
