@@ -15,6 +15,7 @@ import shutil
 import hashlib
 import shlex
 import re
+import statistics
 import pandas as pd
 import numpy as np
 import atexit
@@ -2034,35 +2035,158 @@ def read_hardware_counter_file(path):
             return pd.DataFrame()
 
 
+# Columns ncu has used to name the kernel a metric row belongs to, and to
+# number the launch. A CSV carrying none of them cannot be attributed, and
+# the summariser says so rather than guessing.
+KERNEL_NAME_COLUMNS = ("kernel name", "demangled name", "kernel", "function name")
+LAUNCH_ID_COLUMNS = ("id", "launch id")
+
+# Whichever of these the profiler emitted; both are per-launch wall time.
+DURATION_METRICS = ("duration", "gpu__time_duration.sum")
+
+# ncu picks a time unit per row by magnitude, so one CSV mixes nsecond and
+# usecond freely. Summing without normalising makes a kernel look a
+# thousand times longer than its neighbour and hands it the attribution.
+TIME_UNIT_NS = {
+    "": 1.0, "nan": 1.0,
+    "ns": 1.0, "nsecond": 1.0, "nseconds": 1.0,
+    "us": 1e3, "usecond": 1e3, "useconds": 1e3, "\u00b5s": 1e3,
+    "ms": 1e6, "msecond": 1e6, "mseconds": 1e6,
+    "s": 1e9, "second": 1e9, "seconds": 1e9,
+}
+
+
+def _to_number(value):
+    """Parse a profiler cell, tolerating thousands separators."""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def counter_frame_columns(df):
+    """Locate the columns this CSV actually has, by any name ncu has used."""
+    columns = {str(col).strip().lower(): col for col in df.columns}
+    pick = lambda names: next((columns[n] for n in names if n in columns), None)
+    return {
+        "metric": pick(("metric name", "metric")),
+        "value": pick(("metric value", "value")),
+        "unit": pick(("metric unit", "unit")),
+        "kernel": pick(KERNEL_NAME_COLUMNS),
+        "launch": pick(LAUNCH_ID_COLUMNS),
+    }
+
+
+def dominant_profiled_kernel(df, cols):
+    """Name the kernel that owns most of the profiled runtime.
+
+    --profile deliberately does not limit launch count, so one CSV holds
+    the workload's stress kernel beside every fill, checksum and teardown
+    kernel around it. The counters worth reporting are the stress kernel's,
+    and "the stress kernel" means the one that owns the runtime -- not the
+    one launched most often, which a cheap helper in a tight loop wins.
+
+    Returns (kernel, runtime_share, launches), all None when the CSV
+    carries no kernel names to attribute by.
+    """
+    kernel_col, metric_col = cols["kernel"], cols["metric"]
+    if not kernel_col or not metric_col:
+        return None, None, None
+
+    names = df[metric_col].astype(str).str.strip().str.lower()
+    timing = df[names.isin(DURATION_METRICS)]
+    if timing.empty:
+        return None, None, None
+
+    units = (timing[cols["unit"]].astype(str).str.strip().str.lower()
+             if cols["unit"] else pd.Series("", index=timing.index))
+    nanoseconds = [
+        (_to_number(value) or 0.0) * TIME_UNIT_NS.get(unit, 1.0)
+        for value, unit in zip(timing[cols["value"]], units)
+    ]
+    per_kernel = pd.DataFrame({
+        "kernel": timing[kernel_col].astype(str),
+        "ns": nanoseconds,
+    }).groupby("kernel")["ns"].sum()
+
+    total = float(per_kernel.sum())
+    if total <= 0:
+        return None, None, None
+    kernel = str(per_kernel.idxmax())
+
+    launches = timing[timing[kernel_col].astype(str) == kernel]
+    count = (int(launches[cols["launch"]].nunique()) if cols["launch"]
+             else int(len(launches)))
+    return kernel, float(per_kernel.max()) / total, count
+
+
 def summarize_hardware_counter_file(path):
-    """Flatten profiler CSV output into summary columns for the main report."""
+    """Flatten profiler CSV output into summary columns for the main report.
+
+    One value per metric, taken from the launches of the kernel that owned
+    the run, aggregated by median across them.
+
+    This used to assign into `summary` inside a per-row loop, which made it
+    last-launch-wins: whichever kernel ncu happened to profile last set
+    every counter in the report. Measured on a T4 and an L4 2026-09-09,
+    that published `tensor_virus` with
+    `sm__inst_executed_pipe_tensor.sum = 0` and a Grid Size belonging to a
+    verification kernel -- while the HTML dashboard, which already
+    aggregated, reported 253,440,000 tensor instructions for the same
+    workload on a GH200. Two code paths over one CSV, opposite answers.
+    """
     df = read_hardware_counter_file(path)
     if df.empty:
         return {}
 
-    summary = {}
-    columns = {str(col).strip().lower(): col for col in df.columns}
-    metric_col = next((columns[name] for name in ("metric name", "metric") if name in columns), None)
-    value_col = next((columns[name] for name in ("metric value", "value") if name in columns), None)
-    unit_col = next((columns[name] for name in ("metric unit", "unit") if name in columns), None)
+    cols = counter_frame_columns(df)
+    metric_col, value_col, unit_col = cols["metric"], cols["value"], cols["unit"]
 
     if metric_col and value_col:
-        for _, item in df.iterrows():
-            raw_metric_name = item.get(metric_col, "")
-            if pd.isna(raw_metric_name):
-                continue
-            metric_name = str(raw_metric_name).strip()
+        kernel, share, launches = dominant_profiled_kernel(df, cols)
+        if kernel is not None:
+            df = df[df[cols["kernel"]].astype(str) == kernel]
+
+        summary = {}
+        names = df[metric_col].astype(str).str.strip()
+        for metric_name, group in df.groupby(names, sort=False):
             if not metric_name or metric_name.lower() == "nan":
                 continue
-            value = item.get(value_col, "")
-            if isinstance(value, (int, float, np.integer, np.floating)) and float(value).is_integer():
-                value = int(value)
-            unit = str(item.get(unit_col, "")).strip() if unit_col else ""
-            key = f"Counter {metric_name}"
-            summary[key] = f"{value} {unit}".strip()
+            unit = ""
+            if unit_col:
+                units = group[unit_col].dropna().astype(str)
+                unit = units.iloc[0].strip() if not units.empty else ""
+
+            numbers = [n for n in (_to_number(v) for v in group[value_col])
+                       if n is not None]
+            if numbers:
+                value = float(statistics.median(numbers))
+                if value.is_integer():
+                    value = int(value)
+            else:
+                # Some metrics are strings -- cache configurations, enabled
+                # TPC ids. A median cannot describe those, so the most
+                # common reading stands in for them.
+                readings = [str(v).strip() for v in group[value_col]
+                            if str(v).strip() and str(v).strip().lower() != "nan"]
+                if not readings:
+                    continue
+                value = max(set(readings), key=readings.count)
+            summary[f"Counter {metric_name}"] = f"{value} {unit}".strip()
+
+        # Provenance, and only when there was something to attribute by: a
+        # counter block that does not say which kernel it describes cannot
+        # be checked by whoever reads it later.
+        if kernel is not None:
+            summary["Counter Kernel"] = kernel
+            summary["Counter Kernel Launches"] = launches
+            summary["Counter Kernel Runtime Share"] = f"{share * 100:.1f} %"
         return summary
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns
+    summary = {}
     for col in numeric_cols:
         values = pd.to_numeric(df[col], errors="coerce").dropna()
         if values.empty:

@@ -1052,6 +1052,116 @@ def test_summarize_hardware_counter_file_flattens_ncu_metrics(tmp_path):
     assert summary["Counter lts__t_sectors.avg.pct_of_peak_sustained_elapsed"] == "45.5 %"
 
 
+# -- counter attribution -----------------------------------------------------
+#
+# --profile does not limit launch count, so one CSV holds the workload's stress
+# kernel beside every fill, checksum and teardown kernel around it. The
+# summariser used to assign into the dict inside a per-row loop, which made it
+# last-launch-wins. Measured on a T4 and an L4 2026-09-09: tensor_virus
+# published sm__inst_executed_pipe_tensor.sum = 0, from a verification kernel.
+
+
+def _ncu_csv(tmp_path, launches):
+    """Write a CSV shaped like `ncu --csv`, one metric per row per launch."""
+    lines = ['"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"']
+    for index, (kernel, metrics) in enumerate(launches):
+        for name, unit, value in metrics:
+            lines.append(f'"{index}","{kernel}","{name}","{unit}","{value}"')
+    path = tmp_path / "hardware_counters.csv"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_counters_describe_the_kernel_that_owned_the_runtime(tmp_path):
+    """The stress kernel's counters, not whichever kernel ran last."""
+    stress = ("stress_kernel", [
+        ("Duration", "usecond", "55000"),
+        ("sm__inst_executed_pipe_tensor.sum", "inst", "253448448"),
+    ])
+    helper = ("verify_checksum_kernel", [
+        ("Duration", "nsecond", "3136"),
+        ("sm__inst_executed_pipe_tensor.sum", "inst", "0"),
+    ])
+    # The helper runs last, which is exactly what used to decide the answer.
+    path = _ncu_csv(tmp_path, [stress] * 200 + [helper] * 100)
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter sm__inst_executed_pipe_tensor.sum"] == "253448448 inst"
+
+
+def test_attribution_follows_runtime_not_launch_count(tmp_path):
+    """A cheap helper in a tight loop must not out-vote the real kernel.
+
+    It also must not win on unit confusion: ncu picks a time unit per row by
+    magnitude, so 100,000 launches of "3136 nsecond" sums above 200 of
+    "55 msecond" unless the units are normalised first.
+    """
+    path = _ncu_csv(
+        tmp_path,
+        [("stress_kernel", [("Duration", "msecond", "55")])] * 200
+        + [("helper_kernel", [("Duration", "nsecond", "3136")])] * 100000,
+    )
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Kernel"] == "stress_kernel"
+
+
+def test_counter_block_records_its_own_provenance(tmp_path):
+    """A counter block that cannot be traced to a kernel cannot be checked."""
+    path = _ncu_csv(
+        tmp_path,
+        [("stress_kernel", [("Duration", "nsecond", "900")])] * 3
+        + [("helper_kernel", [("Duration", "nsecond", "100")])],
+    )
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Kernel"] == "stress_kernel"
+    assert summary["Counter Kernel Launches"] == 3
+    assert summary["Counter Kernel Runtime Share"] == "96.4 %"
+
+
+def test_string_metrics_survive_aggregation(tmp_path):
+    """Not every metric is a number; a median cannot describe a cache config."""
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Function Cache Configuration", "", "CachePreferShared")]),
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Function Cache Configuration", "", "CachePreferShared")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Function Cache Configuration"] == "CachePreferShared"
+
+
+def test_thousands_separators_do_not_defeat_aggregation(tmp_path):
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("sm__inst_executed.sum", "inst", "1,538,772,438")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter sm__inst_executed.sum"] == "1538772438 inst"
+
+
+def test_a_csv_without_kernel_names_claims_no_provenance(tmp_path):
+    """Older captures carry no kernel column. Say nothing rather than guess."""
+    counters = tmp_path / "counters.csv"
+    counters.write_text(
+        "Metric Name,Metric Unit,Metric Value\n"
+        "sm__inst_executed.sum,inst,123\n",
+        encoding="utf-8",
+    )
+
+    summary = pantheon.summarize_hardware_counter_file(str(counters))
+
+    assert summary == {"Counter sm__inst_executed.sum": "123 inst"}
+
+
 def test_counter_summary_ignores_empty_profiler_analysis_rows(tmp_path):
     counters = tmp_path / "counters.csv"
     counters.write_text(
