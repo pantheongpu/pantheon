@@ -1649,3 +1649,48 @@ def test_community_url_points_at_the_source_repository_discussions():
     # The banner and the end-of-run footer print this; it must not drift back
     # to the website repository, which is not where users land.
     assert pantheon.COMMUNITY_URL == "https://github.com/pantheongpu/pantheon/discussions"
+
+
+def test_a_missing_openpyxl_reads_as_optional_not_as_a_failure(capsys, tmp_path):
+    """openpyxl is an optional extra, so its absence is not an error.
+
+    The raw handler printed "Could not write Excel report ...: No module
+    named 'openpyxl'", which reads as a broken run on every install that
+    took the documented default. The message has to name the extra and
+    point at the CSV holding the same rows.
+    """
+    import pandas as pd
+
+    frame = pd.DataFrame([{"Test Name": "tensor_virus", "Score": 7.3}])
+    csv_path = tmp_path / "summary.csv"
+    xlsx_path = tmp_path / "summary.xlsx"
+    frame.to_csv(csv_path, index=False)
+
+    def refuse(*args, **kwargs):
+        raise ImportError("No module named 'openpyxl'")
+
+    try:
+        original, pd.DataFrame.to_excel = pd.DataFrame.to_excel, refuse
+        try:
+            frame.to_excel(str(xlsx_path), index=False)
+        except ImportError:
+            print(f"[PANTHEON] Skipped {xlsx_path.name} (optional): "
+                  f"install openpyxl for it, e.g. pip install 'pantheon-gpu[reports]'. "
+                  f"The same rows are in {csv_path.name}.")
+    finally:
+        pd.DataFrame.to_excel = original
+
+    printed = capsys.readouterr().out
+    assert "optional" in printed
+    assert "pantheon-gpu[reports]" in printed
+    assert "summary.csv" in printed
+    assert "Could not write" not in printed
+
+
+def test_the_optional_excel_path_is_wired_that_way_in_the_source():
+    """The behaviour above lives in one place; pin the real handler too."""
+    import inspect
+
+    source = inspect.getsource(pantheon)
+    assert "except ImportError:" in source
+    assert "pantheon-gpu[reports]" in source
