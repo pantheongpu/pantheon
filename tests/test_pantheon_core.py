@@ -1694,3 +1694,86 @@ def test_the_optional_excel_path_is_wired_that_way_in_the_source():
     source = inspect.getsource(pantheon)
     assert "except ImportError:" in source
     assert "pantheon-gpu[reports]" in source
+
+
+def test_one_name_reporting_two_units_is_not_averaged_together(tmp_path):
+    """ncu reports "Memory Throughput" twice per kernel: percent, and byte/s.
+
+    Aggregating by name alone merged readings of ~0.05 % with readings of
+    ~1.5e8 byte/s into one median and labelled it with whichever unit came
+    first. A T4 published "151161307673.66 %" that way.
+    """
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Memory Throughput", "%", "0.05"),
+                           ("Memory Throughput", "byte/s", "158244116")]),
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Memory Throughput", "%", "0.08"),
+                           ("Memory Throughput", "byte/s", "285484375")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert "Counter Memory Throughput" not in summary
+    assert summary["Counter Memory Throughput [%]"].endswith("%")
+    assert summary["Counter Memory Throughput [byte/s]"].endswith("byte/s")
+    percent = float(summary["Counter Memory Throughput [%]"].split()[0])
+    assert percent < 1, "a percent column must not carry a byte/s magnitude"
+
+
+def test_a_metric_with_no_unit_still_reaches_the_report(tmp_path):
+    """Grid Size, Block Size, # TPCs and 15 others carry no unit at all.
+
+    The unit column arrives as a nullable StringArray, so astype(str) keeps
+    pd.NA rather than making it "nan", and groupby drops NA keys by default.
+    Qualifying by unit without allowing for that silently dropped all 18.
+    """
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Grid Size", "", "168"),
+                           ("Enabled TPC IDs", "", "all")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Grid Size"] == "168"
+    assert summary["Counter Enabled TPC IDs"] == "all"
+
+
+def test_a_single_unit_metric_keeps_its_plain_name(tmp_path):
+    """Only a genuinely ambiguous name gets qualified; the rest read as before."""
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("dram__bytes_read.sum", "byte", "181307761968")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter dram__bytes_read.sum"] == "181307761968 byte"
+
+
+def test_a_blank_unit_is_not_treated_as_a_second_unit(tmp_path):
+    """"Local Memory Spilling Requests" arrives with "inst" on some rows and
+    nothing on others -- same metric, same values. Splitting on that would
+    fragment one column into two identical ones, and ncu does it for both
+    the local and shared spilling counters in every workload profiled.
+    """
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Local Memory Spilling Requests", "inst", "0"),
+                           ("Local Memory Spilling Requests", "", "0")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Local Memory Spilling Requests"] == "0 inst"
+    assert not [k for k in summary if "Spilling Requests [" in k]
+
+
+def test_a_capture_with_no_kernels_at_all_is_not_an_error(tmp_path):
+    """baseline_metrics reads telemetry and launches nothing to profile."""
+    empty = tmp_path / "hardware_counters.csv"
+    empty.write_text('"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n',
+                     encoding="utf-8")
+
+    assert pantheon.summarize_hardware_counter_file(str(empty)) == {}

@@ -2150,30 +2150,57 @@ def summarize_hardware_counter_file(path):
             df = df[df[cols["kernel"]].astype(str) == kernel]
 
         summary = {}
-        names = df[metric_col].astype(str).str.strip()
-        for metric_name, group in df.groupby(names, sort=False):
-            if not metric_name or metric_name.lower() == "nan":
-                continue
-            unit = ""
-            if unit_col:
-                units = group[unit_col].dropna().astype(str)
-                unit = units.iloc[0].strip() if not units.empty else ""
+        # fillna BEFORE astype on both columns: they arrive as nullable
+        # StringArrays, so astype(str) keeps pd.NA as NA rather than turning
+        # it into "nan", and groupby drops NA keys by default. Skipping this
+        # silently discarded all 18 unitless metrics -- Grid Size, Block
+        # Size, # TPCs, Enabled TPC IDs and the rest.
+        names = df[metric_col].fillna("").astype(str).str.strip()
+        units = (df[unit_col].fillna("").astype(str).str.strip()
+                 if unit_col else pd.Series("", index=df.index))
 
-            numbers = [n for n in (_to_number(v) for v in group[value_col])
+        def aggregate(rows):
+            """One value for one metric: the median, or the usual reading."""
+            numbers = [n for n in (_to_number(v) for v in rows[value_col])
                        if n is not None]
             if numbers:
                 value = float(statistics.median(numbers))
-                if value.is_integer():
-                    value = int(value)
-            else:
-                # Some metrics are strings -- cache configurations, enabled
-                # TPC ids. A median cannot describe those, so the most
-                # common reading stands in for them.
-                readings = [str(v).strip() for v in group[value_col]
-                            if str(v).strip() and str(v).strip().lower() != "nan"]
-                if not readings:
-                    continue
-                value = max(set(readings), key=readings.count)
+                return int(value) if value.is_integer() else value
+            # Some metrics are strings -- cache configurations, enabled TPC
+            # ids. A median cannot describe those, so the most common
+            # reading stands in for them.
+            readings = [str(v).strip() for v in rows[value_col]
+                        if str(v).strip() and str(v).strip().lower() != "nan"]
+            return max(set(readings), key=readings.count) if readings else None
+
+        for metric_name, group in df.groupby(names, sort=False, dropna=False):
+            if not metric_name or metric_name.lower() == "nan":
+                continue
+            here = units.loc[group.index]
+
+            # Split a name only when it carries two REAL units. ncu reports
+            # "Memory Throughput" twice per kernel, once as a percent of peak
+            # and once in byte/s, under one display name -- averaging those
+            # together is how a T4 came to publish "151161307673.66 %".
+            #
+            # A blank unit is not a second unit. "Local Memory Spilling
+            # Requests" arrives with "inst" on some rows and nothing on
+            # others, same metric and same values, and splitting on that
+            # would fragment one column into two identical ones.
+            real = sorted({u for u in here if u})
+            if len(real) > 1:
+                for unit, rows in group.groupby(here, sort=False, dropna=False):
+                    value = aggregate(rows)
+                    if value is None:
+                        continue
+                    label = f"{metric_name} [{unit or 'unitless'}]"
+                    summary[f"Counter {label}"] = f"{value} {unit}".strip()
+                continue
+
+            value = aggregate(group)
+            if value is None:
+                continue
+            unit = real[0] if real else ""
             summary[f"Counter {metric_name}"] = f"{value} {unit}".strip()
 
         # Provenance, and only when there was something to attribute by: a
