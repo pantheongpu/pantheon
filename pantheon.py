@@ -849,6 +849,7 @@ def get_app_version():
         return "vUnknown"
 
 PANTHEON_VERSION = get_app_version()
+COMMUNITY_URL = "https://github.com/pantheongpu/pantheon/discussions"
 
 def tprint(*args, **kwargs):
     """Custom print function that automatically prepends a timestamp."""
@@ -2626,6 +2627,7 @@ def main():
             if g.get("memory_vendor") not in (None, "N/A"):
                 memory = f" | {g.get('memory_type', 'N/A')} ({g['memory_vendor']})"
             print(f"GPU {g['id']}: [{g['manufacturer']}] {g['name']} | {g['memory_total']} VRAM{memory} | UUID: {g['uuid']}")
+    print(f"Questions and results: {COMMUNITY_URL}")
     print("="*60 + "\n")
 
     # --- Result Folder Setup ---
@@ -2758,6 +2760,7 @@ def main():
         json.dump(full_snapshot, f, indent=4, cls=NumpyEncoder)
     
     log(f"Snapshot saved to: {db_file}")
+    log(f"Share this report or ask a question: {COMMUNITY_URL}")
 
     # --- SYSTEM EXIT HOOK ---
     if run_had_errors:

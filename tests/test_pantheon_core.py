@@ -1533,3 +1533,9 @@ def test_nvidia_static_info_includes_declared_memory(monkeypatch):
     assert gpu["uuid"] == "GPU-abc" and gpu["serial"] == "1234567890"
     assert gpu["memory_type"] == "GDDR6" and gpu["memory_vendor"] == "SK hynix"
     assert gpu["memory_vendor_source"] == "nvidia-rm"
+
+
+def test_community_url_points_at_the_source_repository_discussions():
+    # The banner and the end-of-run footer print this; it must not drift back
+    # to the website repository, which is not where users land.
+    assert pantheon.COMMUNITY_URL == "https://github.com/pantheongpu/pantheon/discussions"
