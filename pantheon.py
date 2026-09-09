@@ -2150,57 +2150,58 @@ def summarize_hardware_counter_file(path):
             df = df[df[cols["kernel"]].astype(str) == kernel]
 
         summary = {}
-        # Same nullable-StringArray trap as the unit column below: fillna
-        # first, or an NA metric name reaches the loop as pd.NA once
-        # dropna=False stops discarding it.
+        # fillna BEFORE astype on both columns: they arrive as nullable
+        # StringArrays, so astype(str) keeps pd.NA as NA rather than turning
+        # it into "nan", and groupby drops NA keys by default. Skipping this
+        # silently discarded all 18 unitless metrics -- Grid Size, Block
+        # Size, # TPCs, Enabled TPC IDs and the rest.
         names = df[metric_col].fillna("").astype(str).str.strip()
-        units_of = df.assign(_n=names).groupby("_n")[unit_col].apply(
-            lambda col: sorted({str(u).strip() for u in col.dropna()})
-        ).to_dict() if unit_col else {}
+        units = (df[unit_col].fillna("").astype(str).str.strip()
+                 if unit_col else pd.Series("", index=df.index))
 
-        # Group by (name, unit), not name alone. ncu reports "Memory
-        # Throughput" twice per kernel -- once as a percent of peak and once
-        # in byte/s -- under one display name. Aggregating by name merges 52
-        # readings of ~0.05 % with 52 of ~1.5e8 byte/s into a single median
-        # and labels it with whichever unit was seen first, which is how a
-        # T4 came to report "151161307673.66 %".
-        # fillna BEFORE astype: the unit column arrives as a nullable
-        # StringArray, so astype(str) keeps pd.NA as NA rather than turning
-        # it into "nan" -- and groupby drops NA keys by default. That
-        # silently lost the 18 unitless metrics (Grid Size, Block Size,
-        # # TPCs, Enabled TPC IDs and the rest) on the first attempt.
-        unit_key = (df[unit_col].fillna("").astype(str).str.strip()
-                    if unit_col else None)
-        keys = [names, unit_key] if unit_col else [names]
-        for group_key, group in df.groupby(keys, sort=False, dropna=False):
-            metric_name = (group_key[0] if isinstance(group_key, tuple)
-                           else group_key)
-            if not metric_name or metric_name.lower() == "nan":
-                continue
-            unit = group_key[1] if isinstance(group_key, tuple) else ""
-            if unit.lower() == "nan":
-                unit = ""
-            # Only a name that genuinely carries two units needs qualifying;
-            # the other 156 keep the plain name a reader expects.
-            suffix = (f" [{unit or 'unitless'}]"
-                      if len(units_of.get(metric_name, [])) > 1 else "")
-
-            numbers = [n for n in (_to_number(v) for v in group[value_col])
+        def aggregate(rows):
+            """One value for one metric: the median, or the usual reading."""
+            numbers = [n for n in (_to_number(v) for v in rows[value_col])
                        if n is not None]
             if numbers:
                 value = float(statistics.median(numbers))
-                if value.is_integer():
-                    value = int(value)
-            else:
-                # Some metrics are strings -- cache configurations, enabled
-                # TPC ids. A median cannot describe those, so the most
-                # common reading stands in for them.
-                readings = [str(v).strip() for v in group[value_col]
-                            if str(v).strip() and str(v).strip().lower() != "nan"]
-                if not readings:
-                    continue
-                value = max(set(readings), key=readings.count)
-            summary[f"Counter {metric_name}{suffix}"] = f"{value} {unit}".strip()
+                return int(value) if value.is_integer() else value
+            # Some metrics are strings -- cache configurations, enabled TPC
+            # ids. A median cannot describe those, so the most common
+            # reading stands in for them.
+            readings = [str(v).strip() for v in rows[value_col]
+                        if str(v).strip() and str(v).strip().lower() != "nan"]
+            return max(set(readings), key=readings.count) if readings else None
+
+        for metric_name, group in df.groupby(names, sort=False, dropna=False):
+            if not metric_name or metric_name.lower() == "nan":
+                continue
+            here = units.loc[group.index]
+
+            # Split a name only when it carries two REAL units. ncu reports
+            # "Memory Throughput" twice per kernel, once as a percent of peak
+            # and once in byte/s, under one display name -- averaging those
+            # together is how a T4 came to publish "151161307673.66 %".
+            #
+            # A blank unit is not a second unit. "Local Memory Spilling
+            # Requests" arrives with "inst" on some rows and nothing on
+            # others, same metric and same values, and splitting on that
+            # would fragment one column into two identical ones.
+            real = sorted({u for u in here if u})
+            if len(real) > 1:
+                for unit, rows in group.groupby(here, sort=False, dropna=False):
+                    value = aggregate(rows)
+                    if value is None:
+                        continue
+                    label = f"{metric_name} [{unit or 'unitless'}]"
+                    summary[f"Counter {label}"] = f"{value} {unit}".strip()
+                continue
+
+            value = aggregate(group)
+            if value is None:
+                continue
+            unit = real[0] if real else ""
+            summary[f"Counter {metric_name}"] = f"{value} {unit}".strip()
 
         # Provenance, and only when there was something to attribute by: a
         # counter block that does not say which kernel it describes cannot

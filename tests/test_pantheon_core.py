@@ -1750,3 +1750,30 @@ def test_a_single_unit_metric_keeps_its_plain_name(tmp_path):
     summary = pantheon.summarize_hardware_counter_file(path)
 
     assert summary["Counter dram__bytes_read.sum"] == "181307761968 byte"
+
+
+def test_a_blank_unit_is_not_treated_as_a_second_unit(tmp_path):
+    """"Local Memory Spilling Requests" arrives with "inst" on some rows and
+    nothing on others -- same metric, same values. Splitting on that would
+    fragment one column into two identical ones, and ncu does it for both
+    the local and shared spilling counters in every workload profiled.
+    """
+    path = _ncu_csv(tmp_path, [
+        ("stress_kernel", [("Duration", "nsecond", "900"),
+                           ("Local Memory Spilling Requests", "inst", "0"),
+                           ("Local Memory Spilling Requests", "", "0")]),
+    ])
+
+    summary = pantheon.summarize_hardware_counter_file(path)
+
+    assert summary["Counter Local Memory Spilling Requests"] == "0 inst"
+    assert not [k for k in summary if "Spilling Requests [" in k]
+
+
+def test_a_capture_with_no_kernels_at_all_is_not_an_error(tmp_path):
+    """baseline_metrics reads telemetry and launches nothing to profile."""
+    empty = tmp_path / "hardware_counters.csv"
+    empty.write_text('"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n',
+                     encoding="utf-8")
+
+    assert pantheon.summarize_hardware_counter_file(str(empty)) == {}
