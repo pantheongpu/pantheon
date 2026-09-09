@@ -2869,6 +2869,15 @@ def main():
     df.to_csv(csv_path, index=False)
     try:
         df.to_excel(xlsx_path, index=False)
+    except ImportError:
+        # openpyxl is an optional extra on purpose -- it is reachable only
+        # from this one call, and requiring it would put a spreadsheet
+        # writer on every machine that only ever reads the CSV and JSON
+        # written beside it. Say that, rather than printing a raw
+        # ModuleNotFoundError that reads like a failed run.
+        print(f"[PANTHEON] Skipped {os.path.basename(xlsx_path)} (optional): "
+              f"install openpyxl for it, e.g. pip install 'pantheon-gpu[reports]'. "
+              f"The same rows are in {os.path.basename(csv_path)}.")
     except Exception as exc:
         print(f"[PANTHEON] Warning: Could not write Excel report {xlsx_path}: {exc}")
 
