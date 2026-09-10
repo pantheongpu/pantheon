@@ -132,10 +132,92 @@ results/<run-id>/profiles/<workload>/gpu<id>/
 ```
 
 `summary.xlsx` links each result to its bundle and includes the flattened
-counter values. Profiling can require multiple vendor passes and is therefore
-substantially slower than a normal stress run. Pantheon refuses an explicit
-profile request when the required vendor tools are unavailable, instead of
-silently running without profiler artifacts.
+counter values. Pantheon refuses an explicit profile request when the required
+vendor tools are unavailable, instead of silently running without profiler
+artifacts.
+
+### What a counter value describes
+
+`--profile` does not limit the profiler's launch count, so one capture holds
+the workload's stress kernel beside every fill, checksum and teardown kernel
+around it. A counter reported for the whole workload would be meaningless, so
+each value is the median across the launches of the **kernel that owned the
+profiled runtime**, and the row records which kernel that was:
+
+```text
+Counter Kernel                tensor_virus_kernel(int, unsigned int *, int, int)
+Counter Kernel Launches       50
+Counter Kernel Runtime Share  98.7 %
+```
+
+Read a counter as a property of that kernel, not of the run. A low runtime
+share means the profiler could not find a dominant kernel and the counters
+describe only part of the work.
+
+Attribution follows runtime rather than launch count, so a cheap helper
+launched thousands of times cannot outvote the kernel doing the work.
+
+A metric the profiler reports under two different units is split rather than
+averaged together -- Nsight Compute emits `Memory Throughput` once as a
+percentage of peak and once in byte/s, so both appear:
+
+```text
+Counter Memory Throughput [%]        68.38 %
+Counter Memory Throughput [byte/s]   11218196555.16 byte/s
+```
+
+### Cost
+
+Profiling replays every kernel, so it is far slower than a normal stress run.
+Measured across 134 profiled and 62 unprofiled workloads on the same cards at
+`--duration 300`: a median of **1212s profiled against 333s unprofiled, about
+3.6x**. Budget roughly half a day for a full 46-workload suite on one GPU.
+
+### Host memory
+
+Nsight Compute stages device memory in **host** RAM while it replays kernels,
+so a profiled run needs host memory comparable to the GPU memory in use. At
+`--mem 99` that means the host should have appreciably more RAM than the card
+has VRAM.
+
+Rigs where VRAM approaches host RAM become unreachable partway through a
+profiled suite -- SSH stops answering while the hypervisor still reports the
+instance healthy. Measured across eleven cards, every rig whose VRAM at 99%
+was below about 0.7x host RAM completed; the three above it did not, including
+one with 96GB of VRAM on a 62GB host. If you cannot give the host that
+headroom, run the suite without `--profile` rather than lowering `--mem`, which
+would make the scores incomparable with everything else.
+
+### Requirements and troubleshooting
+
+Both vendor tools must be present: on NVIDIA that is `ncu` **and** `nsys`, and
+Pantheon refuses the run if either is missing.
+
+**Profiling requires administrative rights.** The NVIDIA driver ships with
+`RmProfilingAdminOnly=1`, so an ordinary user gets almost no counters:
+
+```text
+ERR_NVGPUCTRPERM - The user does not have permission to access
+NVIDIA GPU Performance Counters on the target device 0
+```
+
+Run the profiled workload as root, or clear the restriction in the driver
+module and reload it.
+
+**Nsight Compute must match the driver.** A build newer than the installed
+driver installs and reports its version happily, then fails every capture:
+
+```text
+==ERROR== Nsight Compute failed to connect to the CUDA driver
+          (stub libcuda.so[.1] on path?)
+```
+
+Install the package matching the CUDA version `nvidia-smi` reports -- for a
+driver advertising CUDA 12.8, `cuda-nsight-compute-12-8`.
+
+**`InterprocessLockFailed`** means `/tmp/nsight-compute-lock` is owned by
+another user; a profiler run as an ordinary user leaves a lock a later root run
+cannot take. Remove the file.
 
 ## Fault Maps
 
