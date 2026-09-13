@@ -715,6 +715,222 @@ def summarize_ras_delta(delta, before=None, after=None):
         return {"status": "UNAVAILABLE", "details": ["RAS/AER telemetry is not exposed by this system"]}
     return {"status": "CLEAN", "details": []}
 
+# --------------------------------------------------------------------------
+# Verdict: what a run says about the card, in one word, with the evidence.
+#
+# A 46-row table is where the data lives; it is not what a renter or a buyer
+# reads. The verdict turns the run into HEALTHY, WATCH, FAULT or INCOMPLETE and
+# lists why, and puts each throughput next to the same workload on every other
+# card of that model in the public database, when a baselines file is present.
+
+DIAGNOSTIC_TESTS = {
+    "march_test", "galpat", "memory_hammer", "memory_retention",
+    "memory_retention_bake", "ras_validator",
+}
+THERMAL_WATCH_C = 90            # GPU core: within a few degrees of slowdown
+MEMORY_THERMAL_WATCH_C = 95     # HBM/GDDR6X junction: same idea
+BASELINE_MIN_CARDS = 3          # fewer than this is not a distribution
+BELOW_BASELINE_FRACTION = 0.85  # 15% under the corpus median: the card is off
+# Counters that move on healthy hardware: the PCIe link cycling power states
+# ticks l0_to_recovery on every run of some platforms (all 26 Blackwell RTX PRO
+# cards in the public database, every run). Reported, never held against the
+# card.
+BENIGN_RAS_TOKENS = ("l0_to_recovery",)
+
+
+def _num(value, default=0.0):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if out == out else default   # NaN
+
+
+def load_baselines(source=None):
+    """Return the baselines mapping, or None when none is reachable.
+
+    ``source`` is a path or an http(s) URL. Unset, the lookup order is the
+    PANTHEON_BASELINES environment variable, then the file shipped beside this
+    module. Nothing here raises: a run without baselines is a run without
+    percentiles, and says so.
+    """
+    candidates = [source] if source else [os.environ.get("PANTHEON_BASELINES"), BASELINES_FILE]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            if str(candidate).startswith(("http://", "https://")):
+                import urllib.request
+                with urllib.request.urlopen(candidate, timeout=5) as handle:
+                    data = json.loads(handle.read().decode("utf-8"))
+            else:
+                if not os.path.exists(candidate):
+                    continue
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+        except Exception as exc:                                  # noqa: BLE001
+            log(f"Baselines unavailable from {candidate}: {exc}")
+            continue
+        if isinstance(data, dict) and isinstance(data.get("models"), dict):
+            data.setdefault("source", str(candidate))
+            return data
+        log(f"Baselines at {candidate} are not in the expected shape; ignoring")
+    return None
+
+
+def baseline_for(baselines, gpu_name, test_name):
+    if not baselines:
+        return None
+    model = baselines.get("models", {}).get(str(gpu_name)) or {}
+    entry = model.get("tests", {}).get(test_name)
+    if not isinstance(entry, dict):
+        return None
+    values = [v for v in (entry.get("values") or []) if isinstance(v, (int, float))]
+    if len(values) < BASELINE_MIN_CARDS:
+        return None
+    return {"unit": entry.get("unit"), "values": sorted(values)}
+
+
+def percentile_rank(values, score):
+    """Percentile of ``score`` among ``values`` (per-card medians), ties split."""
+    values = sorted(values)
+    if not values:
+        return None
+    below = sum(1 for v in values if v < score)
+    ties = sum(1 for v in values if v == score)
+    return round(100.0 * (below + 0.5 * ties) / len(values))
+
+
+def split_ras_details(delta_text):
+    """Separate benign counter movement from the ones that mean something."""
+    benign, serious = [], []
+    for token in str(delta_text or "").split("||"):
+        token = token.strip()
+        if not token or token in ("None", "N/A"):
+            continue
+        (benign if any(b in token for b in BENIGN_RAS_TOKENS) else serious).append(token)
+    return benign, serious
+
+
+def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
+    """Turn one GPU's result rows into a verdict with its evidence."""
+    mine = [r for r in rows if r.get("GPU ID") == gpu_id]
+    faults, watches, notes, percentiles = [], [], [], {}
+    benign_ras = []
+    ran = 0
+    baseline_cards = 0
+    for row in mine:
+        test = row.get("Test Name", "?")
+        if row.get("Failure Stage"):
+            notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
+            continue
+        unit = row.get("Unit")
+        failed = unit == "ERR" or str(row.get("Status", "PASS")).upper() == "FAIL"
+        if failed:
+            if test in DIAGNOSTIC_TESTS:
+                faults.append(f"{test} failed: memory errors detected or the workload aborted, see its log")
+            else:
+                watches.append(f"{test} did not complete")
+            continue
+        if test != "baseline_metrics":
+            ran += 1
+
+        ras_status = str(row.get("RAS Status", "")).upper()
+        if ras_status == "ERROR":
+            faults.append(f"{test}: uncorrectable errors ({row.get('RAS Error Delta')})")
+        elif ras_status == "WARNING":
+            benign, serious = split_ras_details(row.get("RAS Error Delta"))
+            if serious:
+                watches.append(f"{test}: {', '.join(serious)}")
+            if benign:
+                benign_ras.append(test)
+
+        limit = str(row.get("Limit Reason", "") or "")
+        tmax = _num(row.get("Max Temp (C)"))
+        tmem = _num(row.get("Max Mem Temp (C)"))
+        if limit.lower() == "thermal":
+            watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C")
+        elif tmax >= THERMAL_WATCH_C:
+            watches.append(f"{test}: GPU reached {tmax:.0f} C")
+        if tmem >= MEMORY_THERMAL_WATCH_C:
+            watches.append(f"{test}: memory reached {tmem:.0f} C")
+
+        score = _num(row.get("Score"))
+        base = baseline_for(baselines, gpu_name, test)
+        if base and score > 0 and (base["unit"] in (None, unit)):
+            values = base["values"]
+            median = values[len(values) // 2] if len(values) % 2 else (values[len(values) // 2 - 1] + values[len(values) // 2]) / 2
+            pct = percentile_rank(values, score)
+            baseline_cards = max(baseline_cards, len(values))
+            percentiles[test] = {"score": score, "unit": unit, "percentile": pct,
+                                 "cards": len(values), "median": round(median, 3)}
+            if median > 0 and score < BELOW_BASELINE_FRACTION * median:
+                watches.append(
+                    f"{test}: {fmt_measure(score)} {unit} is {100 * (1 - score / median):.0f}% below the "
+                    f"median of {len(values)} {gpu_name} cards")
+
+    if benign_ras:
+        notes.append(f"PCIe link recovery events on {len(benign_ras)} workload(s): "
+                     "link power-state cycling, not a fault")
+    if faults:
+        verdict = "FAULT"
+    elif watches:
+        verdict = "WATCH"
+    elif ran:
+        verdict = "HEALTHY"
+    else:
+        verdict = "INCOMPLETE"
+        notes.append("no workload beyond the idle baseline completed")
+    return {
+        "gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
+        "reasons": faults + watches, "notes": notes, "percentiles": percentiles,
+        "workloads_completed": ran, "baseline_cards": baseline_cards,
+    }
+
+
+def fmt_measure(value):
+    """Numbers a person reads: thousands separators, no scientific notation."""
+    value = _num(value)
+    if abs(value) >= 1000:
+        return f"{value:,.0f}"
+    if abs(value) >= 10:
+        return f"{value:.1f}"
+    return f"{value:.3g}"
+
+
+def rank_phrase(percentile, cards):
+    if percentile is None:
+        return ""
+    if percentile <= 0:
+        return f"lowest of {cards} cards"
+    if percentile >= 100:
+        return f"highest of {cards} cards"
+    suffix = "th" if 10 <= percentile % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(percentile % 10, "th")
+    return f"{percentile}{suffix} percentile of {cards} cards"
+
+
+def format_verdict(assessment, baselines=None):
+    colors = {"FAULT": "\033[91m", "WATCH": "\033[93m", "HEALTHY": "\033[92m", "INCOMPLETE": ""}
+    reset = "\033[0m"
+    verdict = assessment["verdict"]
+    lines = [f"VERDICT GPU {assessment['gpu_id']}, {assessment['gpu_name']}: "
+             f"{colors.get(verdict, '')}{verdict}{reset}"]
+    for reason in assessment["reasons"]:
+        lines.append(f"  ! {reason}")
+    for test, p in assessment["percentiles"].items():
+        lines.append(f"  {test:<24} {fmt_measure(p['score']):>14} {str(p['unit']):<12} "
+                     f"{rank_phrase(p['percentile'], p['cards'])} "
+                     f"(median {fmt_measure(p['median'])})")
+    for note in assessment["notes"]:
+        lines.append(f"  note: {note}")
+    if baselines and not assessment["percentiles"] and assessment["workloads_completed"]:
+        lines.append(f"  no public baseline for {assessment['gpu_name']} yet; "
+                     "this run helps build one if you submit it")
+    elif not baselines and assessment["workloads_completed"]:
+        lines.append(f"  percentiles need a baselines file: --baselines {BASELINES_URL}")
+    return "\n".join(lines)
+
+
 TEST_REGISTRY = {
     # Existing
     "baseline_metrics": {"bin": "idle",          "args": [], "desc": "Baseline Idle Metrics (No Load)"},
@@ -773,6 +989,13 @@ TEST_REGISTRY = {
 SUITES = {
     "baseline": [
         "baseline_metrics"
+    ],
+    # About ten minutes at the default duration once kernels are built: idle
+    # baseline, bandwidth against the datasheet, a march test for stuck and
+    # coupled cells, a retention check, and one power-limited compute load.
+    "quick": [
+        "baseline_metrics", "memory_read", "march_test", "memory_retention",
+        "tensor_virus"
     ],
     "core": [
         "voltage", "incinerator", "fp64_virus", "int_virus", 
@@ -851,6 +1074,11 @@ def get_app_version():
 
 PANTHEON_VERSION = get_app_version()
 COMMUNITY_URL = "https://github.com/pantheongpu/pantheon/discussions"
+# Per-model distributions from the public database, shipped inside the wheel by
+# the website's release build and also published at BASELINES_URL for source
+# checkouts. Absent file means no percentiles, never an error.
+BASELINES_FILE = os.path.join(BASE_DIR, "baselines.json")
+BASELINES_URL = "https://pantheongpu.com/assets/baselines.json"
 
 def tprint(*args, **kwargs):
     """Custom print function that automatically prepends a timestamp."""
@@ -2748,6 +2976,10 @@ def main():
     )
     parser.add_argument("--inject_error", action="store_true", help="Inject a hardware fault to test SDC verification")
     parser.add_argument("--platform", choices=["auto", "cuda", "hip", "mock"], default="auto", help="Compiler backend override")
+    parser.add_argument("--baselines", default=None,
+                        help=f"Path or URL of the per-model baselines used for percentiles "
+                             f"(default: PANTHEON_BASELINES, then the bundled file; "
+                             f"published at {BASELINES_URL})")
     args = parser.parse_args()
 
     try:
@@ -2925,6 +3157,21 @@ def main():
 
     print("="*80)
 
+    # The verdict: one word per GPU and the evidence, with each throughput
+    # placed against the public database when a baselines file is present.
+    baselines = load_baselines(args.baselines)
+    verdicts = []
+    for gid in target_gpus:
+        name = next((g.get("name") for g in (gpu_info or []) if g.get("id") == gid), None) or f"GPU {gid}"
+        assessment = assess_gpu(final_results, gid, name, baselines)
+        verdicts.append(assessment)
+        print(format_verdict(assessment, baselines))
+    if baselines:
+        origin = baselines.get("generated") or ""
+        print(f"Baselines: {baselines.get('source', 'bundled')}"
+              + (f", generated {origin}" if origin else ""))
+    print("="*80)
+
     # FILES: Save EVERYTHING (including full names and hidden metrics)
     csv_path = os.path.join(run_dir, "summary.csv")
     xlsx_path = os.path.join(run_dir, "summary.xlsx")
@@ -2947,6 +3194,7 @@ def main():
     log("Generating Database Snapshot...")
     full_snapshot = get_system_snapshot(platform)
     full_snapshot["test_results"] = final_results
+    full_snapshot["verdicts"] = verdicts
     
     db_file = os.path.join(DATABASE_DIR, f"pantheon_report_{timestamp_str}.json")
     

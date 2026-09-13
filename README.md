@@ -60,6 +60,9 @@ python3 pantheon.py --test pulse_virus --duration 60
 
 # Run the inference-path stress suite on GPU 0
  python3 pantheon.py --test inference --duration 60 --gpu 0 --mem 50
+
+# Ten-minute health check with a verdict at the end
+python3 pantheon.py --test quick
 ```
 
 ## Ray tracing workload (rt_virus)
@@ -288,6 +291,41 @@ PANTHEON_CUDA_METRICS="sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__by
 PANTHEON_HIP_METRICS_APPEND="CUSTOM_COUNTER_NAME" \
   python3 pantheon.py --test memory_write --duration 30 --profile
 ```
+
+## Verdict
+
+Every run ends with one word per GPU and the evidence for it:
+
+```
+VERDICT GPU 0, NVIDIA GeForce RTX 3080 Ti: HEALTHY
+  memory_read                   868.4 GB/s        74th percentile of 4 cards (median 868)
+  tensor_virus                   20.3 TFLOPS      50th percentile of 4 cards (median 20.2)
+  note: PCIe link recovery events on 3 workload(s): link power-state cycling, not a fault
+```
+
+* **HEALTHY**: every workload completed, no error counters moved that matter,
+  nothing ran hot, and nothing measured well under the other cards of its model.
+* **WATCH**: something deserves a second look: a thermal limit, a GPU at 90 C or
+  memory at 95 C, correctable ECC or PCIe errors, a workload that did not
+  complete, or a throughput 15% or more under the median of that model.
+* **FAULT**: a memory diagnostic (`march_test`, `galpat`, `memory_hammer`,
+  `memory_retention`, `memory_retention_bake`, `ras_validator`) failed, or an
+  uncorrectable error was counted. Read the workload's log in `results/`.
+* **INCOMPLETE**: nothing beyond the idle baseline completed.
+
+Percentiles come from the public database at pantheongpu.com: the per-card
+median of every card of the same model on the same workload. The distribution
+ships inside the PyPI, apt, COPR and container packages as `baselines.json`;
+a source checkout can point at the published copy with
+`--baselines https://pantheongpu.com/assets/baselines.json` or the
+`PANTHEON_BASELINES` environment variable. A model with fewer than three
+cards in the database gets no percentile, and a run with no baselines file
+gets a verdict without one. The verdicts are also written into the report
+under `verdicts`.
+
+`--test quick` is the ten-minute version of this: idle baseline, memory read
+against the datasheet, a march test, a retention check and one power-limited
+compute load.
 
 ## Interpretation of Results
 
