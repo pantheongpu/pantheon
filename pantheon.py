@@ -1120,6 +1120,24 @@ def amd_memory_info(card):
             "memory_vendor_source": "rocm-smi"}
 
 
+# What nvidia-smi prints instead of a value. "[N/A]" is the common one for a field
+# the driver cannot read, and it is not "[Not Supported]".
+SMI_PLACEHOLDERS = ("", "n/a", "[n/a]", "not supported", "[not supported]", "[unknown error]")
+
+
+def smi_present(value):
+    """Whether nvidia-smi printed a value rather than one of its placeholders."""
+    return str(value).strip().lower() not in SMI_PLACEHOLDERS
+
+
+def smi_number(value):
+    """A number nvidia-smi printed, or "N/A" for a placeholder it printed instead."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return "N/A"
+
+
 def get_gpu_static_info(platform_name=None):
     """Detects static GPU details (Name, VRAM, Driver, TDP) via CLI tools."""
     if platform_name == "MOCK":
@@ -1151,7 +1169,13 @@ def get_gpu_static_info(platform_name=None):
 
             for i, line in enumerate(out.split('\n')):
                 parts = line.split(", ")
-                if len(parts) >= 7:
+                if len(parts) < 7:
+                    continue
+                # One card at a time. A single unreadable field used to raise
+                # inside the loop's shared try and discard the whole list, so a
+                # power limit printed as "[N/A]" on one GPU left the report with
+                # no GPU identity for any of them.
+                try:
                     entry = {
                         "id": int(parts[0]),
                         "type": "NVIDIA",
@@ -1159,12 +1183,15 @@ def get_gpu_static_info(platform_name=None):
                         "name": parts[1],
                         "memory_total": f"{parts[2]} MB",
                         "driver_version": parts[3],
-                        "power_limit": float(parts[4]) if parts[4] != "[Not Supported]" else "N/A",
+                        "power_limit": smi_number(parts[4]),
                         "uuid": parts[5],
-                        "serial": parts[6] if parts[6] not in ["[Not Supported]", "N/A"] else "Unknown"
+                        "serial": parts[6] if smi_present(parts[6]) else "Unknown"
                     }
                     entry.update(nvidia_memory_info(int(parts[0]), parts[7] if len(parts) > 7 else None))
-                    gpu_list.append(entry)
+                except Exception as e:
+                    print(f"[PANTHEON DEBUG] Skipping unparseable NVIDIA GPU line {line!r}: {e}")
+                    continue
+                gpu_list.append(entry)
         except Exception as e: 
             print(f"[PANTHEON DEBUG] NVIDIA parsing failed: {e}")
 
@@ -1877,7 +1904,10 @@ def parse_kernel_output(out, err, returncode):
             if "Throughput:" in line:
                 try:
                     raw_val = line.split("Throughput:")[1].strip()
-                    parts = raw_val.split(' ')
+                    # Any whitespace, not one space: split(' ') dropped the unit
+                    # after a double space and the score after a tab, while
+                    # throughput_variance_percent read the same line correctly.
+                    parts = raw_val.split()
                     throughput = float(parts[0])
                     if len(parts) > 1:
                         unit = parts[1]
@@ -2484,9 +2514,11 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
     except KeyboardInterrupt:
         print("\n[PANTHEON] Interrupted by user.")
         for proc_info in procs:
-            p = proc_info["process"]
-            if p.poll() is None:
-                terminate_process_tree(p)
+            # A GPU whose launch failed has no process. Calling .poll() on it
+            # raised AttributeError, which main() handles as an ordinary workload
+            # error: the run recorded a failure and started the next test, and
+            # every workload after the failed one was left running.
+            terminate_process_tree(proc_info.get("process"))
         raise
     finally:
         hw_stats = monitor.stop_collection()
@@ -2824,7 +2856,10 @@ def main():
                     monitor, args.profile, args.verify, args.inject_error,
                 )
             except KeyboardInterrupt:
-                sys.exit(0)
+                # 130, SIGINT's code. Exit 0 is what a clean pass returns, so a run
+                # stopped halfway through the queue was indistinguishable from one
+                # that finished.
+                sys.exit(130)
             except Exception as exc:
                 reason = f"Unhandled workload setup error: {exc}"
                 tprint(f"[ERROR] {test} on GPU(s) {gpu_batch}: {reason}")

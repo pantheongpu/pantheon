@@ -13,6 +13,45 @@ try:
 except ImportError:
     pynvml = None
 
+
+# NVML's clock-event reasons, by bit (nvml.h). Decoded in one place because the
+# NVML and nvidia-smi paths used to decode them separately, and disagreed: the
+# nvidia-smi path tested 0x2 -- the application clock setting -- for "Power" and
+# never looked at 0x4, and neither path knew the thermal bits past 0x8. A card in
+# software thermal slowdown (0x20, the throttle reached first) read "None": 120 of
+# the 186 published v1.2.x rows measured at 85 C or hotter say no throttling.
+THROTTLE_BITS = (
+    (0x01, "Idle"),         # GpuIdle
+    (0x04, "Power"),        # SwPowerCap
+    (0x08, "Thermal"),      # HwSlowdown
+    (0x20, "Thermal"),      # SwThermalSlowdown
+    (0x40, "Thermal"),      # HwThermalSlowdown
+    (0x80, "Power Brake"),  # HwPowerBrakeSlowdown
+)
+
+# Memory temperature is a field value, not a temperature sensor index.
+NVML_FI_DEV_MEMORY_TEMP = 82
+
+# c_nvmlValue_t members, by NVML_VALUE_TYPE.
+_NVML_VALUE_MEMBERS = {0: "dVal", 1: "uiVal", 2: "ulVal", 3: "ullVal",
+                       4: "sllVal", 5: "siVal", 6: "usVal"}
+
+
+def decode_throttle_mask(mask):
+    """Name the clock-event reasons in an NVML bitmask; "N/A" if it was unreadable."""
+    if mask is None:
+        return "N/A"
+    labels = []
+    for bit, label in THROTTLE_BITS:
+        if mask & bit and label not in labels:
+            labels.append(label)
+    return "|".join(labels) if labels else "None"
+
+
+def _nvml_field_number(field):
+    """The numeric value of one NVML field reading, by its declared value type."""
+    return getattr(field.value, _NVML_VALUE_MEMBERS.get(getattr(field, "valueType", 1), "uiVal"))
+
 class HardwareMonitor:
     def __init__(self, platform):
         self.platform = platform
@@ -50,6 +89,23 @@ class HardwareMonitor:
             return float(text.strip())
         except Exception:
             return default
+
+    @staticmethod
+    def _smi_number(value):
+        """A number nvidia-smi printed, or None for a placeholder such as "[N/A]"."""
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _smi_mask(value):
+        """The clock-event bitmask nvidia-smi printed, or None if it printed none."""
+        text = str(value).strip()
+        try:
+            return int(text, 16) if text.lower().startswith("0x") else int(text)
+        except ValueError:
+            return None
 
     def get_gpu_count(self):
         if self.platform == "MOCK":
@@ -181,7 +237,18 @@ class HardwareMonitor:
                     try: h['temp_core'].append(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
                     except Exception: pass
 
-                    try: h['temp_mem'].append(pynvml.nvmlDeviceGetTemperature(handle, 2)) # 2 = Memory
+                    # A field value, not sensor index 2. nvmlDeviceGetTemperature
+                    # accepts only NVML_TEMPERATURE_GPU (NVML_TEMPERATURE_COUNT is
+                    # 1), so the old call raised on every card and memory
+                    # temperature was never read on this path -- 0 of 5,630
+                    # published v1.2.x NVIDIA rows carry one, H100 and GH200
+                    # included. A card without the sensor returns NOT_SUPPORTED
+                    # for the field and is skipped, as before.
+                    try:
+                        field_id = getattr(pynvml, "NVML_FI_DEV_MEMORY_TEMP", NVML_FI_DEV_MEMORY_TEMP)
+                        (field,) = pynvml.nvmlDeviceGetFieldValues(handle, [field_id])
+                        if field.nvmlReturn == pynvml.NVML_SUCCESS:
+                            h['temp_mem'].append(float(_nvml_field_number(field)))
                     except Exception: pass
 
                     try: h['pwr'].append(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
@@ -216,14 +283,9 @@ class HardwareMonitor:
 
                     # Throttle Reason
                     try:
-                        reasons = []
-                        mask = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
-                        if mask & pynvml.nvmlClocksThrottleReasonGpuIdle: reasons.append("Idle")
-                        if mask & pynvml.nvmlClocksThrottleReasonSwPowerCap: reasons.append("Power")
-                        if mask & pynvml.nvmlClocksThrottleReasonHwSlowdown: reasons.append("Thermal")
-                        if not reasons: reasons.append("None")
-                        h['throttle'].append("|".join(reasons))
-                    except: h['throttle'].append("N/A")
+                        h['throttle'].append(decode_throttle_mask(
+                            pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)))
+                    except Exception: h['throttle'].append("N/A")
             except Exception as e:
                 self._warn_once("nvml_poll", f"[MONITOR] NVML polling failed: {e}.")
         else:
@@ -245,24 +307,22 @@ class HardwareMonitor:
                     if idx in self.history:
                         h = self.history[idx]
                         
-                        h['temp_core'].append(safe_parse(parts[1], float))
-                        h['temp_mem'].append(safe_parse(parts[2], float))
-                        h['pwr'].append(safe_parse(parts[3], float))
-                        h['clk_core'].append(safe_parse(parts[4], float))
+                        # Absent sensors are skipped rather than recorded as 0, the
+                        # rule the NVML path already follows. nvidia-smi prints
+                        # "[N/A]", which safe_parse turned into 0 C and 0 W.
+                        for key, raw in (('temp_core', parts[1]), ('temp_mem', parts[2]),
+                                         ('pwr', parts[3]), ('clk_core', parts[4]),
+                                         ('gpu_util', parts[9])):
+                            reading = self._smi_number(raw)
+                            if reading is not None:
+                                h[key].append(reading)
                         h['fan_pct'].append(safe_parse(parts[5], float))
                         h['volts_core'].append(0)
                         h['volts_soc'].append(0)
                         h['pcie_gen'].append(safe_parse(parts[6], int))
                         h['pcie_width'].append(safe_parse(parts[7], int))
                         
-                        # Throttle (Bitmask from CLI)
-                        mask = safe_parse(parts[8], int)
-                        reasons = []
-                        if mask & 0x1: reasons.append("Idle")
-                        if mask & 0x2: reasons.append("Power")
-                        if mask & 0x8: reasons.append("Thermal")
-                        h['throttle'].append("|".join(reasons) if reasons else "None")
-                        h['gpu_util'].append(safe_parse(parts[9], float))
+                        h['throttle'].append(decode_throttle_mask(self._smi_mask(parts[8])))
                         h['mem_used'].append(safe_parse(parts[10], float))
                         h['mem_total'].append(safe_parse(parts[11], float))
 
