@@ -1777,3 +1777,104 @@ def test_a_capture_with_no_kernels_at_all_is_not_an_error(tmp_path):
                      encoding="utf-8")
 
     assert pantheon.summarize_hardware_counter_file(str(empty)) == {}
+
+
+# --- deep-dive regressions ------------------------------------------------------
+
+def test_one_unreadable_power_limit_does_not_erase_every_gpu(monkeypatch):
+    # nvidia-smi prints "[N/A]" for a limit it cannot read. float() raised inside
+    # the shared try, and the whole NVIDIA list was discarded -- a report with no
+    # GPU identity at all, for both cards, because of one field on one of them.
+    monkeypatch.setattr(pantheon, "find_tool",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+
+    def fake_check_output(cmd, **kwargs):
+        if any(arg.startswith("--query-gpu=index,name") for arg in cmd):
+            return ("0, NVIDIA H100 80GB HBM3, 81559, 570.148.08, [N/A], GPU-aaa, [N/A], 00000000:00:1E.0\n"
+                    "1, NVIDIA H100 80GB HBM3, 81559, 570.148.08, 700.00, GPU-bbb, 1650123, 00000000:00:1F.0\n")
+        if cmd == ["nvidia-smi", "-q"]:
+            return ""
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(pantheon, "nvidia_memory_info",
+                        lambda *a, **k: dict(pantheon.MEMORY_INFO_UNAVAILABLE))
+
+    gpus = pantheon.get_gpu_static_info("CUDA")
+    assert [g["uuid"] for g in gpus] == ["GPU-aaa", "GPU-bbb"]
+    assert gpus[0]["power_limit"] == "N/A"
+    assert gpus[1]["power_limit"] == 700.0
+    # The bracketed placeholder is not a serial number either.
+    assert gpus[0]["serial"] == "Unknown"
+    assert gpus[1]["serial"] == "1650123"
+
+
+def test_an_interrupt_after_a_failed_launch_stops_every_workload(monkeypatch, tmp_path):
+    # A GPU that failed to launch has process None. The interrupt handler called
+    # .poll() on it, raised AttributeError, and main() caught that as an ordinary
+    # workload error -- so Ctrl+C recorded a failure and started the next test,
+    # with the other card's workload still running.
+    import subprocess
+
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    common = {"test_name": "fp64_virus", "output_thread": None, "profiler": None,
+              "profile_files": [], "trace_cmd": [], "trace_files": [],
+              "workload_cmd": "", "profile_cmd": "", "stdout": ""}
+    procs = [dict(common, gpu=0, process=None, launch_error="could not launch",
+                  stderr="could not launch"),
+             dict(common, gpu=1, process=live, stderr="")]
+
+    class Monitor:
+        def start_collection(self, *a, **k): pass
+        def stop_collection(self, *a, **k): return {}
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pantheon, "run_test", lambda *a, **k: procs)
+    monkeypatch.setattr(pantheon, "wait_for_processes", interrupted)
+    monkeypatch.setattr(pantheon, "collect_ras_snapshot", lambda *a, **k: {})
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            pantheon.execute_test("fp64_virus", [0, 1], 1, 10, "MOCK", str(tmp_path), Monitor())
+        live.wait(timeout=5)
+        assert live.returncode is not None
+    finally:
+        if live.poll() is None:
+            live.kill()
+
+
+def test_an_interrupted_run_does_not_exit_as_a_success(monkeypatch, tmp_path):
+    # Exit 0 is what a clean pass returns, so a run stopped halfway through the
+    # queue was indistinguishable from one that finished. 130 is SIGINT's code.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(pantheon.sys, "argv",
+                        ["pantheon.py", "--test", "baseline_metrics", "--duration", "1",
+                         "--platform", "mock"])
+
+    class Monitor:
+        def __init__(self, platform): pass
+        def get_gpu_count(self): return 1
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pantheon, "HardwareMonitor", Monitor)
+    monkeypatch.setattr(pantheon, "build_kernels", lambda platform: {})
+    monkeypatch.setattr(pantheon, "execute_test", interrupted)
+    with pytest.raises(SystemExit) as exit_info:
+        pantheon.main()
+    assert exit_info.value.code == 130
+
+
+@pytest.mark.parametrize("line", [
+    "Throughput: 345.5 GB/s",
+    "Throughput: 345.5  GB/s",
+    "Throughput:\t345.5\tGB/s",
+])
+def test_throughput_survives_any_whitespace(line):
+    # The same line is parsed with split() for variance and split(' ') for the
+    # score, so a double space lost the unit and a tab lost the score entirely.
+    score, unit, status, _, _ = pantheon.parse_kernel_output(
+        f"{line}\nVerification: PASS\n", "", 0)
+    assert (score, unit, status) == (345.5, "GB/s", "PASS")

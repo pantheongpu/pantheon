@@ -197,3 +197,124 @@ def test_efficiency_survives_an_absent_power_sensor():
     row_ok = pantheon.build_result_row("memory_read", 0, 10, 50, 340.0, "GB/s",
                                        {"avg_pwr": 250.0})
     assert row_ok is not None
+
+
+# --- NVIDIA sensor decoding ---------------------------------------------------
+# The published v1.2.x data had these consequences: 0 of 5,630 NVIDIA rows carry
+# a memory temperature (H100, GH200 and L40S all have the sensor), and 120 of the
+# 186 rows measured at 85 C or hotter report no throttling at all.
+
+import types
+
+
+def _history():
+    return {key: [] for key in (
+        "temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core",
+        "volts_soc", "pcie_gen", "pcie_width", "throttle", "gpu_util",
+        "mem_used", "mem_total", "elapsed")}
+
+
+def _fake_nvml(mask=0, memory_temp=71):
+    """Just enough of pynvml, with NVML's real argument rules.
+
+    `nvmlDeviceGetTemperature` accepts only NVML_TEMPERATURE_GPU; NVML defines no
+    other sensor (NVML_TEMPERATURE_COUNT is 1), so anything else is refused the
+    way the driver refuses it.
+    """
+    def temperature(handle, sensor):
+        if sensor != 0:
+            raise RuntimeError("NVML_ERROR_INVALID_ARGUMENT")
+        return 60
+
+    def field_values(handle, ids):
+        fields = []
+        for field_id in ids:
+            value = types.SimpleNamespace(uiVal=memory_temp, ullVal=memory_temp, dVal=0.0)
+            supported = field_id == 0x52 and memory_temp is not None
+            fields.append(types.SimpleNamespace(
+                fieldId=field_id, valueType=1, value=value,
+                nvmlReturn=0 if supported else 3))
+        return fields
+
+    return types.SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda index: object(),
+        NVML_TEMPERATURE_GPU=0, NVML_CLOCK_GRAPHICS=0, NVML_SUCCESS=0,
+        NVML_FI_DEV_MEMORY_TEMP=0x52, NVML_VALUE_TYPE_UNSIGNED_INT=1,
+        nvmlDeviceGetTemperature=temperature,
+        nvmlDeviceGetFieldValues=field_values,
+        nvmlDeviceGetPowerUsage=lambda h: 250000,
+        nvmlDeviceGetClockInfo=lambda h, clock: 1980,
+        nvmlDeviceGetUtilizationRates=lambda h: types.SimpleNamespace(gpu=99),
+        nvmlDeviceGetMemoryInfo=lambda h: types.SimpleNamespace(used=1 << 30, total=80 << 30),
+        nvmlDeviceGetFanSpeed=lambda h: 40,
+        nvmlDeviceGetCurrPcieLinkGeneration=lambda h: 4,
+        nvmlDeviceGetCurrPcieLinkWidth=lambda h: 16,
+        nvmlDeviceGetCurrentClocksThrottleReasons=lambda h: mask,
+        nvmlClocksThrottleReasonGpuIdle=0x1,
+        nvmlClocksThrottleReasonSwPowerCap=0x4,
+        nvmlClocksThrottleReasonHwSlowdown=0x8,
+    )
+
+
+def _nvml_monitor(monkeypatch, **fake):
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", _fake_nvml(**fake))
+    mon = HardwareMonitor("CUDA")
+    mon.history = {0: _history()}
+    mon._poll_nvidia([0])
+    return mon.history[0]
+
+
+def _cli_monitor(monkeypatch, line):
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", None)
+    monkeypatch.setattr("monitor.subprocess.check_output", lambda _cmd: line.encode())
+    mon = HardwareMonitor("CUDA")
+    mon.history = {0: _history()}
+    mon._poll_nvidia([0])
+    return mon.history[0]
+
+
+def test_nvml_reads_memory_temperature_from_its_field_value(monkeypatch):
+    # Sensor index 2 does not exist in NVML, so every read raised and was
+    # skipped: memory temperature was never collected on the path real rigs use.
+    assert _nvml_monitor(monkeypatch)["temp_mem"] == [71.0]
+
+
+def test_a_card_without_a_memory_sensor_still_reports_none(monkeypatch):
+    assert _nvml_monitor(monkeypatch, memory_temp=None)["temp_mem"] == []
+
+
+def test_nvml_names_software_thermal_slowdown(monkeypatch):
+    # 0x20 is the thermal throttle a card reaches first. It decoded as "None".
+    assert _nvml_monitor(monkeypatch, mask=0x20)["throttle"] == ["Thermal"]
+
+
+def test_nvml_names_hardware_thermal_slowdown_and_the_power_brake(monkeypatch):
+    assert _nvml_monitor(monkeypatch, mask=0x40)["throttle"] == ["Thermal"]
+    assert _nvml_monitor(monkeypatch, mask=0x80)["throttle"] == ["Power Brake"]
+
+
+def test_cli_fallback_reads_the_power_cap_from_its_own_bit(monkeypatch):
+    # The fallback tested 0x2 -- the application clock setting -- for "Power",
+    # and never looked at 0x4, where NVML reports the power cap.
+    line = "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0000000000000004, 99, 1024, 81559\n"
+    assert _cli_monitor(monkeypatch, line)["throttle"] == ["Power"]
+
+
+def test_cli_fallback_does_not_call_an_application_clock_setting_power(monkeypatch):
+    line = "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0000000000000002, 99, 1024, 81559\n"
+    assert _cli_monitor(monkeypatch, line)["throttle"] == ["None"]
+
+
+def test_cli_fallback_records_an_absent_sensor_as_absent(monkeypatch):
+    # nvidia-smi prints "[N/A]", which the fallback parsed as 0 -- the same
+    # "no sensor" reported as "0 C" that the NVML path was fixed for.
+    line = "0, 60, [N/A], [N/A], 1980, 40, 4, 16, 0x0000000000000000, 99, 1024, 81559\n"
+    history = _cli_monitor(monkeypatch, line)
+    assert history["temp_mem"] == []
+    assert history["pwr"] == []
+    assert history["temp_core"] == [60.0]
