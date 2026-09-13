@@ -297,35 +297,28 @@ PANTHEON_HIP_METRICS_APPEND="CUSTOM_COUNTER_NAME" \
 Every run ends with one word per GPU and the evidence for it:
 
 ```
-VERDICT GPU 0, NVIDIA GeForce RTX 3080 Ti: HEALTHY
-  memory_read                   868.4 GB/s        74th percentile of 4 cards (median 868)
-  tensor_virus                   20.3 TFLOPS      50th percentile of 4 cards (median 20.2)
-  note: PCIe link recovery events on 3 workload(s): link power-state cycling, not a fault
+VERDICT GPU 0, NVIDIA H100 80GB HBM3: WATCH  (thermally throttled on 2; correctable errors on 8)
+  ! thermal: memory_read thermally throttled, GPU at 95 C, memory_read_agg thermally throttled, GPU at 94 C
+  ! correctable errors on 8 workload(s): pcie.bad_tlp +9, pcie.lcrc +6
+  note: PCIe link recovery events on 8 workload(s): link power-state cycling, not a fault
 ```
 
-* **HEALTHY**: every workload completed, no error counters moved that matter,
-  nothing ran hot, and nothing measured well under the other cards of its model.
+* **HEALTHY**: every workload completed, no error counter that matters moved,
+  and nothing ran hot.
 * **WATCH**: something deserves a second look: a thermal limit, a GPU at 90 C or
-  memory at 95 C, correctable ECC or PCIe errors, a workload that did not
-  complete, or a throughput 15% or more under the median of that model.
+  memory at 95 C, correctable ECC or PCIe errors, or a workload that did not
+  complete. One line per kind, worst first.
 * **FAULT**: a memory diagnostic (`march_test`, `galpat`, `memory_hammer`,
   `memory_retention`, `memory_retention_bake`, `ras_validator`) failed, or an
   uncorrectable error was counted. Read the workload's log in `results/`.
 * **INCOMPLETE**: nothing beyond the idle baseline completed.
 
-Percentiles come from the public database at pantheongpu.com: the per-card
-median of every card of the same model on the same workload. The distribution
-ships inside the PyPI, apt, COPR and container packages as `baselines.json`;
-a source checkout can point at the published copy with
-`--baselines https://pantheongpu.com/assets/baselines.json` or the
-`PANTHEON_BASELINES` environment variable. A model with fewer than three
-cards in the database gets no percentile, and a run with no baselines file
-gets a verdict without one. The verdicts are also written into the report
-under `verdicts`.
+PCIe link recovery counts are reported as a note, never held against the
+card: they tick on every run on some healthy platforms. The verdict is also
+written into the report under `verdicts`, with a structured `findings` block.
 
-`--test quick` is the ten-minute version of this: idle baseline, memory read
-against the datasheet, a march test, a retention check and one power-limited
-compute load.
+`--test quick` is the ten-minute version of this: idle baseline, memory read,
+a march test, a retention check and one power-limited compute load.
 
 ## Interpretation of Results
 
