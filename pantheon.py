@@ -720,8 +720,7 @@ def summarize_ras_delta(delta, before=None, after=None):
 #
 # A 46-row table is where the data lives; it is not what a renter or a buyer
 # reads. The verdict turns the run into HEALTHY, WATCH, FAULT or INCOMPLETE and
-# lists why, and puts each throughput next to the same workload on every other
-# card of that model in the public database, when a baselines file is present.
+# lists why.
 
 DIAGNOSTIC_TESTS = {
     "march_test", "galpat", "memory_hammer", "memory_retention",
@@ -729,8 +728,6 @@ DIAGNOSTIC_TESTS = {
 }
 THERMAL_WATCH_C = 90            # GPU core: within a few degrees of slowdown
 MEMORY_THERMAL_WATCH_C = 95     # HBM/GDDR6X junction: same idea
-BASELINE_MIN_CARDS = 3          # fewer than this is not a distribution
-BELOW_BASELINE_FRACTION = 0.85  # 15% under the corpus median: the card is off
 # Counters that move on healthy hardware: the PCIe link cycling power states
 # ticks l0_to_recovery on every run of some platforms (all 26 Blackwell RTX PRO
 # cards in the public database, every run). Reported, never held against the
@@ -746,61 +743,6 @@ def _num(value, default=0.0):
     return out if out == out else default   # NaN
 
 
-def load_baselines(source=None):
-    """Return the baselines mapping, or None when none is reachable.
-
-    ``source`` is a path or an http(s) URL. Unset, the lookup order is the
-    PANTHEON_BASELINES environment variable, then the file shipped beside this
-    module. Nothing here raises: a run without baselines is a run without
-    percentiles, and says so.
-    """
-    candidates = [source] if source else [os.environ.get("PANTHEON_BASELINES"), BASELINES_FILE]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            if str(candidate).startswith(("http://", "https://")):
-                import urllib.request
-                with urllib.request.urlopen(candidate, timeout=5) as handle:
-                    data = json.loads(handle.read().decode("utf-8"))
-            else:
-                if not os.path.exists(candidate):
-                    continue
-                with open(candidate, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-        except Exception as exc:                                  # noqa: BLE001
-            log(f"Baselines unavailable from {candidate}: {exc}")
-            continue
-        if isinstance(data, dict) and isinstance(data.get("models"), dict):
-            data.setdefault("source", str(candidate))
-            return data
-        log(f"Baselines at {candidate} are not in the expected shape; ignoring")
-    return None
-
-
-def baseline_for(baselines, gpu_name, test_name):
-    if not baselines:
-        return None
-    model = baselines.get("models", {}).get(str(gpu_name)) or {}
-    entry = model.get("tests", {}).get(test_name)
-    if not isinstance(entry, dict):
-        return None
-    values = [v for v in (entry.get("values") or []) if isinstance(v, (int, float))]
-    if len(values) < BASELINE_MIN_CARDS:
-        return None
-    return {"unit": entry.get("unit"), "values": sorted(values)}
-
-
-def percentile_rank(values, score):
-    """Percentile of ``score`` among ``values`` (per-card medians), ties split."""
-    values = sorted(values)
-    if not values:
-        return None
-    below = sum(1 for v in values if v < score)
-    ties = sum(1 for v in values if v == score)
-    return round(100.0 * (below + 0.5 * ties) / len(values))
-
-
 def split_ras_details(delta_text):
     """Separate benign counter movement from the ones that mean something."""
     benign, serious = [], []
@@ -812,7 +754,7 @@ def split_ras_details(delta_text):
     return benign, serious
 
 
-def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
+def assess_gpu(rows, gpu_id, gpu_name):
     """Turn one GPU's result rows into a verdict with its evidence.
 
     Findings are grouped by kind, so a card that is hot on five workloads and
@@ -820,11 +762,10 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
     order the workloads happened to run.
     """
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
-    faults, notes, percentiles = [], [], {}
-    throttled, hot, hot_memory, below, incomplete = [], [], [], [], []
+    faults, notes = [], []
+    throttled, hot, hot_memory, incomplete = [], [], [], []
     ras_serious, benign_ras = {}, []
     ran = 0
-    baseline_cards = 0
     for row in mine:
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
@@ -861,18 +802,6 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
         if tmem >= MEMORY_THERMAL_WATCH_C:
             hot_memory.append((test, tmem))
 
-        score = _num(row.get("Score"))
-        base = baseline_for(baselines, gpu_name, test)
-        if base and score > 0 and (base["unit"] in (None, unit)):
-            values = base["values"]
-            median = values[len(values) // 2] if len(values) % 2 else (values[len(values) // 2 - 1] + values[len(values) // 2]) / 2
-            pct = percentile_rank(values, score)
-            baseline_cards = max(baseline_cards, len(values))
-            percentiles[test] = {"score": score, "unit": unit, "percentile": pct,
-                                 "cards": len(values), "median": round(median, 3)}
-            if median > 0 and score < BELOW_BASELINE_FRACTION * median:
-                below.append((test, round(100 * (1 - score / median)), len(values)))
-
     watches = []
     if throttled:
         throttled.sort(key=lambda t: -t[1])
@@ -883,12 +812,6 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
     if hot_memory:
         hot_memory.sort(key=lambda t: -t[1])
         watches.append("hot memory: " + ", ".join(f"{t} memory reached {c:.0f} C" for t, c in hot_memory))
-    if below:
-        below.sort(key=lambda b: -b[1])
-        cards = max(b[2] for b in below)
-        watches.append("below the model median: "
-                       + ", ".join(f"{t} {pct}%" for t, pct, _ in below)
-                       + f" ({cards} {gpu_name} cards)")
     if ras_serious:
         totals = {}
         for details in ras_serious.values():
@@ -921,58 +844,30 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
         summary_bits.append(f"thermally throttled on {len(throttled)}")
     if hot or hot_memory:
         summary_bits.append(f"hot on {len(hot) + len(hot_memory)}")
-    if below:
-        summary_bits.append(f"{len(below)} workload(s) {min(b[1] for b in below)} to {max(b[1] for b in below)}% below the model median"
-                            if len(below) > 1 else f"1 workload {below[0][1]}% below the model median")
     if ras_serious:
         summary_bits.append(f"correctable errors on {len(ras_serious)}")
     if incomplete:
         summary_bits.append(f"{len(incomplete)} incomplete")
     if verdict == "HEALTHY":
-        summary_bits.append(f"{ran} workload(s) completed"
-                            + (f", {len(percentiles)} placed against {baseline_cards} cards" if percentiles else ""))
+        summary_bits.append(f"{ran} workload(s) completed")
 
     return {
         "gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
         "summary": "; ".join(summary_bits),
         "reasons": faults + watches, "notes": notes,
-        "percentiles": dict(sorted(percentiles.items(),
-                                   key=lambda kv: (kv[1]["percentile"] if kv[1]["percentile"] is not None else 101, kv[0]))),
         "findings": {
             "faults": faults,
             "throttled": [{"test": t, "temp_c": c} for t, c in throttled],
             "hot": [{"test": t, "temp_c": c} for t, c in hot],
             "hot_memory": [{"test": t, "temp_c": c} for t, c in hot_memory],
-            "below_median": [{"test": t, "percent_below": p} for t, p, _ in below],
             "correctable_errors": ras_serious,
             "incomplete": incomplete,
         },
-        "workloads_completed": ran, "baseline_cards": baseline_cards,
+        "workloads_completed": ran,
     }
 
 
-def fmt_measure(value):
-    """Numbers a person reads: thousands separators, no scientific notation."""
-    value = _num(value)
-    if abs(value) >= 1000:
-        return f"{value:,.0f}"
-    if abs(value) >= 10:
-        return f"{value:.1f}"
-    return f"{value:.3g}"
-
-
-def rank_phrase(percentile, cards):
-    if percentile is None:
-        return ""
-    if percentile <= 0:
-        return f"lowest of {cards} cards"
-    if percentile >= 100:
-        return f"highest of {cards} cards"
-    suffix = "th" if 10 <= percentile % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(percentile % 10, "th")
-    return f"{percentile}{suffix} percentile of {cards} cards"
-
-
-def format_verdict(assessment, baselines=None):
+def format_verdict(assessment):
     colors = {"FAULT": "\033[91m", "WATCH": "\033[93m", "HEALTHY": "\033[92m", "INCOMPLETE": ""}
     reset = "\033[0m"
     verdict = assessment["verdict"]
@@ -981,17 +876,8 @@ def format_verdict(assessment, baselines=None):
              + (f"  ({assessment['summary']})" if assessment.get("summary") else "")]
     for reason in assessment["reasons"]:
         lines.append(f"  ! {reason}")
-    for test, p in assessment["percentiles"].items():
-        lines.append(f"  {test:<24} {fmt_measure(p['score']):>14} {str(p['unit']):<12} "
-                     f"{rank_phrase(p['percentile'], p['cards'])} "
-                     f"(median {fmt_measure(p['median'])})")
     for note in assessment["notes"]:
         lines.append(f"  note: {note}")
-    if baselines and not assessment["percentiles"] and assessment["workloads_completed"]:
-        lines.append(f"  no public baseline for {assessment['gpu_name']} yet; "
-                     "this run helps build one if you submit it")
-    elif not baselines and assessment["workloads_completed"]:
-        lines.append(f"  percentiles need a baselines file: --baselines {BASELINES_URL}")
     return "\n".join(lines)
 
 
@@ -1138,11 +1024,6 @@ def get_app_version():
 
 PANTHEON_VERSION = get_app_version()
 COMMUNITY_URL = "https://github.com/pantheongpu/pantheon/discussions"
-# Per-model distributions from the public database, shipped inside the wheel by
-# the website's release build and also published at BASELINES_URL for source
-# checkouts. Absent file means no percentiles, never an error.
-BASELINES_FILE = os.path.join(BASE_DIR, "baselines.json")
-BASELINES_URL = "https://pantheongpu.com/assets/baselines.json"
 
 def tprint(*args, **kwargs):
     """Custom print function that automatically prepends a timestamp."""
@@ -3040,10 +2921,6 @@ def main():
     )
     parser.add_argument("--inject_error", action="store_true", help="Inject a hardware fault to test SDC verification")
     parser.add_argument("--platform", choices=["auto", "cuda", "hip", "mock"], default="auto", help="Compiler backend override")
-    parser.add_argument("--baselines", default=None,
-                        help=f"Path or URL of the per-model baselines used for percentiles "
-                             f"(default: PANTHEON_BASELINES, then the bundled file; "
-                             f"published at {BASELINES_URL})")
     args = parser.parse_args()
 
     try:
@@ -3221,19 +3098,13 @@ def main():
 
     print("="*80)
 
-    # The verdict: one word per GPU and the evidence, with each throughput
-    # placed against the public database when a baselines file is present.
-    baselines = load_baselines(args.baselines)
+    # The verdict: one word per GPU and the evidence.
     verdicts = []
     for gid in target_gpus:
         name = next((g.get("name") for g in (gpu_info or []) if g.get("id") == gid), None) or f"GPU {gid}"
-        assessment = assess_gpu(final_results, gid, name, baselines)
+        assessment = assess_gpu(final_results, gid, name)
         verdicts.append(assessment)
-        print(format_verdict(assessment, baselines))
-    if baselines:
-        origin = baselines.get("generated") or ""
-        print(f"Baselines: {baselines.get('source', 'bundled')}"
-              + (f", generated {origin}" if origin else ""))
+        print(format_verdict(assessment))
     print("="*80)
 
     # FILES: Save EVERYTHING (including full names and hidden metrics)
