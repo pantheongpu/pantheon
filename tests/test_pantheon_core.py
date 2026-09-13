@@ -1945,7 +1945,7 @@ def test_failed_diagnostic_is_a_fault_and_failed_load_is_a_watch():
     assert v["verdict"] == "FAULT" and "march_test failed" in v["reasons"][0]
     rows = [_row("tensor_virus", 0.0, "ERR", status="FAIL"), _row("memory_read", 868.0)]
     v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti", BASELINES)
-    assert v["verdict"] == "WATCH" and "tensor_virus did not complete" in v["reasons"][0]
+    assert v["verdict"] == "WATCH" and "did not complete: tensor_virus" in v["reasons"][0]
 
 
 def test_thermal_limit_and_low_score_are_watches_with_the_numbers_in_them():
@@ -1955,9 +1955,11 @@ def test_thermal_limit_and_low_score_are_watches_with_the_numbers_in_them():
     v = pantheon.assess_gpu(rows, 0, "NVIDIA H100 80GB HBM3", base)
     assert v["verdict"] == "WATCH"
     joined = " | ".join(v["reasons"])
-    assert "thermally throttled, GPU at 95 C" in joined
-    assert "38% below the median of 5 NVIDIA H100 80GB HBM3 cards" in joined
+    assert "thermal: memory_read thermally throttled, GPU at 95 C" in joined
+    assert "below the model median: memory_read 38% (5 NVIDIA H100 80GB HBM3 cards)" in joined
     assert v["percentiles"]["memory_read"]["percentile"] == 0
+    assert "thermally throttled on 1" in v["summary"] and "38% below the model median" in v["summary"]
+    assert v["findings"]["below_median"] == [{"test": "memory_read", "percent_below": 38}]
 
 
 def test_hot_but_unthrottled_card_and_hot_memory_are_watches():
@@ -1976,7 +1978,8 @@ def test_link_recovery_is_a_note_and_correctable_errors_are_a_watch():
     rows = [_row("memory_read", 868.0, ras_status="WARNING",
                  ras_delta="vendor_ras.pcie.l0_to_recovery +1 || vendor_ras.pcie.bad_tlp +2")]
     v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti")
-    assert v["verdict"] == "WATCH" and "bad_tlp +2" in v["reasons"][0]
+    assert v["verdict"] == "WATCH" and "pcie.bad_tlp +2" in v["reasons"][0]
+    assert v["reasons"][0].startswith("correctable errors on 1 workload(s)")
     assert "l0_to_recovery" not in v["reasons"][0]
     rows = [_row("memory_read", 868.0, ras_status="ERROR",
                  ras_delta="vendor_ras.ecc.errors.uncorrected.volatile.total +1")]
@@ -2023,7 +2026,7 @@ def test_format_verdict_carries_the_reason_the_percentile_and_the_hint():
     v = pantheon.assess_gpu([_row("memory_read", 868.4)], 0, "NVIDIA GeForce RTX 3080 Ti", None)
     assert pantheon.BASELINES_URL in pantheon.format_verdict(v, None)
     v = pantheon.assess_gpu([_row("memory_read", 1.0, max_temp=95, throttle_reason="Thermal")], 0, "X")
-    assert "! memory_read: thermally throttled" in pantheon.format_verdict(v, None)
+    assert "! thermal: memory_read thermally throttled" in pantheon.format_verdict(v, None)
 
 
 def test_measurements_and_ranks_read_like_prose():
@@ -2036,4 +2039,31 @@ def test_measurements_and_ranks_read_like_prose():
     assert pantheon.rank_phrase(12, 9) == "12th percentile of 9 cards"
     assert pantheon.rank_phrase(0, 5) == "lowest of 5 cards"
     assert pantheon.rank_phrase(100, 5) == "highest of 5 cards"
+
+
+def test_findings_are_grouped_and_ordered_worst_first():
+    base = {"models": {"H": {"tests": {
+        "memory_read": {"unit": "GB/s", "values": [3000.0, 3040.0, 3050.0, 3100.0]},
+        "fp64_virus": {"unit": "TFLOPS", "values": [21.0, 21.5, 21.7, 22.0]},
+        "mma_virus": {"unit": "TFLOPS", "values": [1140.0, 1150.0, 1160.0, 1180.0]}}}}}
+    rows = [_row("memory_read", 1864.0, max_temp=95, throttle_reason="Thermal"),
+            _row("memory_write", 1790.0, max_temp=90),
+            _row("memory_hammer", 1.0, "aggressor-reads/s", max_temp=92),
+            _row("fp64_virus", 13.7, "TFLOPS"),
+            _row("mma_virus", 1155.0, "TFLOPS"),
+            _row("graph_replay", 1.0, "graph-steps/s", ras_status="WARNING",
+                 ras_delta="vendor_ras.pcie.bad_tlp +1 || vendor_ras.pcie.l0_to_recovery +2"),
+            _row("serving_mix", 1.0, "ai-ops/s", ras_status="WARNING",
+                 ras_delta="vendor_ras.pcie.bad_tlp +2 || vendor_ras.pcie.lcrc +1")]
+    v = pantheon.assess_gpu(rows, 0, "H", base)
+    assert v["verdict"] == "WATCH"
+    kinds = [r.split(":")[0] for r in v["reasons"]]
+    assert kinds == ["thermal", "hot", "below the model median", "correctable errors on 2 workload(s)"]
+    assert "memory_hammer GPU reached 92 C, memory_write GPU reached 90 C" in v["reasons"][1]
+    assert "memory_read 39%, fp64_virus 37%" in v["reasons"][2]        # worst first
+    assert "pcie.bad_tlp +3, pcie.lcrc +1" in v["reasons"][3]           # summed across workloads
+    assert list(v["percentiles"]) == ["fp64_virus", "memory_read", "mma_virus"]  # lowest percentile first
+    assert v["summary"].startswith("thermally throttled on 1; hot on 2; 2 workload(s) 37 to 39% below the model median")
+    text = pantheon.format_verdict(v, base)
+    assert text.splitlines()[0].endswith("below the model median; correctable errors on 2)")
 

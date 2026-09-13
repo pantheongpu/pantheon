@@ -813,10 +813,16 @@ def split_ras_details(delta_text):
 
 
 def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
-    """Turn one GPU's result rows into a verdict with its evidence."""
+    """Turn one GPU's result rows into a verdict with its evidence.
+
+    Findings are grouped by kind, so a card that is hot on five workloads and
+    slow on nine reads as two lines, worst first, rather than fourteen in the
+    order the workloads happened to run.
+    """
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
-    faults, watches, notes, percentiles = [], [], [], {}
-    benign_ras = []
+    faults, notes, percentiles = [], [], {}
+    throttled, hot, hot_memory, below, incomplete = [], [], [], [], []
+    ras_serious, benign_ras = {}, []
     ran = 0
     baseline_cards = 0
     for row in mine:
@@ -830,7 +836,7 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
             if test in DIAGNOSTIC_TESTS:
                 faults.append(f"{test} failed: memory errors detected or the workload aborted, see its log")
             else:
-                watches.append(f"{test} did not complete")
+                incomplete.append(test)
             continue
         if test != "baseline_metrics":
             ran += 1
@@ -841,7 +847,7 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
         elif ras_status == "WARNING":
             benign, serious = split_ras_details(row.get("RAS Error Delta"))
             if serious:
-                watches.append(f"{test}: {', '.join(serious)}")
+                ras_serious[test] = serious
             if benign:
                 benign_ras.append(test)
 
@@ -849,11 +855,11 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
         if limit.lower() == "thermal":
-            watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C")
+            throttled.append((test, tmax))
         elif tmax >= THERMAL_WATCH_C:
-            watches.append(f"{test}: GPU reached {tmax:.0f} C")
+            hot.append((test, tmax))
         if tmem >= MEMORY_THERMAL_WATCH_C:
-            watches.append(f"{test}: memory reached {tmem:.0f} C")
+            hot_memory.append((test, tmem))
 
         score = _num(row.get("Score"))
         base = baseline_for(baselines, gpu_name, test)
@@ -865,9 +871,35 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
             percentiles[test] = {"score": score, "unit": unit, "percentile": pct,
                                  "cards": len(values), "median": round(median, 3)}
             if median > 0 and score < BELOW_BASELINE_FRACTION * median:
-                watches.append(
-                    f"{test}: {fmt_measure(score)} {unit} is {100 * (1 - score / median):.0f}% below the "
-                    f"median of {len(values)} {gpu_name} cards")
+                below.append((test, round(100 * (1 - score / median)), len(values)))
+
+    watches = []
+    if throttled:
+        throttled.sort(key=lambda t: -t[1])
+        watches.append("thermal: " + ", ".join(f"{t} thermally throttled, GPU at {c:.0f} C" for t, c in throttled))
+    if hot:
+        hot.sort(key=lambda t: -t[1])
+        watches.append("hot: " + ", ".join(f"{t} GPU reached {c:.0f} C" for t, c in hot))
+    if hot_memory:
+        hot_memory.sort(key=lambda t: -t[1])
+        watches.append("hot memory: " + ", ".join(f"{t} memory reached {c:.0f} C" for t, c in hot_memory))
+    if below:
+        below.sort(key=lambda b: -b[1])
+        cards = max(b[2] for b in below)
+        watches.append("below the model median: "
+                       + ", ".join(f"{t} {pct}%" for t, pct, _ in below)
+                       + f" ({cards} {gpu_name} cards)")
+    if ras_serious:
+        totals = {}
+        for details in ras_serious.values():
+            for item in details:
+                name, _, delta = item.rpartition(" ")
+                short = name.split(".")[-2] + "." + name.split(".")[-1] if name.count(".") >= 2 else name
+                totals[short] = totals.get(short, 0) + _num(delta.lstrip("+"))
+        watches.append(f"correctable errors on {len(ras_serious)} workload(s): "
+                       + ", ".join(f"{k} +{v:g}" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])))
+    if incomplete:
+        watches.append("did not complete: " + ", ".join(incomplete))
 
     if benign_ras:
         notes.append(f"PCIe link recovery events on {len(benign_ras)} workload(s): "
@@ -881,9 +913,40 @@ def assess_gpu(rows, gpu_id, gpu_name, baselines=None):
     else:
         verdict = "INCOMPLETE"
         notes.append("no workload beyond the idle baseline completed")
+
+    summary_bits = []
+    if faults:
+        summary_bits.append(f"{len(faults)} fault(s)")
+    if throttled:
+        summary_bits.append(f"thermally throttled on {len(throttled)}")
+    if hot or hot_memory:
+        summary_bits.append(f"hot on {len(hot) + len(hot_memory)}")
+    if below:
+        summary_bits.append(f"{len(below)} workload(s) {min(b[1] for b in below)} to {max(b[1] for b in below)}% below the model median"
+                            if len(below) > 1 else f"1 workload {below[0][1]}% below the model median")
+    if ras_serious:
+        summary_bits.append(f"correctable errors on {len(ras_serious)}")
+    if incomplete:
+        summary_bits.append(f"{len(incomplete)} incomplete")
+    if verdict == "HEALTHY":
+        summary_bits.append(f"{ran} workload(s) completed"
+                            + (f", {len(percentiles)} placed against {baseline_cards} cards" if percentiles else ""))
+
     return {
         "gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
-        "reasons": faults + watches, "notes": notes, "percentiles": percentiles,
+        "summary": "; ".join(summary_bits),
+        "reasons": faults + watches, "notes": notes,
+        "percentiles": dict(sorted(percentiles.items(),
+                                   key=lambda kv: (kv[1]["percentile"] if kv[1]["percentile"] is not None else 101, kv[0]))),
+        "findings": {
+            "faults": faults,
+            "throttled": [{"test": t, "temp_c": c} for t, c in throttled],
+            "hot": [{"test": t, "temp_c": c} for t, c in hot],
+            "hot_memory": [{"test": t, "temp_c": c} for t, c in hot_memory],
+            "below_median": [{"test": t, "percent_below": p} for t, p, _ in below],
+            "correctable_errors": ras_serious,
+            "incomplete": incomplete,
+        },
         "workloads_completed": ran, "baseline_cards": baseline_cards,
     }
 
@@ -914,7 +977,8 @@ def format_verdict(assessment, baselines=None):
     reset = "\033[0m"
     verdict = assessment["verdict"]
     lines = [f"VERDICT GPU {assessment['gpu_id']}, {assessment['gpu_name']}: "
-             f"{colors.get(verdict, '')}{verdict}{reset}"]
+             f"{colors.get(verdict, '')}{verdict}{reset}"
+             + (f"  ({assessment['summary']})" if assessment.get("summary") else "")]
     for reason in assessment["reasons"]:
         lines.append(f"  ! {reason}")
     for test, p in assessment["percentiles"].items():
