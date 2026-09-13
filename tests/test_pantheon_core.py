@@ -1878,3 +1878,162 @@ def test_throughput_survives_any_whitespace(line):
     score, unit, status, _, _ = pantheon.parse_kernel_output(
         f"{line}\nVerification: PASS\n", "", 0)
     assert (score, unit, status) == (345.5, "GB/s", "PASS")
+
+
+# --- verdict, percentiles, quick suite -------------------------------------
+
+def _row(test, score, unit="GB/s", gpu=0, **overrides):
+    stats = {"max_temp": 60, "max_mem_temp": 0, "throttle_reason": "None"}
+    stats.update({k: v for k, v in overrides.items() if k in ("max_temp", "max_mem_temp", "throttle_reason")})
+    row = pantheon.build_result_row(test, gpu, 60, 99, score, unit, stats,
+                                    status=overrides.get("status", "PASS"))
+    row["RAS Status"] = overrides.get("ras_status", "CLEAN")
+    row["RAS Error Delta"] = overrides.get("ras_delta", "None")
+    return row
+
+
+BASELINES = {"schema": 1, "generated": "2026-09-13", "models": {
+    "NVIDIA GeForce RTX 3080 Ti": {"tests": {
+        "memory_read": {"unit": "GB/s", "cards": 4, "values": [850.0, 860.0, 868.0, 870.0]},
+        "tensor_virus": {"unit": "TFLOPS", "cards": 4, "values": [19.8, 20.1, 20.3, 20.5]},
+    }}}}
+
+
+def test_quick_suite_is_short_and_made_of_registered_workloads():
+    quick = pantheon.SUITES["quick"]
+    assert 4 <= len(quick) <= 6
+    assert set(quick) <= set(pantheon.TEST_REGISTRY)
+    assert "march_test" in quick and "memory_read" in quick
+    assert pantheon.resolve_test_queue("quick") == quick
+
+
+def test_percentile_rank_splits_ties_and_handles_extremes():
+    assert pantheon.percentile_rank([1, 2, 3, 4], 3.5) == 75
+    assert pantheon.percentile_rank([1, 2, 3, 4], 0) == 0
+    assert pantheon.percentile_rank([1, 2, 3, 4], 9) == 100
+    assert pantheon.percentile_rank([2, 2, 2, 2], 2) == 50
+    assert pantheon.percentile_rank([], 1) is None
+
+
+def test_healthy_card_gets_percentiles_against_its_model():
+    rows = [_row("baseline_metrics", 0.0), _row("memory_read", 868.4), _row("tensor_virus", 20.3, "TFLOPS")]
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti", BASELINES)
+    assert v["verdict"] == "HEALTHY" and v["reasons"] == []
+    assert v["percentiles"]["memory_read"]["percentile"] == 75
+    assert v["percentiles"]["memory_read"]["cards"] == 4
+    assert v["percentiles"]["tensor_virus"]["median"] == 20.2
+    assert v["workloads_completed"] == 2 and v["baseline_cards"] == 4
+
+
+def test_no_baseline_means_no_percentiles_but_still_a_verdict():
+    rows = [_row("memory_read", 500.0)]
+    v = pantheon.assess_gpu(rows, 0, "Some Unlisted GPU", BASELINES)
+    assert v["verdict"] == "HEALTHY" and v["percentiles"] == {}
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti", None)
+    assert v["verdict"] == "HEALTHY" and v["percentiles"] == {}
+
+
+def test_fewer_than_three_cards_is_not_a_baseline():
+    thin = {"models": {"X": {"tests": {"memory_read": {"unit": "GB/s", "values": [1.0, 2.0]}}}}}
+    v = pantheon.assess_gpu([_row("memory_read", 1.5)], 0, "X", thin)
+    assert v["percentiles"] == {}
+
+
+def test_failed_diagnostic_is_a_fault_and_failed_load_is_a_watch():
+    rows = [_row("march_test", 0.0, "ERR", status="FAIL"), _row("memory_read", 868.0)]
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti", BASELINES)
+    assert v["verdict"] == "FAULT" and "march_test failed" in v["reasons"][0]
+    rows = [_row("tensor_virus", 0.0, "ERR", status="FAIL"), _row("memory_read", 868.0)]
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti", BASELINES)
+    assert v["verdict"] == "WATCH" and "tensor_virus did not complete" in v["reasons"][0]
+
+
+def test_thermal_limit_and_low_score_are_watches_with_the_numbers_in_them():
+    rows = [_row("memory_read", 1900.0, max_temp=95, throttle_reason="Thermal")]
+    base = {"models": {"NVIDIA H100 80GB HBM3": {"tests": {"memory_read": {
+        "unit": "GB/s", "values": [3020.0, 3040.0, 3045.0, 3050.0, 3140.0]}}}}}
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA H100 80GB HBM3", base)
+    assert v["verdict"] == "WATCH"
+    joined = " | ".join(v["reasons"])
+    assert "thermally throttled, GPU at 95 C" in joined
+    assert "38% below the median of 5 NVIDIA H100 80GB HBM3 cards" in joined
+    assert v["percentiles"]["memory_read"]["percentile"] == 0
+
+
+def test_hot_but_unthrottled_card_and_hot_memory_are_watches():
+    v = pantheon.assess_gpu([_row("mma_virus", 815.0, "TFLOPS", max_temp=91)], 0, "NVIDIA H100 PCIe")
+    assert v["verdict"] == "WATCH" and "GPU reached 91 C" in v["reasons"][0]
+    v = pantheon.assess_gpu([_row("memory_read", 900.0, max_mem_temp=96)], 0, "X")
+    assert v["verdict"] == "WATCH" and "memory reached 96 C" in v["reasons"][0]
+
+
+def test_link_recovery_is_a_note_and_correctable_errors_are_a_watch():
+    rows = [_row("memory_read", 868.0, ras_status="WARNING",
+                 ras_delta="vendor_ras.pcie.l0_to_recovery +4")]
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti")
+    assert v["verdict"] == "HEALTHY"
+    assert any("link power-state cycling" in n for n in v["notes"])
+    rows = [_row("memory_read", 868.0, ras_status="WARNING",
+                 ras_delta="vendor_ras.pcie.l0_to_recovery +1 || vendor_ras.pcie.bad_tlp +2")]
+    v = pantheon.assess_gpu(rows, 0, "NVIDIA GeForce RTX 3080 Ti")
+    assert v["verdict"] == "WATCH" and "bad_tlp +2" in v["reasons"][0]
+    assert "l0_to_recovery" not in v["reasons"][0]
+    rows = [_row("memory_read", 868.0, ras_status="ERROR",
+                 ras_delta="vendor_ras.ecc.errors.uncorrected.volatile.total +1")]
+    assert pantheon.assess_gpu(rows, 0, "X")["verdict"] == "FAULT"
+
+
+def test_only_the_idle_baseline_is_incomplete_and_not_run_rows_are_notes():
+    rows = [_row("baseline_metrics", 0.0),
+            pantheon.build_failure_row("march_test", 0, 60, 99, "nvcc missing", "compile")]
+    v = pantheon.assess_gpu(rows, 0, "X")
+    assert v["verdict"] == "INCOMPLETE"
+    assert any("march_test did not run (compile: nvcc missing)" in n for n in v["notes"])
+
+
+def test_other_gpus_rows_do_not_leak_into_a_verdict():
+    rows = [_row("march_test", 0.0, "ERR", gpu=1, status="FAIL"), _row("memory_read", 868.0, gpu=0)]
+    assert pantheon.assess_gpu(rows, 0, "X")["verdict"] == "HEALTHY"
+    assert pantheon.assess_gpu(rows, 1, "X")["verdict"] == "FAULT"
+
+
+def test_load_baselines_prefers_explicit_then_env_then_bundled(tmp_path, monkeypatch):
+    good = tmp_path / "b.json"
+    good.write_text(json.dumps(BASELINES), encoding="utf-8")
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(pantheon, "BASELINES_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.delenv("PANTHEON_BASELINES", raising=False)
+    assert pantheon.load_baselines() is None
+    monkeypatch.setenv("PANTHEON_BASELINES", str(good))
+    loaded = pantheon.load_baselines()
+    assert loaded["models"] and loaded["source"] == str(good)
+    assert pantheon.load_baselines(str(bad)) is None          # unreadable: no crash
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text(json.dumps({"hello": 1}), encoding="utf-8")
+    assert pantheon.load_baselines(str(wrong)) is None        # wrong shape: no crash
+
+
+def test_format_verdict_carries_the_reason_the_percentile_and_the_hint():
+    v = pantheon.assess_gpu([_row("memory_read", 868.4), _row("tensor_virus", 20.3, "TFLOPS")],
+                            0, "NVIDIA GeForce RTX 3080 Ti", BASELINES)
+    text = pantheon.format_verdict(v, BASELINES)
+    assert "VERDICT GPU 0, NVIDIA GeForce RTX 3080 Ti" in text and "HEALTHY" in text
+    assert "memory_read" in text and "75th percentile of 4 cards" in text
+    v = pantheon.assess_gpu([_row("memory_read", 868.4)], 0, "NVIDIA GeForce RTX 3080 Ti", None)
+    assert pantheon.BASELINES_URL in pantheon.format_verdict(v, None)
+    v = pantheon.assess_gpu([_row("memory_read", 1.0, max_temp=95, throttle_reason="Thermal")], 0, "X")
+    assert "! memory_read: thermally throttled" in pantheon.format_verdict(v, None)
+
+
+def test_measurements_and_ranks_read_like_prose():
+    assert pantheon.fmt_measure(317927000.0) == "317,927,000"
+    assert pantheon.fmt_measure(868.4) == "868.4"
+    assert pantheon.fmt_measure(20.34) == "20.3"
+    assert pantheon.fmt_measure(5.66683) == "5.67"
+    assert pantheon.rank_phrase(75, 4) == "75th percentile of 4 cards"
+    assert pantheon.rank_phrase(1, 9) == "1st percentile of 9 cards"
+    assert pantheon.rank_phrase(12, 9) == "12th percentile of 9 cards"
+    assert pantheon.rank_phrase(0, 5) == "lowest of 5 cards"
+    assert pantheon.rank_phrase(100, 5) == "highest of 5 cards"
+
