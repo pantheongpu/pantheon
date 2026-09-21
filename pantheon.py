@@ -1610,6 +1610,15 @@ _NV_ESC_REGISTER_FD, _NV_ESC_RM_FREE, _NV_ESC_RM_CONTROL, _NV_ESC_RM_ALLOC = 201
 _NV01_ROOT, _NV01_DEVICE_0, _NV20_SUBDEVICE_0 = 0x0, 0x80, 0x2080
 _NV2080_CTRL_CMD_FB_GET_INFO_V2 = 0x20801303
 _NV_FB_INFO_INDEX_RAM_TYPE, _NV_FB_INFO_INDEX_VENDOR_ID = 0x0D, 0x1C
+# FB_GET_INFO_V2 carries a fixed-length list whose length has grown with the
+# driver, and RM refuses a control whose parameters are not exactly the size its
+# own header says, with NV_ERR_INVALID_ARGUMENT, before reading them. From
+# NVIDIA's open-gpu-kernel-modules headers (NV2080_CTRL_FB_INFO_MAX_LIST_SIZE):
+# 128 from 580, 57 on 560-575, 55 on 545-550, 54 on 525-535. Tried newest
+# first; a wrong guess costs one rejected ioctl. Sending only the 580 size is
+# why every Lambda host (570.148.08) reported the vendor as unavailable.
+_NV_FB_INFO_LIST_SIZES = (0x80, 0x39, 0x37, 0x36)
+_NV_ERR_INVALID_ARGUMENT = 0x1F
 
 
 class _NVOS21_PARAMETERS(ctypes.Structure):  # RM alloc
@@ -1643,8 +1652,17 @@ class _NV2080_CTRL_FB_INFO(ctypes.Structure):
     _fields_ = [("index", ctypes.c_uint32), ("data", ctypes.c_uint32)]
 
 
-class _NV2080_CTRL_FB_GET_INFO_V2_PARAMS(ctypes.Structure):
-    _fields_ = [("fbInfoListSize", ctypes.c_uint32), ("fbInfoList", _NV2080_CTRL_FB_INFO * 128)]
+_FB_GET_INFO_V2_PARAMS = {}
+
+
+def _fb_get_info_v2_params(list_size):
+    """NV2080_CTRL_FB_GET_INFO_V2_PARAMS for a driver whose list holds `list_size` entries."""
+    if list_size not in _FB_GET_INFO_V2_PARAMS:
+        _FB_GET_INFO_V2_PARAMS[list_size] = type(
+            f"_NV2080_CTRL_FB_GET_INFO_V2_PARAMS_{list_size}", (ctypes.Structure,),
+            {"_fields_": [("fbInfoListSize", ctypes.c_uint32),
+                          ("fbInfoList", _NV2080_CTRL_FB_INFO * list_size)]})
+    return _FB_GET_INFO_V2_PARAMS[list_size]
 
 
 class _NV_IOCTL_REGISTER_FD(ctypes.Structure):
@@ -1716,12 +1734,16 @@ def nvidia_memory_info(gpu_index, bus_id=None, dev_root="/dev", proc_root="/proc
             device = _nv_rm_alloc(ctl, root, root, _NV01_DEVICE_0,
                                   _NV0080_ALLOC_PARAMETERS(deviceId=minor, hClientShare=root))
             subdevice = _nv_rm_alloc(ctl, root, device, _NV20_SUBDEVICE_0, _NV2080_ALLOC_PARAMETERS(subDeviceId=0))
-            query = _NV2080_CTRL_FB_GET_INFO_V2_PARAMS(fbInfoListSize=2)
-            query.fbInfoList[0].index = _NV_FB_INFO_INDEX_RAM_TYPE
-            query.fbInfoList[1].index = _NV_FB_INFO_INDEX_VENDOR_ID
-            control = _NVOS54_PARAMETERS(hClient=root, hObject=subdevice, cmd=_NV2080_CTRL_CMD_FB_GET_INFO_V2,
-                                         flags=0, params=ctypes.addressof(query), paramsSize=ctypes.sizeof(query))
-            fcntl.ioctl(ctl, _nv_iowr(_NV_ESC_RM_CONTROL, ctypes.sizeof(control)), control)
+            for list_size in _NV_FB_INFO_LIST_SIZES:
+                query = _fb_get_info_v2_params(list_size)(fbInfoListSize=2)
+                query.fbInfoList[0].index = _NV_FB_INFO_INDEX_RAM_TYPE
+                query.fbInfoList[1].index = _NV_FB_INFO_INDEX_VENDOR_ID
+                control = _NVOS54_PARAMETERS(hClient=root, hObject=subdevice, cmd=_NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                                             flags=0, params=ctypes.addressof(query),
+                                             paramsSize=ctypes.sizeof(query))
+                fcntl.ioctl(ctl, _nv_iowr(_NV_ESC_RM_CONTROL, ctypes.sizeof(control)), control)
+                if control.status != _NV_ERR_INVALID_ARGUMENT:
+                    break
             if control.status:
                 raise RuntimeError(f"FB_GET_INFO_V2 returned status 0x{control.status:x}")
             memory_type, vendor = decode_memory_info(query.fbInfoList[0].data, query.fbInfoList[1].data)

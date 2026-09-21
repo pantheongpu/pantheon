@@ -1,3 +1,4 @@
+import ctypes
 import os
 import re
 import json
@@ -1603,6 +1604,72 @@ def test_nvidia_memory_info_degrades_to_na_without_device_nodes(tmp_path):
     assert info["memory_type"] == "N/A"
     assert info["memory_vendor"] == "N/A"
     assert info["memory_vendor_source"].startswith("unavailable:")
+
+
+class _FakeRmDriver:
+    """Just enough of /dev/nvidiactl to answer FB_GET_INFO_V2 like one driver branch."""
+
+    def __init__(self, list_size, status=0, ram_type=0x14, vendor=0x6):
+        self.list_size, self.status = list_size, status
+        self.ram_type, self.vendor = ram_type, vendor
+        self.sizes_seen = []
+
+    def ioctl(self, fd, request, arg):
+        nr = request & 0xFF
+        if nr == pantheon._NV_ESC_RM_ALLOC:
+            arg.hObjectNew, arg.status = 0x1000 + arg.hClass, 0
+        elif nr == pantheon._NV_ESC_RM_CONTROL:
+            self.sizes_seen.append(arg.paramsSize)
+            if arg.paramsSize != 4 + 8 * self.list_size:
+                arg.status = pantheon._NV_ERR_INVALID_ARGUMENT
+                return
+            entry_data = lambda i: ctypes.c_uint32.from_address(arg.params + 4 + 8 * i + 4)
+            entry_data(0).value, entry_data(1).value = self.ram_type, self.vendor
+            arg.status = self.status
+
+
+def _fake_device_nodes(tmp_path):
+    (tmp_path / "nvidiactl").write_text("")
+    (tmp_path / "nvidia0").write_text("")
+
+
+@pytest.mark.parametrize("list_size, driver", [
+    (0x80, "580 and newer"), (0x39, "560-575, e.g. Lambda's 570.148.08"),
+    (0x37, "545-550"), (0x36, "525-535"),
+])
+def test_nvidia_memory_info_matches_the_drivers_list_size(tmp_path, monkeypatch, list_size, driver):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(list_size)
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info == {"memory_type": "HBM3", "memory_vendor": "SK hynix", "memory_vendor_source": "nvidia-rm"}, driver
+    assert fake.sizes_seen[-1] == 4 + 8 * list_size
+    assert fake.sizes_seen[0] == 4 + 8 * 0x80        # newest layout is tried first
+
+
+def test_nvidia_memory_info_does_not_retry_a_real_refusal(tmp_path, monkeypatch):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(0x80, status=0x56)          # NV_ERR_NOT_SUPPORTED
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info["memory_vendor"] == "N/A"
+    assert info["memory_vendor_source"] == "unavailable: FB_GET_INFO_V2 returned status 0x56"
+    assert len(fake.sizes_seen) == 1
+
+
+def test_nvidia_memory_info_reports_an_unknown_list_size(tmp_path, monkeypatch):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(0x20)                       # a layout no known driver uses
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info["memory_vendor_source"] == "unavailable: FB_GET_INFO_V2 returned status 0x1f"
+    assert len(fake.sizes_seen) == len(pantheon._NV_FB_INFO_LIST_SIZES)
 
 
 def test_amd_memory_info_names_the_vendor_rocm_smi_reports():
