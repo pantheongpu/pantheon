@@ -15,6 +15,13 @@ try:
 except ImportError:
     pynvml = None
 
+# Host CPU sampling is optional in the same way: without psutil the CPU
+# columns report "N/A" and everything else is unaffected.
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 
 # NVML's clock-event reasons, by bit (nvml.h). Decoded in one place because the
 # NVML and nvidia-smi paths used to decode them separately, and disagreed: the
@@ -138,6 +145,12 @@ def amd_sysfs_readings(device_dir):
 
 
 class HardwareMonitor:
+    # psutil measures CPU load between consecutive calls. The first tick lands
+    # a few milliseconds after the priming call, too short an interval to mean
+    # anything, so host samples taken before this much time has passed are
+    # recorded as missing rather than as a number.
+    HOST_WARMUP_S = 0.5
+
     def __init__(self, platform):
         self.platform = platform
         self.sysfs_drm_root = SYSFS_DRM_ROOT
@@ -231,6 +244,10 @@ class HardwareMonitor:
             'pcie_gen': [], 'pcie_width': [], 'throttle': [],
             'gpu_util': [], 'mem_used': [], 'mem_total': [], 'elapsed': []
         } for gid in gpu_ids}
+        # The host is sampled on the same ticks as the GPUs. One set for the
+        # machine, not one per GPU: every GPU in the run shares the CPU.
+        self.host = {'cpu_util': [], 'cpu_busiest_core': [], 'cpu_freq': [], 'elapsed': []}
+        self._host_primed_at = time.time()
         
         csv_path = os.path.join(output_dir, "time_series.csv")
         write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
@@ -243,15 +260,36 @@ class HardwareMonitor:
                 "Power(W)", "Clock(MHz)",
                 "Fan(%)", "Volts_Core(mV)", "Volts_SoC(mV)",
                 "PCIe_Gen", "PCIe_Width", "Throttle_Reason",
-                "GPU_Utilization(%)", "Memory_Used(MiB)", "Memory_Total(MiB)"
+                "GPU_Utilization(%)", "Memory_Used(MiB)", "Memory_Total(MiB)",
+                "CPU_Utilization(%)", "CPU_Busiest_Core(%)", "CPU_Clock(MHz)"
             ])
         
         self.thread = threading.Thread(target=self._loop, args=(gpu_ids,))
         self.thread.start()
 
+    def _prime_host(self):
+        """Start psutil's CPU-load interval on the thread that will sample it.
+
+        psutil answers cpu_percent() relative to the previous call, and since
+        psutil 6 it keeps that previous call per thread. Priming anywhere else
+        leaves this thread without a baseline, and its first reading is 0.0 --
+        observed as a spurious idle second at the start of every workload.
+        """
+        if psutil is not None:
+            try:
+                psutil.cpu_percent(percpu=True)
+            except Exception:
+                pass
+        self._host_primed_at = time.time()
+
     def _loop(self, gpu_ids):
+        self._prime_host()
         start_t = time.time()
-        while self.running:
+        # At least one tick even when stop_collection() lands before this
+        # thread gets going, so a very short workload still has a sample.
+        first_tick = True
+        while self.running or first_tick:
+            first_tick = False
             try:
                 if self.platform == "MOCK":
                     pass
@@ -264,6 +302,14 @@ class HardwareMonitor:
                 print(f"[MONITOR DEBUG] Polling error: {e}")
             
             elapsed = round(time.time() - start_t, 2)
+            if time.time() - self._host_primed_at >= self.HOST_WARMUP_S:
+                cpu_util, cpu_core, cpu_freq = self._poll_host()
+            else:
+                cpu_util = cpu_core = cpu_freq = None
+            self.host['cpu_util'].append(cpu_util)
+            self.host['cpu_busiest_core'].append(cpu_core)
+            self.host['cpu_freq'].append(cpu_freq)
+            self.host['elapsed'].append(elapsed)
             for gid in gpu_ids:
                 h = self.history[gid]
                 
@@ -288,12 +334,38 @@ class HardwareMonitor:
                 mt  = get_last('mem_total')
                 h['elapsed'].append(elapsed)
                     
-                self.csv_writer.writerow([self.test_name, elapsed, gid, t_c, t_m, p, c, f, v_c, v_s, pg, pw, tr, gu, mu, mt])
+                self.csv_writer.writerow([self.test_name, elapsed, gid, t_c, t_m, p, c, f, v_c, v_s, pg, pw, tr, gu, mu, mt,
+                                          *("N/A" if v is None else round(v, 1)
+                                            for v in (cpu_util, cpu_core, cpu_freq))])
             
             self.csv_file.flush()
             time.sleep(1)
         
         self.csv_file.close()
+
+    @staticmethod
+    def _poll_host():
+        """Host CPU for one tick: machine-wide load, the busiest core, and clock.
+
+        The busiest core is what exposes a host bottleneck. A benchmark that is
+        waiting on one launch thread pins a single core while the machine-wide
+        average stays low -- one saturated core of eight reads as 12.5%.
+        Returns None for anything that could not be read.
+        """
+        if psutil is None:
+            return None, None, None
+        try:
+            per_core = psutil.cpu_percent(percpu=True)
+        except Exception:
+            per_core = []
+        util = sum(per_core) / len(per_core) if per_core else None
+        busiest = max(per_core) if per_core else None
+        try:
+            freq = psutil.cpu_freq()
+            freq = freq.current if freq and freq.current else None
+        except Exception:
+            freq = None
+        return util, busiest, freq
 
     def stop_collection(self, measurement_window_seconds=None):
         self.running = False
@@ -545,8 +617,31 @@ class HardwareMonitor:
         except Exception as e:
             self._warn_once("amd_poll", f"[MONITOR] rocm-smi polling failed: {e}.")
 
+    def _host_stats(self, measurement_window_seconds=None):
+        host = getattr(self, "host", None) or {}
+        elapsed = list(host.get('elapsed', []))
+        keep = [True] * len(elapsed)
+        if measurement_window_seconds is not None and len(elapsed) > 1 and measurement_window_seconds > 0:
+            cutoff = elapsed[-1] - float(measurement_window_seconds)
+            keep = [t >= cutoff for t in elapsed]
+
+        def series(key):
+            return [v for v, k in zip(host.get(key, []), keep) if k and v is not None]
+
+        def mean(values): return float(round(np.mean(values), 1)) if values else "N/A"
+        def peak(values): return float(round(np.max(values), 1)) if values else "N/A"
+        util, busiest, freq = series('cpu_util'), series('cpu_busiest_core'), series('cpu_freq')
+        return {
+            "avg_cpu_util": mean(util),
+            "max_cpu_util": peak(util),
+            "avg_cpu_busiest_core": mean(busiest),
+            "max_cpu_busiest_core": peak(busiest),
+            "avg_cpu_clk": mean(freq),
+        }
+
     def _aggregate(self, measurement_window_seconds=None):
         stats = {}
+        host_stats = self._host_stats(measurement_window_seconds)
         for gid, data in self.history.items():
             samples = data
             if measurement_window_seconds is not None:
@@ -601,6 +696,7 @@ class HardwareMonitor:
                 "max_volts_soc": safe_max(samples['volts_soc']),
                 "pcie_gen": safe_max(samples['pcie_gen']),
                 "pcie_width": safe_max(samples['pcie_width']),
-                "throttle_reason": mode_str(samples['throttle'])
+                "throttle_reason": mode_str(samples['throttle']),
+                **host_stats,
             }
         return stats

@@ -2040,6 +2040,7 @@ def get_system_snapshot(platform_name):
     if psutil:
         vm = psutil.virtual_memory()
         snapshot["cpu_info"] = {
+            "model": get_cpu_model(),
             "physical_cores": psutil.cpu_count(logical=False),
             "logical_cores": psutil.cpu_count(logical=True),
             "freq": f"{psutil.cpu_freq().current:.2f}Mhz" if psutil.cpu_freq() else "N/A"
@@ -2050,6 +2051,35 @@ def get_system_snapshot(platform_name):
         }
 
     return snapshot
+
+
+def get_cpu_model(cpuinfo_path="/proc/cpuinfo"):
+    """The host CPU's product name, or "N/A".
+
+    Two runs of one GPU on different host CPUs can differ on launch-bound
+    workloads, so the host has to be identifiable. x86 kernels publish the name
+    as "model name" in /proc/cpuinfo; arm64 kernels do not, and lscpu derives
+    the core design from the implementer and part codes instead.
+    """
+    try:
+        with open(cpuinfo_path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                if key.strip().lower() == "model name" and value.strip():
+                    return " ".join(value.split())
+    except OSError:
+        pass
+    if shutil.which("lscpu"):
+        try:
+            listing = subprocess.run(["lscpu"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     universal_newlines=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            listing = ""
+        for line in listing.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "Model name" and value.strip() not in ("", "-"):
+                return " ".join(value.split())
+    return platform.processor() or "N/A"
 
 
 def write_incremental_workload_reports(snapshot, rows, run_id, sequence):
@@ -3177,6 +3207,11 @@ def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats,
         "Max Clock (MHz)": stats.get("max_clk", 0),
         "Avg GPU Util (%)": stats.get("avg_gpu_util", 0),
         "Max GPU Util (%)": stats.get("max_gpu_util", 0),
+        "Avg CPU Util (%)": stats.get("avg_cpu_util", "N/A"),
+        "Max CPU Util (%)": stats.get("max_cpu_util", "N/A"),
+        "Avg Busiest Core (%)": stats.get("avg_cpu_busiest_core", "N/A"),
+        "Max Busiest Core (%)": stats.get("max_cpu_busiest_core", "N/A"),
+        "Avg CPU Clock (MHz)": stats.get("avg_cpu_clk", "N/A"),
         "Peak Memory (MiB)": stats.get("peak_mem_used", 0),
         "Memory Total (MiB)": stats.get("mem_total", 0),
         "Energy (Wh)": stats.get("energy_wh", 0),
