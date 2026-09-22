@@ -517,6 +517,24 @@ is not installed, and a few were Pantheon not looking:
 | Limit reason | Decoded from the clock-event reasons. | Not reported: no cheap throttle reading exists to poll. |
 | Throughput variance | N/A unless a workload prints more than one `Throughput:` line; most print one. | Same. |
 
+## Host CPU
+
+Each report names the host CPU in `cpu_info.model`, and every workload row
+records what the CPU was doing while the workload ran, sampled on the same
+one-second ticks as the GPU telemetry:
+
+- `Avg CPU Util (%)` / `Max CPU Util (%)`: load across the whole machine.
+- `Avg Busiest Core (%)` / `Max Busiest Core (%)`: load on the single busiest
+  core at each tick. This is the column that exposes a host bottleneck: a
+  workload waiting on one launch thread pins one core while the machine-wide
+  average stays low (one saturated core of eight reads as 12.5%).
+- `Avg CPU Clock (MHz)`: average host CPU clock.
+
+Read them next to `Avg GPU Util (%)`. A GPU near 100% busy with an idle host is
+GPU-bound. A GPU that is noticeably less busy while the busiest core sits near
+100% is waiting for the host to hand it work, so a faster or less loaded host
+CPU would raise the score. The per-second values are in `time_series.csv`.
+
 ## Per-workload documentation
 
 Each workload has its own page under `kernels/<test>/README.md` describing what

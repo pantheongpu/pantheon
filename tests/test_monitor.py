@@ -627,3 +627,108 @@ def test_amd_link_downshifted_at_idle_does_not_hide_the_link_under_load(monkeypa
     monitor.history[0]["temp_core"] = [50.0, 51.0]
 
     assert monitor._aggregate()[0]["pcie_gen"] == 4.0
+
+
+class _FakePsutil:
+    """psutil as the monitor sees it: per-core load and one clock reading."""
+
+    def __init__(self, per_core, mhz):
+        self.per_core, self.mhz = per_core, mhz
+
+    def cpu_percent(self, percpu=False):
+        return list(self.per_core)
+
+    def cpu_freq(self):
+        class Freq:
+            current = self.mhz
+        return Freq()
+
+
+def _one_tick(monitor, monkeypatch, tmp_path):
+    monkeypatch.setattr(HardwareMonitor, "HOST_WARMUP_S", 0)
+    def stop_after_first_sample(_seconds):
+        monitor.running = False
+
+    monkeypatch.setattr("monitor.time.sleep", stop_after_first_sample)
+    monitor.start_collection([0], tmp_path, "scheduler")
+    return monitor.stop_collection()
+
+
+def test_host_cpu_is_sampled_with_the_busiest_core(tmp_path, monkeypatch):
+    # One launch thread saturating one core of four: the machine-wide average
+    # hides it, the busiest core shows it.
+    monkeypatch.setattr("monitor.psutil", _FakePsutil([100.0, 4.0, 2.0, 2.0], 3100.0))
+    stats = _one_tick(HardwareMonitor("MOCK"), monkeypatch, tmp_path)[0]
+
+    assert stats["avg_cpu_util"] == 27.0
+    assert stats["avg_cpu_busiest_core"] == 100.0
+    assert stats["max_cpu_busiest_core"] == 100.0
+    assert stats["avg_cpu_clk"] == 3100.0
+
+    with (tmp_path / "time_series.csv").open(newline="", encoding="utf-8") as f:
+        row = list(csv.DictReader(f))[0]
+    assert row["CPU_Utilization(%)"] == "27.0"
+    assert row["CPU_Busiest_Core(%)"] == "100.0"
+    assert row["CPU_Clock(MHz)"] == "3100.0"
+
+
+def test_host_cpu_is_na_without_psutil(tmp_path, monkeypatch):
+    monkeypatch.setattr("monitor.psutil", None)
+    stats = _one_tick(HardwareMonitor("MOCK"), monkeypatch, tmp_path)[0]
+
+    for key in ("avg_cpu_util", "max_cpu_util", "avg_cpu_busiest_core",
+                "max_cpu_busiest_core", "avg_cpu_clk"):
+        assert stats[key] == "N/A"
+
+
+def test_host_cpu_uses_the_same_measurement_window_as_the_gpu():
+    monitor = HardwareMonitor("MOCK")
+    monitor.history = {0: {key: [] for key in (
+        "temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core",
+        "volts_soc", "pcie_gen", "pcie_width", "throttle", "gpu_util",
+        "mem_used", "mem_total", "elapsed")}}
+    monitor.host = {
+        "cpu_util": [90.0, 90.0, 20.0, 30.0],        # setup is busy, the run is not
+        "cpu_busiest_core": [100.0, 100.0, 40.0, 60.0],
+        "cpu_freq": [2000.0, None, 3000.0, 3200.0],  # a tick with no clock reading
+        "elapsed": [0, 5, 10, 15],
+    }
+
+    stats = monitor._aggregate(measurement_window_seconds=5)[0]
+
+    assert stats["avg_cpu_util"] == 25.0
+    assert stats["max_cpu_busiest_core"] == 60.0
+    assert stats["avg_cpu_clk"] == 3100.0
+
+
+def test_first_host_tick_inside_the_warmup_is_not_a_reading(tmp_path, monkeypatch):
+    monkeypatch.setattr("monitor.psutil", _FakePsutil([0.0, 0.0], 3000.0))
+    monitor = HardwareMonitor("MOCK")
+
+    def stop_after_first_sample(_seconds):
+        monitor.running = False
+
+    monkeypatch.setattr("monitor.time.sleep", stop_after_first_sample)
+    monitor.start_collection([0], tmp_path, "scheduler")
+    stats = monitor.stop_collection()[0]
+
+    # The only tick came before the warm-up elapsed: no number is invented.
+    assert stats["avg_cpu_util"] == "N/A"
+
+
+def test_host_cpu_is_primed_on_the_sampling_thread(tmp_path, monkeypatch):
+    # psutil keeps the cpu_percent() baseline per thread; a baseline set on
+    # another thread makes the first real reading 0.0.
+    import threading
+    calls = []
+
+    class ThreadAwarePsutil(_FakePsutil):
+        def cpu_percent(self, percpu=False):
+            calls.append(threading.get_ident())
+            return super().cpu_percent(percpu)
+
+    monkeypatch.setattr("monitor.psutil", ThreadAwarePsutil([50.0, 50.0], 3000.0))
+    stats = _one_tick(HardwareMonitor("MOCK"), monkeypatch, tmp_path)[0]
+
+    assert len(calls) == 2 and calls[0] == calls[1] != threading.get_ident()
+    assert stats["avg_cpu_util"] == 50.0

@@ -694,6 +694,41 @@ def test_parse_kernel_output_preserves_parameter_lines():
     assert "Verification: PASS (0 errors)" in lines
 
 
+def test_cpu_model_comes_from_proc_cpuinfo(tmp_path):
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor\t: 0\nvendor_id\t: GenuineIntel\n"
+                       "model name\t: Intel(R) Xeon(R)   Platinum 8559C\n", encoding="utf-8")
+    assert pantheon.get_cpu_model(str(cpuinfo)) == "Intel(R) Xeon(R) Platinum 8559C"
+
+
+def test_cpu_model_falls_back_to_lscpu_on_arm(tmp_path, monkeypatch):
+    # arm64 /proc/cpuinfo has implementer and part codes but no model name.
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd0c\n", encoding="utf-8")
+    monkeypatch.setattr(pantheon.shutil, "which", lambda name: "/usr/bin/lscpu")
+
+    class Listing:
+        stdout = "Architecture:  aarch64\nVendor ID:     ARM\nModel name:    Neoverse-N1\n"
+
+    monkeypatch.setattr(pantheon.subprocess, "run", lambda *a, **k: Listing())
+    assert pantheon.get_cpu_model(str(cpuinfo)) == "Neoverse-N1"
+
+
+def test_build_result_row_carries_host_cpu_telemetry():
+    stats = {"avg_gpu_util": 81.0, "avg_cpu_util": 14.2, "max_cpu_util": 19.0,
+             "avg_cpu_busiest_core": 98.5, "max_cpu_busiest_core": 100.0, "avg_cpu_clk": 3900.0}
+    row = pantheon.build_result_row("scheduler", 0, 60, 99, 400.0, "KIPS", stats)
+
+    assert row["Avg CPU Util (%)"] == 14.2
+    assert row["Max CPU Util (%)"] == 19.0
+    assert row["Avg Busiest Core (%)"] == 98.5
+    assert row["Max Busiest Core (%)"] == 100.0
+    assert row["Avg CPU Clock (MHz)"] == 3900.0
+    # Stats from a monitor that never sampled the host still produce the columns.
+    bare = pantheon.build_result_row("scheduler", 0, 60, 99, 400.0, "KIPS", {})
+    assert bare["Avg CPU Util (%)"] == "N/A"
+
+
 def test_build_result_row_includes_profile_metadata_and_counter_summary():
     row = pantheon.build_result_row(
         "fp64_virus",
