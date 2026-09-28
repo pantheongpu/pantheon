@@ -2,6 +2,27 @@
 
 Pantheon is a cross-platform (CUDA/ROCm) stress testing tool designed to isolate and hammer specific GPU subsystems. Unlike generic benchmarks (Furmark, 3DMark), Pantheon allows you to test specific silicon limits.
 
+## Install
+
+This repository is the source. To install a released version:
+
+```bash
+pipx install pantheon-gpu                     # PyPI
+conda install -c conda-forge pantheon-gpu     # conda-forge
+```
+
+Either one installs a `pantheon` command. The [install guide](https://pantheongpu.com/getting-started/)
+covers the apt and COPR repositories and the container image as well.
+
+To check the GPUs of a self-hosted GitHub Actions runner before a job uses them:
+
+```yaml
+- uses: pantheongpu/gpu-health-check@v0
+```
+
+[Pantheon GPU Health Check](https://github.com/marketplace/actions/pantheon-gpu-health-check)
+on the GitHub Marketplace lists its options.
+
 ## Requirements
 
 ### Running From Source
