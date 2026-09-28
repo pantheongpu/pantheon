@@ -65,6 +65,21 @@ python3 pantheon.py --test pulse_virus --duration 60
 python3 pantheon.py --test quick
 ```
 
+## Choosing GPUs
+
+`--gpu` takes the numbers `nvidia-smi` shows: `--gpu 0`, `--gpu 0,2` or `--gpu all`, which is the default.
+
+Pantheon tests only the cards its job has been given. If `CUDA_VISIBLE_DEVICES` is set, as a scheduler sets it when a job gets some of a machine's cards, `--gpu all` means the cards it lists, and asking for any other card by number is an error that says the card is hidden. The variable may name cards by number or by UUID, as CUDA accepts them.
+
+Reports keep `nvidia-smi`'s numbers. A run with `CUDA_VISIBLE_DEVICES=2` tests one card and reports it as GPU 2, with that card's UUID, temperature and error counters, and leaves the hidden cards out of the report.
+
+```bash
+# A job that was given the third card of a four-card machine
+CUDA_VISIBLE_DEVICES=2 python3 pantheon.py --test quick
+```
+
+On AMD, `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` are not translated yet. Pantheon says so when either is set. Run it with every card of the machine visible.
+
 ## Ray tracing workload (rt_virus)
 
 NVIDIA's OptiX headers are proprietary and not redistributable, so this tree

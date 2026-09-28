@@ -1990,3 +1990,197 @@ def test_format_verdict_carries_the_word_the_summary_and_the_reasons():
     assert "(1 workload(s) completed)" in text
     v = pantheon.assess_gpu([_row("memory_read", 1.0, max_temp=95, throttle_reason="Thermal")], 0, "X")
     assert "! thermal: memory_read thermally throttled" in pantheon.format_verdict(v)
+
+
+# --- CUDA_VISIBLE_DEVICES ----------------------------------------------------
+#
+# A scheduler that gives a job one card of four sets CUDA_VISIBLE_DEVICES and
+# nothing else: nvidia-smi still shows four. Pantheon used to start a workload
+# on every card nvidia-smi showed, so a card the job was not given came back as
+# "invalid device ordinal" and was reported as failed.
+
+UUIDS = [
+    "GPU-aaaaaaaa-0000-0000-0000-000000000000",
+    "GPU-bbbbbbbb-1111-1111-1111-111111111111",
+    "GPU-bbbbcccc-2222-2222-2222-222222222222",
+    "GPU-dddddddd-3333-3333-3333-333333333333",
+]
+
+
+def visible(value, platform_name="CUDA", count=4, uuids=UUIDS, variable="CUDA_VISIBLE_DEVICES"):
+    environ = {} if value is None else {variable: value}
+    return pantheon.resolve_visible_devices(platform_name, count, uuids, environ)
+
+
+def test_nothing_is_hidden_when_the_variable_is_unset():
+    result = visible(None)
+    assert result["restricted"] is False
+    assert result["allowed"] == [0, 1, 2, 3]
+    assert result["ordinals"] == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_one_visible_card_is_device_zero_to_the_workload():
+    # The case that was reported: the job has card 2 only. CUDA calls it 0.
+    result = visible("2")
+    assert result["restricted"] is True
+    assert result["allowed"] == [2]
+    assert result["ordinals"] == {2: 0}
+
+
+def test_workload_numbers_follow_the_order_of_the_variable():
+    result = visible("3,1")
+    assert result["allowed"] == [3, 1]
+    assert result["ordinals"] == {3: 0, 1: 1}
+
+
+def test_cards_can_be_named_by_uuid_or_by_a_unique_prefix_of_it():
+    assert visible(UUIDS[3])["ordinals"] == {3: 0}
+    assert visible("GPU-dddd, GPU-aaaa")["ordinals"] == {3: 0, 0: 1}
+    assert visible("gpu-DDDD")["allowed"] == [3]
+
+
+def test_an_ambiguous_uuid_prefix_names_no_card():
+    # GPU-bbbb is the start of two cards.
+    assert visible("GPU-bbbb")["allowed"] == []
+    assert visible("0,GPU-bbbb,3")["allowed"] == [0]
+
+
+def test_reading_stops_at_the_first_identifier_that_cannot_be_used():
+    # As CUDA does: the cards before it are visible, the ones after are not.
+    assert visible("1,9,2")["allowed"] == [1]
+    assert visible("1,1,2")["allowed"] == [1]
+    assert visible("1,,2")["allowed"] == [1]
+    assert visible("-1")["allowed"] == []
+    assert visible("none")["allowed"] == []
+
+
+def test_an_empty_variable_hides_every_card():
+    result = visible("")
+    assert result["restricted"] is True
+    assert result["allowed"] == []
+
+
+def test_spaces_around_identifiers_are_ignored():
+    assert visible(" 2 , 0 ")["allowed"] == [2, 0]
+
+
+def test_a_mig_device_is_not_guessed_at():
+    result = visible("MIG-GPU-aaaaaaaa-0000-0000-0000-000000000000/1/0")
+    assert result["restricted"] is False
+    assert result["allowed"] == [0, 1, 2, 3]
+    assert any("MIG" in note for note in result["notes"])
+
+
+def test_uuids_cannot_be_matched_when_none_are_known():
+    assert visible(UUIDS[1], uuids=[])["allowed"] == []
+    assert visible("1", uuids=[])["allowed"] == [1]
+
+
+def test_the_variable_means_nothing_to_the_mock_backend():
+    result = visible("1", platform_name="MOCK", count=1)
+    assert result["restricted"] is False
+    assert result["allowed"] == [0]
+
+
+@pytest.mark.parametrize("variable", ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"])
+def test_amd_variables_are_reported_and_not_acted_on(variable):
+    result = visible("1", platform_name="HIP", variable=variable)
+    assert result["restricted"] is False
+    assert result["allowed"] == [0, 1, 2, 3]
+    assert any(variable in note for note in result["notes"])
+
+
+def test_cuda_variable_is_not_read_for_an_amd_run():
+    result = visible("1", platform_name="HIP")
+    assert result["restricted"] is False and result["notes"] == []
+
+
+def test_all_means_the_visible_cards_in_nvidia_smi_order():
+    assert pantheon.parse_gpu_selection("all", 4, visible("3,1")) == [1, 3]
+    assert pantheon.parse_gpu_selection("all", 4, visible(None)) == [0, 1, 2, 3]
+    assert pantheon.parse_gpu_selection("all", 4) == [0, 1, 2, 3]
+
+
+def test_asking_for_a_hidden_card_says_why():
+    with pytest.raises(ValueError, match="hidden from this run by CUDA_VISIBLE_DEVICES='3,1'"):
+        pantheon.parse_gpu_selection("0", 4, visible("3,1"))
+    assert pantheon.parse_gpu_selection("3", 4, visible("3,1")) == [3]
+
+
+def test_no_visible_card_is_an_error_and_not_an_empty_run():
+    with pytest.raises(ValueError, match="leaves no GPU visible"):
+        pantheon.parse_gpu_selection("all", 4, visible(""))
+    with pytest.raises(ValueError, match="leaves no GPU visible"):
+        pantheon.parse_gpu_selection("all", 4, visible("9"))
+
+
+def test_workload_is_started_with_the_number_cuda_gives_the_card(tmp_path, monkeypatch):
+    executable = tmp_path / "echo_device"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "print('device', sys.argv[1])\n"
+        "print('Throughput: 1.0 GB/s')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(pantheon, "BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(pantheon, "TEST_REGISTRY", {
+        "echo_device": {"bin": "echo_device", "args": [], "desc": "Echo"},
+    })
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {3: 0, 1: 1})
+
+    processes = pantheon.run_test("echo_device", [1, 3], 0, 1, "CUDA", str(tmp_path))
+    assert not pantheon.wait_for_processes(processes, 10)
+    seen = {}
+    for info in processes:
+        info["output_thread"].join(timeout=5)
+        seen[info["gpu"]] = info["stdout"].splitlines()[0]
+        # The row is still about the card as nvidia-smi numbers it.
+        assert info["workload_argv"][1] == str(pantheon.device_ordinal(info["gpu"]))
+    assert seen == {1: "device 1", 3: "device 0"}
+
+
+def test_device_numbers_are_unchanged_when_nothing_is_hidden(monkeypatch):
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {})
+    assert [pantheon.device_ordinal(gpu) for gpu in range(4)] == [0, 1, 2, 3]
+
+
+def test_the_profiler_is_asked_about_the_same_device_as_the_workload(monkeypatch):
+    commands = []
+
+    class Result:
+        returncode = 0
+        stdout = "  sm__cycles_elapsed.avg   counter\n"
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return Result()
+
+    monkeypatch.setattr(pantheon.subprocess, "run", fake_run)
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {2: 0})
+    supported, _, _ = pantheon.filter_supported_profile_metrics(
+        "CUDA", {"counter": "ncu"}, 2, ["sm__cycles_elapsed.avg"],
+    )
+    assert supported == ["sm__cycles_elapsed.avg"]
+    assert commands[0][-2:] == ["--devices", "0"]
+
+
+def test_hidden_cards_are_left_out_of_the_report(monkeypatch):
+    cards = [{"id": index, "uuid": uuid, "name": "card"} for index, uuid in enumerate(UUIDS)]
+    monkeypatch.setattr(pantheon, "get_gpu_static_info", lambda platform_name=None: list(cards))
+
+    monkeypatch.setattr(pantheon, "VISIBLE_GPU_IDS", {1, 3})
+    snapshot = pantheon.get_system_snapshot("CUDA")
+    assert [card["id"] for card in snapshot["gpu_static_info"]] == [1, 3]
+
+    monkeypatch.setattr(pantheon, "VISIBLE_GPU_IDS", None)
+    snapshot = pantheon.get_system_snapshot("CUDA")
+    assert [card["id"] for card in snapshot["gpu_static_info"]] == [0, 1, 2, 3]
+
+
+def test_no_workload_command_is_built_from_the_untranslated_gpu_number():
+    source = (Path(pantheon.__file__).resolve().parent / "pantheon.py").read_text(encoding="utf-8")
+    assert "[binary, str(gpu)," not in source
+    assert '"--devices", str(gpu_id)]' not in source

@@ -324,7 +324,7 @@ def validate_profile_tools(platform_name, tools):
 def filter_supported_profile_metrics(platform_name, tools, gpu_id, requested_metrics):
     """Keep supported default counters and record unavailable architecture-specific ones."""
     if platform_name == "CUDA":
-        command = [tools["counter"], "--query-metrics", "--query-metrics-mode", "all", "--devices", str(gpu_id)]
+        command = [tools["counter"], "--query-metrics", "--query-metrics-mode", "all", "--devices", str(device_ordinal(gpu_id))]
     elif platform_name == "HIP":
         availability_tool = shutil.which("rocprofv3-avail")
         if not availability_tool:
@@ -1463,7 +1463,7 @@ def get_system_snapshot(platform_name):
         },
         "cpu_info": "psutil_missing",
         "ram_info": "psutil_missing",
-        "gpu_static_info": get_gpu_static_info(platform_name),
+        "gpu_static_info": visible_gpu_static_info(get_gpu_static_info(platform_name)),
         "toolkit_version": get_toolkit_version(platform_name)
     }
 
@@ -1907,7 +1907,7 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
     procs = []
     
     for gpu in gpu_ids:
-        workload_cmd = [binary, str(gpu), str(duration), str(mem_pct)] + config["args"]
+        workload_cmd = [binary, str(device_ordinal(gpu)), str(duration), str(mem_pct)] + config["args"]
         cmd = list(workload_cmd)
        
         if verify:
@@ -1943,7 +1943,8 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
             cmd = build_counter_command(platform, profile_tools, profile_metrics, artifact_dir, workload_cmd)
             trace_cmd = build_trace_command(platform, profile_tools, artifact_dir, workload_cmd)
 
-        log(f"Launching {test_name} on GPU {gpu} (Alloc: {mem_pct}% VRAM)...")
+        device_note = "" if device_ordinal(gpu) == gpu else f", device {device_ordinal(gpu)} to the workload"
+        log(f"Launching {test_name} on GPU {gpu}{device_note} (Alloc: {mem_pct}% VRAM)...")
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  universal_newlines=True, start_new_session=True)
@@ -2016,9 +2017,125 @@ def resolve_test_queue(test_arg):
     raise ValueError(f"Unknown test or suite: {test_arg}")
 
 
-def parse_gpu_selection(gpu_arg, gpu_count):
-    """Resolve and validate a CLI GPU selector."""
+# --------------------------------------------------------------------------
+# Which GPUs this run may use.
+#
+# Pantheon numbers GPUs as nvidia-smi does, and reads each card's telemetry and
+# error counters by that number. A workload is a CUDA program, and CUDA numbers
+# only the cards CUDA_VISIBLE_DEVICES leaves visible, in the order the variable
+# lists them. A scheduler that gives a job one card of four sets that variable
+# and nothing else: nvidia-smi still shows four. Passing Pantheon's number
+# straight through then starts the workload on a card the job may not touch,
+# CUDA answers "invalid device ordinal", and a healthy card is reported as
+# failed. So the variable decides which cards are tested, and each card's
+# number is translated to CUDA's before a workload is started.
+
+VISIBLE_DEVICES_VARIABLE = {"CUDA": "CUDA_VISIBLE_DEVICES"}
+# Read by the AMD runtimes. Pantheon does not translate these yet, so it says so
+# rather than let a hidden card look like a faulty one without explanation.
+UNTRANSLATED_DEVICE_VARIABLES = {"HIP": ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}
+
+# GPU id -> the device number a workload must be given. Empty means the two
+# are the same, which is the case whenever nothing is hidden.
+DEVICE_ORDINALS = {}
+# The GPU ids this run may use, or None when nothing is hidden.
+VISIBLE_GPU_IDS = None
+
+
+def resolve_visible_devices(platform_name, gpu_count, gpu_uuids=None, environ=None):
+    """Work out which GPUs the environment leaves visible to a workload.
+
+    Returns a dict with:
+      restricted  True when a variable hides at least the possibility of a card
+      variable    the variable that was read, or None
+      value       its value, or None
+      allowed     GPU ids in the order the workload will number them
+      ordinals    GPU id -> device number inside the workload
+      notes       things the user should be told
+    """
+    environ = os.environ if environ is None else environ
+    gpu_uuids = list(gpu_uuids or [])
+    everything = {
+        "restricted": False, "variable": None, "value": None,
+        "allowed": list(range(gpu_count)),
+        "ordinals": {gpu: gpu for gpu in range(gpu_count)},
+        "notes": [],
+    }
+
+    for variable in UNTRANSLATED_DEVICE_VARIABLES.get(platform_name, ()):
+        if environ.get(variable) is not None:
+            everything["notes"].append(
+                f"{variable}={environ[variable]} is set. Pantheon does not translate it yet: "
+                "a workload started on a card it hides will fail, and that card is not faulty."
+            )
+
+    variable = VISIBLE_DEVICES_VARIABLE.get(platform_name)
+    if variable is None or environ.get(variable) is None:
+        return everything
+
+    value = environ[variable]
+    tokens = [token.strip() for token in value.split(",")]
+    if any(token.upper().startswith("MIG-") for token in tokens):
+        everything["notes"].append(
+            f"{variable} names a MIG device. Pantheon cannot match a MIG device to a card, "
+            "so it runs on every GPU nvidia-smi reports."
+        )
+        return everything
+
+    allowed = []
+    for token in tokens:
+        gpu = None
+        if re.fullmatch(r"[0-9]+", token):
+            if int(token) < gpu_count:
+                gpu = int(token)
+        elif token.upper().startswith("GPU-"):
+            matches = [
+                index for index, uuid in enumerate(gpu_uuids)
+                if uuid and str(uuid).lower().startswith(token.lower())
+            ]
+            if len(matches) == 1:
+                gpu = matches[0]
+        # CUDA stops reading at the first identifier it cannot use: the cards
+        # named before it are visible, the ones after it are not.
+        if gpu is None or gpu in allowed:
+            break
+        allowed.append(gpu)
+
+    return {
+        "restricted": True, "variable": variable, "value": value,
+        "allowed": allowed,
+        "ordinals": {gpu: ordinal for ordinal, gpu in enumerate(allowed)},
+        "notes": everything["notes"],
+    }
+
+
+def device_ordinal(gpu):
+    """The device number a workload must be given to run on this GPU."""
+    return DEVICE_ORDINALS.get(gpu, gpu)
+
+
+def visible_gpu_static_info(gpu_info):
+    """Drop the cards this run may not use from a list of GPU descriptions."""
+    if VISIBLE_GPU_IDS is None:
+        return gpu_info
+    return [gpu for gpu in gpu_info if gpu.get("id") in VISIBLE_GPU_IDS]
+
+
+def parse_gpu_selection(gpu_arg, gpu_count, visible=None):
+    """Resolve and validate a CLI GPU selector.
+
+    `visible` is what resolve_visible_devices returned. When it hides cards,
+    "all" means the visible ones, in nvidia-smi's order, and asking for a
+    hidden card by number is an error that says why.
+    """
+    restricted = bool(visible and visible.get("restricted"))
     if gpu_arg == "all":
+        if restricted:
+            if not visible["allowed"]:
+                raise ValueError(
+                    f"{visible['variable']}={visible['value']!r} leaves no GPU visible to this run"
+                )
+            return sorted(visible["allowed"])
         return list(range(gpu_count))
 
     gpu_ids = []
@@ -2032,6 +2149,10 @@ def parse_gpu_selection(gpu_arg, gpu_count):
             raise ValueError(f"Invalid GPU ID: {raw}") from exc
         if gpu_id < 0 or gpu_id >= gpu_count:
             raise ValueError(f"GPU ID {gpu_id} is outside the detected range 0-{max(0, gpu_count - 1)}")
+        if restricted and gpu_id not in visible["allowed"]:
+            raise ValueError(
+                f"GPU {gpu_id} is hidden from this run by {visible['variable']}={visible['value']!r}"
+            )
         if gpu_id not in gpu_ids:
             gpu_ids.append(gpu_id)
 
@@ -2947,12 +3068,37 @@ def main():
     monitor = HardwareMonitor(platform)
 
     # --- GPU Discovery ---
+    global DEVICE_ORDINALS, VISIBLE_GPU_IDS
     avail_count = monitor.get_gpu_count()
+    gpu_info = get_gpu_static_info(platform)
+    uuids_by_id = {g.get("id"): g.get("uuid") for g in gpu_info}
+    visible = resolve_visible_devices(
+        platform, avail_count, [uuids_by_id.get(index) for index in range(avail_count)],
+    )
+    if platform == "CUDA":
+        # nvidia-smi lists cards in PCI bus order and CUDA, left alone, lists
+        # the fastest first. On a machine with two kinds of card those differ,
+        # and a workload would run on one card while Pantheon read another.
+        previous_order = os.environ.get("CUDA_DEVICE_ORDER")
+        if previous_order not in (None, "PCI_BUS_ID"):
+            log(f"CUDA_DEVICE_ORDER={previous_order} replaced by PCI_BUS_ID, so GPU numbers match nvidia-smi.")
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    for note in visible["notes"]:
+        log(note)
     try:
-        target_gpus = parse_gpu_selection(args.gpu, avail_count)
+        target_gpus = parse_gpu_selection(args.gpu, avail_count, visible)
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         sys.exit(1)
+    if visible["restricted"]:
+        DEVICE_ORDINALS = dict(visible["ordinals"])
+        VISIBLE_GPU_IDS = set(visible["allowed"])
+        hidden = [gpu for gpu in range(avail_count) if gpu not in VISIBLE_GPU_IDS]
+        log(
+            f"{visible['variable']}={visible['value']}: this run may use GPU "
+            f"{', '.join(str(gpu) for gpu in sorted(VISIBLE_GPU_IDS))}"
+            + (f"; GPU {', '.join(str(gpu) for gpu in hidden)} hidden from it." if hidden else ".")
+        )
 
     queue, skipped_tests = filter_gpu_compatible_tests(queue, len(target_gpus))
     for test_name, required_gpu_count in skipped_tests:
@@ -2974,7 +3120,7 @@ def main():
     print("\n" + "="*60)
     print(f"PANTHEON SYSTEM DETECTED (v{PANTHEON_VERSION})")
     print("="*60)
-    gpu_info = get_gpu_static_info(platform)
+    gpu_info = visible_gpu_static_info(gpu_info)
     if not gpu_info:
         print(f"Platform: {platform} (No detailed GPU info available via SMI)")
     else:
