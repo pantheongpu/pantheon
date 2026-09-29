@@ -256,14 +256,18 @@ def check(args, environ):
     workdir = args.report_dir if keep else tempfile.mkdtemp(prefix="pantheon-node-check-")
     os.makedirs(workdir, exist_ok=True)
     try:
+        ended_badly = {}
         for workload in args.test:
             code = run_pantheon(executable, workload, ids, args, workdir, environ)
             if code is None:
                 result["messages"].append(f"{workload}: stopped, it did not finish in time")
             elif code != 0:
-                tail = log_tail(workdir, workload)
-                result["messages"].append(f"{workload}: pantheon exited with code {code} ({tail})")
+                ended_badly[workload] = f"pantheon exited with code {code} ({log_tail(workdir, workload)})"
         rows, gpus, kinds = load_reports(os.path.join(workdir, "database"))
+        # A workload that failed on a card has a row that says so. Pantheon's
+        # own words are wanted only when it left no row behind.
+        reported = {r.get("Test Name") for r in rows}
+        result["messages"] += [f"{w}: {why}" for w, why in ended_badly.items() if w not in reported]
     finally:
         if not keep:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -298,20 +302,28 @@ def check(args, environ):
     return result
 
 
+def headline(result):
+    """One line that can stand alone, as the reason a node was drained does."""
+    if not result["gpus"]:
+        return "; ".join(result["messages"]) or "nothing was tested"
+    parts = []
+    for gpu in sorted(result["gpus"], key=lambda g: -SEVERITY[g["verdict"]]):
+        if gpu["verdict"] != HEALTHY:
+            why = (gpu["reasons"] or gpu["notes"] or ["no result"])[0]
+            parts.append(f"GPU {gpu['gpu_id']} {gpu['verdict']} ({why})")
+    healthy = sum(1 for gpu in result["gpus"] if gpu["verdict"] == HEALTHY)
+    if healthy:
+        parts.append(f"{healthy} GPU {HEALTHY}")
+    return "; ".join(parts)
+
+
 def render(result):
-    counts = {}
-    for gpu in result["gpus"]:
-        counts[gpu["verdict"]] = counts.get(gpu["verdict"], 0) + 1
-    if counts:
-        summary = ", ".join(f"{n} GPU {v}" for v, n in sorted(counts.items(), key=lambda kv: -SEVERITY[kv[0]]))
-    else:
-        summary = "; ".join(result["messages"]) or "nothing was tested"
-    lines = [f"PANTHEON {result['verdict']}: {summary}"]
+    lines = [f"PANTHEON {result['verdict']}: {headline(result)}"]
     for gpu in result["gpus"]:
         detail = "; ".join(gpu["reasons"]) or ", ".join(gpu["scores"])
         lines.append(f"GPU {gpu['gpu_id']} ({gpu['gpu_name']}): {gpu['verdict']}" + (f", {detail}" if detail else ""))
         lines += [f"  note: {note}" for note in gpu["notes"]]
-    if counts:
+    if result["gpus"]:
         lines += [f"note: {message}" for message in result["messages"]]
     if result["report_dir"]:
         lines.append(f"reports: {result['report_dir']}")

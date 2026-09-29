@@ -120,8 +120,11 @@ def test_a_failed_memory_test_is_a_fault(node, capsys):
     code, out = node.run(capsys, gpus=NVIDIA, rows=both_workloads(Unit="ERR", Score=0.0),
                          exit={"march_test": 1})
     assert code == 2
-    assert out.splitlines()[0] == "PANTHEON FAULT: 1 GPU FAULT, 1 GPU HEALTHY"
+    assert out.splitlines()[0] == ("PANTHEON FAULT: GPU 1 FAULT (march_test failed: memory errors detected "
+                                   "or the workload aborted); 1 GPU HEALTHY")
     assert "GPU 1 (NVIDIA H100 PCIe): FAULT, march_test failed" in out
+    # The row says what happened, so Pantheon's last words are left out.
+    assert "exited with code" not in out
 
 
 def test_counted_errors_are_a_fault_although_pantheon_exits_zero(node, capsys):
@@ -149,8 +152,7 @@ def test_a_workload_that_is_no_memory_test_and_fails_is_a_watch(node, capsys):
 def test_heat_and_correctable_errors_are_a_watch(node, capsys, fields, reason):
     code, out = node.run(capsys, gpus=NVIDIA, rows=both_workloads(**fields))
     assert code == 1
-    assert out.splitlines()[0] == "PANTHEON WATCH: 1 GPU WATCH, 1 GPU HEALTHY"
-    assert reason in out
+    assert out.splitlines()[0] == f"PANTHEON WATCH: GPU 1 WATCH (march_test: {reason}); 1 GPU HEALTHY"
 
 
 def test_a_link_changing_power_state_is_a_note(node, capsys):
@@ -200,7 +202,7 @@ def test_a_requested_card_without_a_result_is_incomplete(node, capsys):
     code, out = node.run(capsys, "--test", "memory_read", "--gpu", "0,1",
                          gpus=NVIDIA, rows=[row("memory_read", 0)])
     assert code == 3
-    assert out.splitlines()[0] == "PANTHEON INCOMPLETE: 1 GPU INCOMPLETE, 1 GPU HEALTHY"
+    assert out.splitlines()[0] == "PANTHEON INCOMPLETE: GPU 1 INCOMPLETE (no workload completed); 1 GPU HEALTHY"
 
 
 def test_an_epilog_tests_the_cards_of_the_job_by_node_number(node, capsys):
@@ -270,3 +272,13 @@ def test_the_result_can_be_read_by_a_program(node, capsys):
     assert result["backend"] == "cuda"
     assert [g["gpu_id"] for g in result["gpus"]] == [0, 1]
     assert result["gpus"][0]["scores"] == ["memory_read 1971.4 GB/s", "march_test 1971.4 march-ops/s"]
+
+
+def test_the_first_line_names_the_worst_card_first(node, capsys):
+    rows = [row("memory_read", 0, **{"Max Temp (C)": 92.0}), row("memory_read", 1),
+            row("march_test", 0, Unit="march-ops/s"),
+            row("march_test", 1, Unit="ERR", Score=0.0)]
+    code, out = node.run(capsys, gpus=NVIDIA, rows=rows, exit={"march_test": 1})
+    assert code == 2
+    assert out.splitlines()[0] == ("PANTHEON FAULT: GPU 1 FAULT (march_test failed: memory errors detected "
+                                   "or the workload aborted); GPU 0 WATCH (memory_read: GPU reached 92 C)")

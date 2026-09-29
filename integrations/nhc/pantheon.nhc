@@ -1,0 +1,57 @@
+# NHC - GPU diagnostics with Pantheon
+#
+# Runs a short Pantheon memory test on the GPUs of the node and takes the node
+# out of service when a card has a fault. It stands in for the check that
+# used nvidia-healthmon, which NVIDIA no longer ships, and it is the same
+# check on NVIDIA and on AMD cards.
+#
+# Install this file in /etc/nhc/scripts/ and pantheon_node_check.py in
+# /usr/local/sbin/, then add to /etc/nhc/nhc.conf:
+#
+#   * || export TIMEOUT=90
+#   * || check_pantheon
+#
+# NHC stops a run after TIMEOUT seconds, 30 by default. The check below takes
+# about 15 seconds once the workloads are compiled, and the first run on a
+# node compiles them, which takes a minute or two.
+#
+# The check loads the GPUs. Let NHC run it on idle nodes only, with
+# HealthCheckNodeState=IDLE in slurm.conf.
+
+PANTHEON_NODE_CHECK="${PANTHEON_NODE_CHECK:-/usr/local/sbin/pantheon_node_check.py}"
+PANTHEON_NODE_CHECK_ARGS="${PANTHEON_NODE_CHECK_ARGS:---test march_test --duration 10}"
+# What to do when the check could not test anything: 0 lets the node pass and
+# writes a log entry, 1 fails the node.
+PANTHEON_FAIL_ON_NO_RESULT="${PANTHEON_FAIL_ON_NO_RESULT:-0}"
+
+# Usage in nhc.conf:  check_pantheon [arguments for pantheon_node_check.py]
+# shellcheck disable=SC2086,SC2128
+function check_pantheon() {
+    local OUTPUT VERDICT RC
+
+    OUTPUT=$("$PANTHEON_NODE_CHECK" $PANTHEON_NODE_CHECK_ARGS "$@" 2>&1)
+    RC=$?
+    VERDICT="${OUTPUT%%$'\n'*}"
+
+    if [[ $RC -eq 0 ]]; then
+        dbg "$FUNCNAME:  $VERDICT"
+        return 0
+    elif [[ $RC -eq 1 ]]; then
+        log "$FUNCNAME:  $OUTPUT"
+        return 0
+    elif [[ $RC -eq 2 ]]; then
+        log "$FUNCNAME:  $OUTPUT"
+        die 1 "$FUNCNAME:  $VERDICT"
+        return 1
+    elif [[ $RC -eq 127 || $RC -eq 126 ]]; then
+        die 1 "$FUNCNAME:  $PANTHEON_NODE_CHECK not found or not runnable."
+        return 1
+    fi
+
+    log "$FUNCNAME:  $OUTPUT"
+    if [[ "$PANTHEON_FAIL_ON_NO_RESULT" == "1" ]]; then
+        die 1 "$FUNCNAME:  $VERDICT"
+        return 1
+    fi
+    return 0
+}
