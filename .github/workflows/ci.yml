@@ -79,6 +79,26 @@ jobs:
           done
           exit "${fail}"
 
+      - name: Node check of the integrations on the mock backend
+        run: |
+          mkdir -p "${RUNNER_TEMP}/bin"
+          printf '#!/bin/bash\nexec python3 "%s/pantheon.py" "$@"\n' "${GITHUB_WORKSPACE}" \
+            > "${RUNNER_TEMP}/bin/pantheon"
+          chmod +x "${RUNNER_TEMP}/bin/pantheon"
+          check="python3 integrations/pantheon_node_check.py --pantheon ${RUNNER_TEMP}/bin/pantheon"
+          ${check} --platform mock --test march_test --duration 2
+          # An injected fault has to come out as a fault, exit code 2.
+          printf '#!/bin/bash\nexec python3 "%s/pantheon.py" --inject_error "$@"\n' "${GITHUB_WORKSPACE}" \
+            > "${RUNNER_TEMP}/bin/pantheon-fault"
+          chmod +x "${RUNNER_TEMP}/bin/pantheon-fault"
+          code=0
+          python3 integrations/pantheon_node_check.py --pantheon "${RUNNER_TEMP}/bin/pantheon-fault" \
+            --platform mock --test march_test --duration 2 || code=$?
+          if [ "${code}" -ne 2 ]; then
+            echo "::error::The node check answered ${code} to an injected fault, expected 2"
+            exit 1
+          fi
+
       - name: Documentation builds
         run: python -m mkdocs build --strict
 

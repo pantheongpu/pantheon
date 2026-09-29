@@ -23,6 +23,13 @@ To check the GPUs of a self-hosted GitHub Actions runner before a job uses them:
 [Pantheon GPU Health Check](https://github.com/marketplace/actions/pantheon-gpu-health-check)
 on the GitHub Marketplace lists its options.
 
+## Integrations
+
+[`integrations/`](integrations/) has files that put Pantheon where a cluster
+already looks for the health of its nodes: a node check that answers with a
+verdict and an exit code, a Slurm epilog and acceptance job, a check for NHC,
+and a test for ReFrame.
+
 ## Requirements
 
 ### Running From Source

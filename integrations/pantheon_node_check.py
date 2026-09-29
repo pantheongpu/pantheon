@@ -83,7 +83,7 @@ def split_ras_details(delta_text):
 def assess_gpu(rows, gpu_id, gpu_name):
     """Turn the result rows of one GPU into a verdict with its reasons."""
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
-    faults, watches, notes = [], [], []
+    faults, watches, notes, link_recovery = [], [], [], []
     ran = 0
     for row in mine:
         test = row.get("Test Name", "?")
@@ -108,7 +108,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
             if serious:
                 watches.append(f"{test}: correctable errors ({', '.join(serious)})")
             if benign:
-                notes.append(f"{test}: PCIe link recovery, link power-state cycling and not a fault")
+                link_recovery.append(test)
 
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
@@ -119,6 +119,9 @@ def assess_gpu(rows, gpu_id, gpu_name):
         if tmem >= MEMORY_THERMAL_WATCH_C:
             watches.append(f"{test}: memory reached {tmem:.0f} C")
 
+    if link_recovery:
+        notes.append(f"PCIe link recovery during {', '.join(link_recovery)}: "
+                     "link power-state cycling, not a fault")
     if faults:
         verdict = FAULT
     elif watches:

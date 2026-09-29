@@ -7,7 +7,7 @@
 #
 # The job that ran last is the best stress test a card gets, so the moment
 # after it is a good time to ask if the memory still holds a pattern. The node
-# stays in the state "completing" while this runs, about 15 seconds with the
+# stays in the state "completing" while this runs, about 20 seconds with the
 # defaults below once the workloads are compiled.
 #
 # slurmd runs the epilog as root with a short PATH and an environment of its

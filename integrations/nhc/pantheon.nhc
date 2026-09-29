@@ -12,7 +12,7 @@
 #   * || check_pantheon
 #
 # NHC stops a run after TIMEOUT seconds, 30 by default. The check below takes
-# about 15 seconds once the workloads are compiled, and the first run on a
+# about 20 seconds once the workloads are compiled, and the first run on a
 # node compiles them, which takes a minute or two.
 #
 # The check loads the GPUs. Let NHC run it on idle nodes only, with
