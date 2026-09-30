@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pantheon-node-check
+description: Test the GPUs of every GPU node of a cluster with Pantheon, one Job per node.
+type: application
+version: 0.1.0
+appVersion: "1.2.2"
+home: https://pantheongpu.com
+sources:
+  - https://github.com/pantheongpu/pantheon

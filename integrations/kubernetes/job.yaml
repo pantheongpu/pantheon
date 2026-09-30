@@ -1,0 +1,39 @@
+# One Job that tests every GPU of one node and keeps the reports in a volume.
+#
+#   kubectl apply -f job.yaml
+#   kubectl logs -f job/pantheon-node-check
+#
+# The Job fails when a workload fails on a card, so "kubectl get job" shows the
+# result. Pin the node with spec.template.spec.nodeName, or use the Helm chart
+# beside this file to run it on every GPU node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pantheon-node-check
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pantheon-node-check
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: pantheon
+          image: ghcr.io/pantheongpu/pantheon:1.2.2
+          args: ["--test", "march_test", "--duration", "120", "--gpu", "all"]
+          workingDir: /reports
+          resources:
+            limits:
+              nvidia.com/gpu: 8   # every GPU of the node
+          volumeMounts:
+            - name: reports
+              mountPath: /reports
+            - name: build-cache
+              mountPath: /root/.cache
+      volumes:
+        - name: reports
+          emptyDir: {}
+        - name: build-cache
+          emptyDir: {}

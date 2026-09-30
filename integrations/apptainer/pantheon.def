@@ -1,0 +1,35 @@
+# Apptainer definition for Pantheon on NVIDIA nodes.
+#
+#   apptainer build pantheon.sif pantheon.def
+#   apptainer run --nv pantheon.sif --test march_test --duration 60 --gpu all
+#
+# The image carries the CUDA 12.8 toolchain, so the node needs only its driver.
+# Pantheon compiles its workloads on the first run, into the cache directory
+# that PANTHEON_BUILD_CACHE_DIR names, which is bound from the host below so
+# that the compiled workloads survive between runs. Reports are written to the
+# working directory.
+#
+# For AMD nodes, build from ghcr.io/pantheongpu/pantheon:1.2.2-rocm6.4 and run
+# with --rocm instead of --nv.
+
+Bootstrap: docker
+From: ghcr.io/pantheongpu/pantheon:1.2.2-cuda12.8
+
+%environment
+    export PANTHEON_BUILD_CACHE_DIR=${PANTHEON_BUILD_CACHE_DIR:-$HOME/.cache/pantheongpu/builds}
+
+%runscript
+    exec pantheon "$@"
+
+%test
+    pantheon --version
+
+%labels
+    org.opencontainers.image.title Pantheon
+    org.opencontainers.image.source https://github.com/pantheongpu/pantheon
+    org.opencontainers.image.licenses Apache-2.0
+
+%help
+    GPU diagnostics with Pantheon. Run with --nv on NVIDIA nodes:
+        apptainer run --nv pantheon.sif --test march_test --duration 60 --gpu all
+    Reports land in ./database of the directory you run from.

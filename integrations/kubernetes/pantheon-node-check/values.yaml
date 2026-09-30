@@ -1,0 +1,30 @@
+image:
+  repository: ghcr.io/pantheongpu/pantheon
+  tag: "1.2.2"
+  pullPolicy: IfNotPresent
+
+# The nodes to test, by name. Each one gets a Job that asks for all of its GPUs.
+nodes: []
+#  - gpu-node-01
+#  - gpu-node-02
+
+# GPUs on each node, requested as nvidia.com/gpu so that a Job takes the whole node.
+gpusPerNode: 8
+
+# What to run. --gpu all tests every card the Job was given.
+workload: march_test
+duration: 120
+extraArgs: []
+
+# Where Pantheon writes its reports. An emptyDir is gone with the pod; give a
+# persistentVolumeClaim to keep them.
+reports:
+  persistentVolumeClaim: ""
+
+# Finished Jobs are deleted after this many seconds.
+ttlSecondsAfterFinished: 86400
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule

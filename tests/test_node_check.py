@@ -282,3 +282,57 @@ def test_the_first_line_names_the_worst_card_first(node, capsys):
     assert code == 2
     assert out.splitlines()[0] == ("PANTHEON FAULT: GPU 1 FAULT (march_test failed: memory errors detected "
                                    "or the workload aborted); GPU 0 WATCH (memory_read: GPU reached 92 C)")
+
+
+def test_the_numbers_of_each_workload_are_in_the_result(node, capsys):
+    rows = [row("memory_read", 0, **{"Max Power (W)": 288.5}),
+            row("march_test", 0, Unit="ERR", Score=0.0)]
+    code, out = node.run(capsys, "--json", gpus=NVIDIA[:1], rows=rows, exit={"march_test": 1})
+    result = json.loads(out)
+    assert [r["workload"] for r in result["results"]] == ["memory_read", "march_test"]
+    first, second = result["results"]
+    assert first["score"] == 1971.4 and first["unit"] == "GB/s"
+    assert first["max_temp_c"] == 72.0 and first["max_power_w"] == 288.5
+    assert first["failed"] is False
+    # A failed workload has no score, however Pantheon filled the column.
+    assert second["score"] is None and second["failed"] is True
+
+
+def test_the_prometheus_file_carries_the_verdict_and_the_numbers(node, capsys, tmp_path):
+    prom = tmp_path / "textfile" / "pantheon.prom"
+    rows = both_workloads(**{"RAS Status": "WARNING", "RAS Error Delta": "vendor_ras.pcie.bad_tlp +12"})
+    code, out = node.run(capsys, "--textfile", str(prom), gpus=NVIDIA, rows=rows)
+    assert code == 1
+    text = prom.read_text()
+    assert "pantheon_verdict_code 1\n" in text
+    assert 'pantheon_verdict_info{verdict="WATCH"} 1\n' in text
+    assert 'pantheon_gpu_verdict_code{gpu="0",name="NVIDIA H100 PCIe"} 0\n' in text
+    assert 'pantheon_gpu_verdict_code{gpu="1",name="NVIDIA H100 PCIe"} 1\n' in text
+    assert 'pantheon_gpu_score{gpu="0",workload="memory_read",unit="GB/s"} 1971.4\n' in text
+    assert 'pantheon_gpu_score{gpu="1",workload="march_test",unit="march-ops/s"} 1971.4\n' in text
+    assert 'pantheon_gpu_max_temperature_celsius{gpu="0",workload="memory_read"} 72\n' in text
+    assert 'pantheon_gpu_workload_failed{gpu="1",workload="march_test"} 0\n' in text
+    assert "pantheon_last_run_timestamp_seconds " in text
+    # Prometheus is strict about the format: every metric has HELP and TYPE, and
+    # the file ends with a newline.
+    for name in ("pantheon_verdict_code", "pantheon_gpu_verdict_code", "pantheon_gpu_score",
+                 "pantheon_gpu_max_temperature_celsius", "pantheon_gpu_workload_failed"):
+        assert f"# HELP {name} " in text and f"# TYPE {name} gauge" in text
+    assert text.endswith("\n")
+    # The file is written in one step: no half-written file is left beside it.
+    assert sorted(p.name for p in prom.parent.iterdir()) == ["pantheon.prom"]
+
+
+def test_the_prometheus_file_says_when_nothing_was_tested(node, capsys, tmp_path):
+    prom = tmp_path / "pantheon.prom"
+    code, out = node.run(capsys, "--textfile", str(prom), "--test", "memory_read",
+                         gpus=CPU, rows=[row("memory_read")])
+    assert code == 3
+    text = prom.read_text()
+    assert "pantheon_verdict_code 3\n" in text
+    assert 'pantheon_verdict_info{verdict="NO GPU TESTED"} 1\n' in text
+    assert "pantheon_gpu_score" not in text
+
+
+def test_label_values_are_escaped():
+    assert node_check._label('a "quoted" name\\') == 'a \\"quoted\\" name\\\\'

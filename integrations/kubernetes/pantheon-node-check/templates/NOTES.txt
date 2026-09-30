@@ -1,0 +1,12 @@
+One Job per node in .Values.nodes. Watch them with:
+
+  kubectl get jobs -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=20
+
+A Job that completed means every workload passed on every card of that node.
+A Job that failed means a workload failed on a card; its log says which.
+{{- if not .Values.nodes }}
+
+No nodes were given. Set them with, for example:
+  helm upgrade --install gpu-check . --set nodes={gpu-node-01,gpu-node-02}
+{{- end }}

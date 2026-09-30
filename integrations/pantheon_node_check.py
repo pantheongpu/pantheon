@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 # The rules below mirror assess_gpu in pantheon.py, so a node judged here and a
 # report read by hand reach the same word. They are repeated because a Pantheon
@@ -137,6 +138,30 @@ def assess_gpu(rows, gpu_id, gpu_name):
             "reasons": faults + watches, "notes": notes, "scores": scores}
 
 
+def _maybe_num(value):
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out else None
+
+
+def row_result(row):
+    """The numbers of one result row, for programs and metrics."""
+    return {
+        "gpu_id": row.get("GPU ID"),
+        "workload": row.get("Test Name"),
+        "score": None if row.get("Unit") == "ERR" else _maybe_num(row.get("Score")),
+        "unit": row.get("Unit"),
+        "max_temp_c": _maybe_num(row.get("Max Temp (C)")),
+        "max_power_w": _maybe_num(row.get("Max Power (W)")),
+        "limit_reason": row.get("Limit Reason"),
+        "ras_status": row.get("RAS Status"),
+        "failed": bool(row.get("Failure Stage")) or row.get("Unit") == "ERR"
+        or str(row.get("Status") or "PASS").upper() == "FAIL",
+    }
+
+
 def load_reports(report_dir):
     """Rows and GPUs from every report in the directory, each row once.
 
@@ -239,8 +264,8 @@ def log_tail(workdir, workload, lines=3):
 
 def check(args, environ):
     """Run the workloads and return the result as a dictionary."""
-    result = {"verdict": NOT_RUN, "messages": [], "gpus": [], "workloads": list(args.test),
-              "backend": "unknown", "report_dir": None}
+    result = {"verdict": NOT_RUN, "messages": [], "gpus": [], "results": [],
+              "workloads": list(args.test), "backend": "unknown", "report_dir": None}
     try:
         ids = select_devices(args.gpu, args.context, environ)
     except NoDevices as reason:
@@ -300,6 +325,7 @@ def check(args, environ):
     for gpu_id in judged:
         result["gpus"].append(assess_gpu(rows, gpu_id, gpus.get(gpu_id, "not found on this node")))
     result["verdict"] = max((g["verdict"] for g in result["gpus"]), key=lambda v: SEVERITY[v])
+    result["results"] = [row_result(r) for r in rows if r.get("GPU ID") in judged]
     if result["backend"] == "cpu":
         result["messages"].append("CPU backend: these results describe no GPU")
     return result
@@ -333,6 +359,69 @@ def render(result):
     return "\n".join(lines)
 
 
+def _label(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_textfile(result, now):
+    """The result in the text format that Prometheus reads.
+
+    node_exporter's textfile collector picks the file up on its next scrape,
+    so a cron job that runs this check gives every GPU a verdict in Grafana.
+    """
+    code = EXIT_CODE[result["verdict"]]
+    lines = [
+        "# HELP pantheon_verdict_code Verdict of the last Pantheon node check: "
+        "0 healthy, 1 watch, 2 fault, 3 nothing was tested.",
+        "# TYPE pantheon_verdict_code gauge",
+        f"pantheon_verdict_code {code}",
+        "# HELP pantheon_verdict_info The verdict of the last node check as a word.",
+        "# TYPE pantheon_verdict_info gauge",
+        f'pantheon_verdict_info{{verdict="{_label(result["verdict"])}"}} 1',
+        "# HELP pantheon_gpu_verdict_code Verdict of the last node check for one GPU: "
+        "0 healthy, 1 watch, 2 fault, 3 nothing was tested.",
+        "# TYPE pantheon_gpu_verdict_code gauge",
+    ]
+    for gpu in result["gpus"]:
+        lines.append(f'pantheon_gpu_verdict_code{{gpu="{_label(gpu["gpu_id"])}",'
+                     f'name="{_label(gpu["gpu_name"])}"}} {EXIT_CODE[gpu["verdict"]]}')
+    metrics = [
+        ("pantheon_gpu_score", "Score of a workload on a GPU, in the unit given by the label.", "score", True),
+        ("pantheon_gpu_max_temperature_celsius", "Highest GPU temperature during a workload.", "max_temp_c", False),
+        ("pantheon_gpu_max_power_watts", "Highest power draw during a workload.", "max_power_w", False),
+    ]
+    for name, help_text, key, with_unit in metrics:
+        rows = [r for r in result["results"] if r.get(key) is not None]
+        if not rows:
+            continue
+        lines += [f"# HELP {name} {help_text}", f"# TYPE {name} gauge"]
+        for r in rows:
+            labels = f'gpu="{_label(r["gpu_id"])}",workload="{_label(r["workload"])}"'
+            if with_unit:
+                labels += f',unit="{_label(r["unit"])}"'
+            lines.append(f"{name}{{{labels}}} {r[key]:g}")
+    if result["results"]:
+        lines += ["# HELP pantheon_gpu_workload_failed 1 when the workload failed or did not complete on the GPU.",
+                  "# TYPE pantheon_gpu_workload_failed gauge"]
+        for r in result["results"]:
+            lines.append(f'pantheon_gpu_workload_failed{{gpu="{_label(r["gpu_id"])}",'
+                         f'workload="{_label(r["workload"])}"}} {1 if r["failed"] else 0}')
+    lines += ["# HELP pantheon_last_run_timestamp_seconds When the last node check finished, as Unix time.",
+              "# TYPE pantheon_last_run_timestamp_seconds gauge",
+              f"pantheon_last_run_timestamp_seconds {now:.0f}"]
+    return "\n".join(lines) + "\n"
+
+
+def write_textfile(path, text):
+    """Write the file in one step, so a scrape never sees half of it."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=".pantheon-", suffix=".prom", dir=directory)
+    with os.fdopen(handle, "w", encoding="utf-8") as out:
+        out.write(text)
+    os.replace(temporary, path)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -359,6 +448,10 @@ def build_parser():
                         help="keep Pantheon's reports and logs in this directory (default: a temporary "
                              "directory that is removed)")
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
+    parser.add_argument("--textfile", metavar="PATH",
+                        help="also write the result as Prometheus metrics to this file, for "
+                             "node_exporter's textfile collector (for example "
+                             "/var/lib/node_exporter/textfile_collector/pantheon.prom)")
     return parser
 
 
@@ -366,6 +459,8 @@ def main(argv=None, environ=None):
     args = build_parser().parse_args(argv)
     args.test = args.test or list(DEFAULT_WORKLOADS)
     result = check(args, dict(os.environ if environ is None else environ))
+    if args.textfile:
+        write_textfile(args.textfile, render_textfile(result, time.time()))
     print(json.dumps(result, indent=2) if args.json else render(result))
     return EXIT_CODE[result["verdict"]]
 

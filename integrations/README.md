@@ -10,6 +10,9 @@ the `pantheon-gpu` package. They work with Pantheon 1.2.2 and later.
 | Slurm | Test the cards of a job when it ends; accept a node before it goes into service | [`slurm/`](slurm/) |
 | NHC | The health check that Slurm or PBS runs on a node | [`nhc/`](nhc/) |
 | ReFrame | A regression test with one performance value for each card | [`reframe/`](reframe/) |
+| Prometheus | The verdict and the numbers as metrics, for node_exporter and Grafana | [`prometheus/`](prometheus/) |
+| Kubernetes | A Job for one node and a Helm chart for many | [`kubernetes/`](kubernetes/) |
+| Apptainer | A definition file for sites that run containers through Apptainer | [`apptainer/`](apptainer/) |
 
 Elsewhere:
 
@@ -85,7 +88,8 @@ are named by UUID, and MIG devices, are not guessed: the check stops and asks
 for `--gpu`.
 
 `--report-dir DIR` keeps the reports and the log of each workload. `--json`
-prints the result for a program to read.
+prints the result for a program to read, and `--textfile PATH` writes it as
+Prometheus metrics, see [`prometheus/`](prometheus/).
 
 ### How much load
 
