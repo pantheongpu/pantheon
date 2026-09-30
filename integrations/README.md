@@ -118,6 +118,11 @@ Average power during the run, as the median over the cards in our
   injected fault, which drained the node both ways.
 - The ReFrame test ran with ReFrame 4.10.4 on an RTX 3060 and on the CPU
   backend, and failed as it should on an injected fault.
+- The Prometheus output has unit tests. The Helm chart passes `helm lint`
+  and its rendered manifests validate against the Kubernetes API schema; it
+  has not run on a cluster with GPUs. The Apptainer image was built from the
+  definition and ran a workload on the CPU backend; it has not run with
+  `--nv` on a GPU node.
 
 Not tested: a cluster with real GPUs under Slurm, AMD cards, and MIG devices.
 If you run one of these files there, we would like to hear how it went in the
