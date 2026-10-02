@@ -2184,3 +2184,121 @@ def test_no_workload_command_is_built_from_the_untranslated_gpu_number():
     source = (Path(pantheon.__file__).resolve().parent / "pantheon.py").read_text(encoding="utf-8")
     assert "[binary, str(gpu)," not in source
     assert '"--devices", str(gpu_id)]' not in source
+
+
+# --- Compiling ahead of time: the backend and the target come from the environment ---
+
+def test_detect_platform_takes_backend_from_env(monkeypatch):
+    monkeypatch.delenv("PANTHEON_MOCK", raising=False)
+    monkeypatch.setenv("PANTHEON_PLATFORM", "cuda")
+    # No compiler anywhere: an installation compiled ahead of time has none on the PATH.
+    monkeypatch.setattr(pantheon.shutil, "which", lambda name: None)
+    assert pantheon.detect_platform() == "CUDA"
+    # The command line still wins over the environment.
+    assert pantheon.detect_platform("mock") == "MOCK"
+
+
+def test_detect_platform_rejects_unknown_backend_in_env(monkeypatch):
+    monkeypatch.setenv("PANTHEON_PLATFORM", "opencl")
+    with pytest.raises(SystemExit) as exc:
+        pantheon.detect_platform()
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("value, target", [
+    ("9.0", "90a"),
+    ("sm_90", "90a"),
+    ("90a", "90a"),
+    ("8.0", "80"),
+    ("120", "120"),
+    ("sm_120", "120"),
+])
+def test_detect_build_target_takes_cuda_arch_from_env(monkeypatch, value, target):
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", value)
+
+    def no_nvidia_smi(*_args, **_kwargs):
+        raise AssertionError("nvidia-smi must not be consulted when the target is given")
+
+    monkeypatch.setattr(pantheon.subprocess, "check_output", no_nvidia_smi)
+    assert pantheon.detect_build_target("CUDA") == target
+
+
+def test_detect_build_target_rejects_malformed_cuda_arch(monkeypatch):
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", "hopper")
+    with pytest.raises(SystemExit):
+        pantheon.detect_build_target("CUDA")
+
+
+def test_build_kernels_passes_cuda_target_to_make(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    kernels = base / "kernels" / "demo"
+    cache_root = tmp_path / "cache"
+    kernels.mkdir(parents=True)
+    (base / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
+    (kernels / "demo.cpp").write_text("int main(){return 0;}\n", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        build_dir = Path(cmd[3].split("=", 1)[1])
+        build_dir.mkdir(parents=True, exist_ok=True)
+        binary = build_dir / "demo"
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setenv("PANTHEON_BUILD_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", "9.0")
+    monkeypatch.setattr(pantheon, "BUILD_DIR", pantheon.BUILD_DIR)
+    monkeypatch.setattr(pantheon, "BUILD_CACHE_FILE", pantheon.BUILD_CACHE_FILE)
+    monkeypatch.setattr(pantheon, "BASE_DIR", str(base))
+    monkeypatch.setattr(pantheon, "KERNEL_DIR", str(base / "kernels"))
+    monkeypatch.setattr(pantheon, "PANTHEON_VERSION", "9.9.9")
+    monkeypatch.setattr(pantheon, "TEST_REGISTRY", {
+        "demo": {"bin": "demo", "args": [], "desc": "Demo"},
+    })
+    monkeypatch.setattr(pantheon.subprocess, "run", fake_run)
+
+    pantheon.build_kernels("CUDA")
+
+    expected_build_dir = str(cache_root / "9.9.9" / "cuda-90a")
+    assert calls == [[
+        "make",
+        "-k",
+        "PLATFORM=CUDA",
+        f"BUILD_DIR={expected_build_dir}",
+        "DETECTED_ARCH=90a",
+    ]]
+    assert pantheon.is_build_cache_current("CUDA")
+
+    # A later run on a Hopper card, without the override, finds the same cache.
+    monkeypatch.delenv("PANTHEON_CUDA_ARCH")
+    monkeypatch.setattr(pantheon.subprocess, "check_output", lambda *_args, **_kwargs: "9.0\n")
+    assert pantheon.configure_build_directory("CUDA") == expected_build_dir
+    assert pantheon.is_build_cache_current("CUDA")
+
+
+def test_build_only_compiles_and_exits(monkeypatch):
+    calls = []
+    monkeypatch.setattr("sys.argv", ["pantheon.py", "--build-only", "--platform", "mock"])
+    monkeypatch.setattr(pantheon, "build_kernels", lambda platform: calls.append(platform) or {})
+
+    with pytest.raises(SystemExit) as exc:
+        pantheon.main()
+
+    assert exc.value.code == 0
+    assert calls == ["MOCK"]
+
+
+def test_build_only_fails_when_a_workload_did_not_compile(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["pantheon.py", "--build-only", "--platform", "mock"])
+    monkeypatch.setattr(
+        pantheon, "build_kernels",
+        lambda platform: {"demo": "Compilation did not produce demo. See build.log for compiler output."},
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        pantheon.main()
+
+    assert exc.value.code == 1

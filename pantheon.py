@@ -1518,11 +1518,21 @@ def detect_platform(preferred="auto"):
     if preferred != "auto":
         return preferred.upper()
 
-    # 1. Force Mock Mode via Environment Variable (for CI)
+    # 1. The backend named by the environment. An installation whose workloads
+    #    were compiled ahead of time (see --build-only) has no compiler on the
+    #    PATH at run time, so a module file or a wrapper names the backend here.
+    requested = os.environ.get("PANTHEON_PLATFORM", "").strip().lower()
+    if requested and requested != "auto":
+        if requested not in ("cuda", "hip", "mock"):
+            print(f"[ERROR] PANTHEON_PLATFORM={requested!r}: expected cuda, hip or mock.")
+            sys.exit(1)
+        return requested.upper()
+
+    # 2. Force Mock Mode via Environment Variable (for CI)
     if os.environ.get("PANTHEON_MOCK") == "1":
         return "MOCK"
     
-    # 2. Try Auto-Detect. Prefer the compiler matching the detected GPU vendor
+    # 3. Try Auto-Detect. Prefer the compiler matching the detected GPU vendor
     # when both CUDA and HIP toolchains are installed.
     has_nvcc = find_tool("nvcc") is not None
     has_hipcc = find_tool("hipcc") is not None
@@ -1538,7 +1548,7 @@ def detect_platform(preferred="auto"):
     if has_hipcc:
         return "HIP"
     
-    # 3. Fallback to Mock if nothing else found (Optional, good for local dev without GPU)
+    # 4. Fallback to Mock if nothing else found (Optional, good for local dev without GPU)
     if find_tool("g++"):
         print("[PANTHEON] Warning: No GPU compiler found. Defaulting to CPU Mock mode.")
         return "MOCK"
@@ -1546,9 +1556,31 @@ def detect_platform(preferred="auto"):
     return "UNKNOWN"
 
 
+def normalize_cuda_arch(value):
+    """The target name for a compute capability: '9.0', 'sm_90', '90' and '90a' all give '90a'."""
+    text = str(value or "").strip().lower()
+    if text.startswith("sm_"):
+        text = text[3:]
+    text = text.replace(".", "")
+    if not text:
+        return ""
+    if not re.fullmatch(r"[0-9]+[a-z]?", text):
+        print(f"[ERROR] PANTHEON_CUDA_ARCH={value!r}: expected a compute capability such as 8.0, sm_90 or 120.")
+        sys.exit(1)
+    if text == "90":
+        # Hopper needs the 'a' suffix for the WGMMA instructions, as the Makefile does
+        text = "90a"
+    return text
+
+
 def detect_build_target(platform_name):
     """Mirror the Makefile's architecture target selection for cache safety."""
     if platform_name == "CUDA":
+        # A build node without a GPU names the target through the environment
+        # (see --build-only); otherwise it is read from the card that is present.
+        requested = normalize_cuda_arch(os.environ.get("PANTHEON_CUDA_ARCH", ""))
+        if requested:
+            return requested
         detected_arch = ""
         try:
             out = subprocess.check_output(
@@ -1690,6 +1722,11 @@ def build_kernels(platform):
     # vendor-specific or optional workload must not prevent the rest of the
     # selected suite from being available.
     cmd = ["make", "-k", f"PLATFORM={platform}", f"BUILD_DIR={BUILD_DIR}"]
+    if platform == "CUDA":
+        # The Makefile detects the target with nvidia-smi too; passing the
+        # runner's choice keeps both the same, also on a build node without a
+        # GPU where PANTHEON_CUDA_ARCH names the target.
+        cmd.append(f"DETECTED_ARCH={detect_build_target(platform)}")
     if platform == "HIP":
         hipcc = find_tool("hipcc")
         if not hipcc:
@@ -3042,6 +3079,12 @@ def main():
     )
     parser.add_argument("--inject_error", action="store_true", help="Inject a hardware fault to test SDC verification")
     parser.add_argument("--platform", choices=["auto", "cuda", "hip", "mock"], default="auto", help="Compiler backend override")
+    parser.add_argument(
+        "--build-only", action="store_true",
+        help="Compile the workloads for the platform into the build cache and exit, without touching a GPU. "
+             "For installations that compile ahead of time: set PANTHEON_BUILD_CACHE_DIR, and PANTHEON_CUDA_ARCH "
+             "(for example 9.0) or TARGET_GFX (for example gfx942) for the cards the binaries are for.",
+    )
     args = parser.parse_args()
 
     try:
@@ -3064,6 +3107,14 @@ def main():
     # --- Setup ---
     platform = detect_platform(args.platform)
     if platform == "UNKNOWN": sys.exit("Error: No compiler found.")
+
+    if args.build_only:
+        unavailable = build_kernels(platform)
+        print(f"[PANTHEON] Workloads for {platform} are in {BUILD_DIR}")
+        if unavailable:
+            print(f"[ERROR] {len(unavailable)} workload(s) did not compile; see above.")
+            sys.exit(1)
+        sys.exit(0)
 
     monitor = HardwareMonitor(platform)
 
