@@ -5,6 +5,7 @@ writes the reports a scenario describes. The check itself is the real one.
 """
 import json
 import os
+import re
 import stat
 import sys
 import textwrap
@@ -332,6 +333,53 @@ def test_the_prometheus_file_says_when_nothing_was_tested(node, capsys, tmp_path
     assert "pantheon_verdict_code 3\n" in text
     assert 'pantheon_verdict_info{verdict="NO GPU TESTED"} 1\n' in text
     assert "pantheon_gpu_score" not in text
+
+
+DASHBOARD = os.path.join(os.path.dirname(__file__), "..", "integrations", "prometheus",
+                         "grafana-dashboard.json")
+
+
+def test_grafana_dashboard_shows_every_exported_metric_and_nothing_else():
+    """The dashboard and the exporter must not drift apart."""
+    with open(DASHBOARD, encoding="utf-8") as fp:
+        dashboard = json.load(fp)
+    result = {
+        "verdict": "WATCH",
+        "gpus": [{"gpu_id": 0, "gpu_name": "NVIDIA H100 PCIe", "verdict": "HEALTHY"},
+                 {"gpu_id": 1, "gpu_name": "NVIDIA H100 PCIe", "verdict": "WATCH"}],
+        "results": [{"gpu_id": 0, "workload": "memory_read", "unit": "GB/s", "score": 1971.4,
+                     "max_temp_c": 72, "max_power_w": 288.5, "failed": False}],
+    }
+    exported = set(re.findall(r"^# TYPE (pantheon_\w+)", node_check.render_textfile(result, 1790800000), re.M))
+    queries = [t["expr"] for panel in dashboard["panels"] for t in panel["targets"]]
+    queries += [v["definition"] for v in dashboard["templating"]["list"] if v["type"] == "query"]
+    used = set(re.findall(r"pantheon_\w+", " ".join(queries)))
+    assert used == exported
+
+    # Every panel and variable goes through the datasource the import asks for.
+    for panel in dashboard["panels"]:
+        assert panel["datasource"]["uid"] == "${DS_PROMETHEUS}"
+        for t in panel["targets"]:
+            assert t["datasource"]["uid"] == "${DS_PROMETHEUS}"
+    assert [v["name"] for v in dashboard["templating"]["list"]] == ["DS_PROMETHEUS", "instance", "gpu"]
+
+    # The verdict mappings name every exit code the check can answer with.
+    codes = {str(code) for code in node_check.EXIT_CODE.values()}
+    for title in ("Node verdict", "Cards"):
+        panel = next(p for p in dashboard["panels"] if p["title"] == title)
+        mapping = panel["fieldConfig"]["defaults"]["mappings"][0]["options"]
+        assert set(mapping) == codes
+        assert mapping["0"]["text"] == "HEALTHY" and mapping["2"]["text"] == "FAULT"
+
+    # Panels tile the grid without overlapping.
+    cells = set()
+    for panel in dashboard["panels"]:
+        g = panel["gridPos"]
+        assert g["x"] + g["w"] <= 24
+        for x in range(g["x"], g["x"] + g["w"]):
+            for y in range(g["y"], g["y"] + g["h"]):
+                assert (x, y) not in cells, f"{panel['title']} overlaps another panel"
+                cells.add((x, y))
 
 
 def test_label_values_are_escaped():

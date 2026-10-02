@@ -48,6 +48,15 @@ it from the scheduler instead: the [Slurm epilog](../slurm/) can add
 `--textfile` to its node check, and the metrics then describe the cards after
 each job.
 
+## Grafana
+
+[`grafana-dashboard.json`](grafana-dashboard.json) shows the metrics above:
+the verdict of each node and each card, how long ago the check ran, the score
+of each workload over time, and the highest temperature and power draw. Import
+it in Grafana under Dashboards, New, Import, and pick the Prometheus data
+source that scrapes node_exporter. It filters by node and by GPU, and it
+expects the `instance` label that node_exporter gives every metric.
+
 ## Alerts
 
 ```yaml
