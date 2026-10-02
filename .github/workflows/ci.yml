@@ -60,6 +60,17 @@ jobs:
       - name: Smoke test the runner
         run: python3 pantheon.py --test baseline_metrics --duration 5 --mem 5
 
+      - name: Workloads compiled ahead of time run without a compiler lookup
+        run: |
+          set -o pipefail
+          cache="${RUNNER_TEMP}/precompiled"
+          PANTHEON_BUILD_CACHE_DIR="${cache}" python3 pantheon.py --build-only --platform mock
+          # A run that takes the backend from the environment, as a module file
+          # would set it, must find the compiled workloads and compile nothing.
+          PANTHEON_BUILD_CACHE_DIR="${cache}" PANTHEON_PLATFORM=mock \
+            python3 pantheon.py --test memory_read --duration 2 --mem 5 | tee "${RUNNER_TEMP}/precompiled.log"
+          grep -q "Kernel build cache is current" "${RUNNER_TEMP}/precompiled.log"
+
       - name: Verification must pass clean and fail on an injected fault
         run: |
           # The point of this step is the second half. A workload whose

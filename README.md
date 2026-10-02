@@ -53,9 +53,34 @@ make PLATFORM=HIP       # AMD
 make PLATFORM=MOCK      # CPU backend, no GPU required
 ```
 
+### Compiling ahead of time
+
+A site that installs Pantheon once for many nodes, a container image, or a
+software stack such as EESSI can compile the workloads at install time and
+ship them, so the nodes need the GPU driver and not the toolkit:
+
+```bash
+export PANTHEON_BUILD_CACHE_DIR=/opt/pantheon/builds   # where the binaries go
+export PANTHEON_CUDA_ARCH=9.0                          # the cards' compute capability
+pantheon --build-only --platform cuda
+```
+
+`--build-only` compiles every workload for the platform into the build cache
+and exits. It needs the compiler (`nvcc` or `hipcc`) and no GPU. For AMD cards
+set `TARGET_GFX` (for example `gfx942`) instead of `PANTHEON_CUDA_ARCH`. Repeat
+the command per compute capability; each gets its own directory under the
+cache.
+
+At run time, set the same `PANTHEON_BUILD_CACHE_DIR` and `PANTHEON_PLATFORM=cuda`
+(or `hip`) in the environment, for example in a module file. Pantheon then
+takes the backend from the environment instead of looking for a compiler,
+finds the binaries that match the card it runs on, and compiles nothing. The
+CUDA binaries link the CUDA runtime statically, so only `libcuda` from the
+driver is needed on the node.
+
 ### Runtime Dependencies
 - **Hardware Drivers:** Latest NVIDIA or AMD Linux drivers for the target GPU.
-- **Compiler:** CUDA `nvcc` for NVIDIA GPUs, or ROCm/HIP `hipcc` for AMD GPUs. Pantheon uses the local compiler to build GPU workload binaries for the current machine.
+- **Compiler:** CUDA `nvcc` for NVIDIA GPUs, or ROCm/HIP `hipcc` for AMD GPUs. Pantheon uses the local compiler to build GPU workload binaries for the current machine, unless they were compiled ahead of time (see above).
 - **System tools:** `make` and a C++ compiler such as `g++`.
 - **Linux compatibility:** Official x86-64 binaries are built in a `manylinux_2_28` environment and require GLIBC 2.28 or newer.
 
