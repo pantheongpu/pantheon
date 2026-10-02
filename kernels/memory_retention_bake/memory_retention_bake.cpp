@@ -1,4 +1,8 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent FMA chains per thread for the bake loop.
+#define BAKE_ILP 8
 #include <chrono>
 #include <iostream>
 #include <string>
@@ -40,24 +44,29 @@ __global__ void write_payload_kernel(uint4* data, size_t n, int inject_error, in
 __global__ void bake_kernel(int iters, float* sink) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    float a = 1.0f, b = -1.0f, c = 0.5f;
-    
+    float x[BAKE_ILP];
+    #pragma unroll
+    for (int k = 0; k < BAKE_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED(k);
+
     for (int i = 0; i < iters; ++i) {
-        #pragma unroll 32
-        for (int j = 0; j < 32; ++j) {
+        #pragma unroll 8
+        for (int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int k = 0; k < BAKE_ILP; ++k) {
             #ifdef __HIP_PLATFORM_AMD__
                 // Use fmaf for explicitly 32-bit float math (fma defaults to double)
-                a = __builtin_fmaf(a, b, c); 
-                b = __builtin_fmaf(b, c, a);
+                x[k] = __builtin_fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #else
-                a = fmaf(a, b, c); 
-                b = fmaf(b, c, a);
+                x[k] = fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #endif
+            }
         }
-        if ((i & 0xF) == 0) a = -a;
     }
-    
+
     // Sink accumulator to prevent Dead Code Elimination
+    float a = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < BAKE_ILP; ++k) a += x[k];
     if (a == 12345.0f) sink[tid] = 1.0f;
 }
 
@@ -203,7 +212,7 @@ int main(int argc, char* argv[]) {
         CHECK(hipDeviceSynchronize());
         
         // 2 FMA operations per float = 4 ops per j-loop. Unrolled 32 times = 128 ops per i-loop.
-        ops_performed += total_threads * kernel_loops * 128;
+        ops_performed += total_threads * kernel_loops * 8 * BAKE_ILP * 2;
         
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;

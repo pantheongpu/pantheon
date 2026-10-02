@@ -1,4 +1,5 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
 #include <vector>
 #include <chrono>
 #include <string>
@@ -19,6 +20,9 @@
     #define __hneg2(x) (-(x))
 #endif
 
+// Independent packed-FP16 chains per thread.
+#define INCIN_ILP 8
+
 // --- INCINERATOR KERNEL (FP16/Half2 + SRAM Stress) ---
 // Smashes the dedicated FP16 math units while simultaneously hammering
 // the L1/Shared Memory banks to create maximum localized thermal density.
@@ -35,27 +39,26 @@ void incinerator_kernel(int iters, float* sink, int inject_error) {
 
     // 2. Packed FP16 (Half2) Registers
     // Removes 'volatile' and locks variables into ultra-fast FP16 datapaths.
-    half2 a = __float2half2_rn(1.0f);
-    half2 b = __float2half2_rn(0.999f);
-    half2 c = __float2half2_rn(0.001f);
-    half2 d = __float2half2_rn(-0.001f);
+    half2 x[INCIN_ILP], k_const[INCIN_ILP];
+    #pragma unroll
+    for (int k = 0; k < INCIN_ILP; ++k) {
+        x[k] = __float2half2_rn(PANTHEON_CHAOS_SEED(k));
+        k_const[k] = __float2half2_rn(PANTHEON_CHAOS_CONST(k));
+    }
 
     for(int i = 0; i < iters; ++i) {
         
         // --- VECTOR UNIT STRESS (Packed FP16 FMA) ---
+        #pragma unroll
+        for (int k = 0; k < INCIN_ILP; ++k) {
         #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
             // AMD HIP construction for packed half2 math
-            a = __hadd2(__hmul2(a, b), c);
-            b = __hadd2(__hmul2(b, c), d);
-            c = __hadd2(__hmul2(c, d), a);
-            d = __hadd2(__hmul2(d, a), b);
+            x[k] = __hadd2(__hmul2(x[k], x[k]), k_const[k]);
         #else
             // NVIDIA Native Half2 FMA Instruction (__hfma2)
-            a = __hfma2(a, b, c);
-            b = __hfma2(b, c, d);
-            c = __hfma2(c, d, a);
-            d = __hfma2(d, a, b);
+            x[k] = __hfma2(x[k], x[k], k_const[k]);
         #endif
+        }
 
         // --- SRAM STRESS (L1 Cache) ---
         // XOR index deliberately causes bank conflicts to generate heat
@@ -63,17 +66,11 @@ void incinerator_kernel(int iters, float* sink, int inject_error) {
         float val = smem[idx];
         smem[local_tid] = val + 0.0001f; 
         
-        // --- POLARITY SHOCK & CLAMPING ---
-        // FP16 overflows to Infinity extremely fast (max val is only ~65504).
-        // Clamp the values to keep the math units busy without hitting the NaN trap.
+        // --- SHARED MEMORY REFRESH ---
+        // The FP16 chains need no clamp: the map is closed, so they cannot
+        // reach the ~65504 that overflows half precision. The shared-memory
+        // accumulator does still drift, so it is reset on the same cadence.
         if ((i & 0xFF) == 0) {
-            float a_float = __low2float(a);
-            float b_float = __low2float(b);
-            
-            a = (a_float > 2.0f || a_float < -2.0f) ? __float2half2_rn(1.0f) : __hneg2(a);
-            b = (b_float > 2.0f || b_float < -2.0f) ? __float2half2_rn(0.999f) : __hneg2(b);
-            
-            // Periodically reset shared memory to prevent float degradation
             smem[local_tid] = (float)local_tid;
         }
     }
@@ -81,7 +78,9 @@ void incinerator_kernel(int iters, float* sink, int inject_error) {
     // --- DCE BYPASS & CONSENSUS SINK ---
     // We must reference smem to prevent the compiler from deleting the SRAM stress block.
     // However, we cannot add smem to the final value, or the Thread IDs will ruin the verification consensus.
-    float final_val = __low2float(a) + __low2float(b);
+    float final_val = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < INCIN_ILP; ++k) final_val += __low2float(x[k]);
     
     // This condition will physically never happen, but the compiler doesn't know that at compile-time.
     // This forces the compiler to execute all the SRAM reads/writes without poisoning our FP16 math.
@@ -230,7 +229,7 @@ int main(int argc, char* argv[]) {
 
         // A Half2 op is 2 calculations per instruction. FMA is 2 ops (Mul + Add).
         // We do 4 instructions * 2 (Half2) * 2 (FMA) = 16 operations per thread per loop.
-        ops_performed += total_threads * kernel_loops * 16;
+        ops_performed += total_threads * kernel_loops * INCIN_ILP * 4;
 
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;

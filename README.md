@@ -69,7 +69,10 @@ pantheon --build-only --platform cuda
 and exits. It needs the compiler (`nvcc` or `hipcc`) and no GPU. For AMD cards
 set `TARGET_GFX` (for example `gfx942`) instead of `PANTHEON_CUDA_ARCH`. Repeat
 the command per compute capability; each gets its own directory under the
-cache.
+cache. Some architectures (Hopper, Blackwell) have an `a` target with extra matrix
+instructions: the build node asks `nvcc` whether it exists and names the
+directory accordingly (`cuda-100a`), and a run node with no `nvcc` uses the
+directory that is there.
 
 At run time, set the same `PANTHEON_BUILD_CACHE_DIR` and `PANTHEON_PLATFORM=cuda`
 (or `hip`) in the environment, for example in a module file. Pantheon then

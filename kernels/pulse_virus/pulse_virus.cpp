@@ -1,4 +1,9 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent FMA chains per thread. A pulse has to reach full draw within
+// the spike, and one chain issues at a quarter of the pipe's rate.
+#define PULSE_ILP 8
 #include <chrono>
 #include <thread> // For sleep
 #include <string>
@@ -8,25 +13,28 @@
 __global__ void golden_pulse_kernel(int iters, unsigned int* golden_sink) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    float a = 0.999f, b = -0.999f, c = 0.5f;
+    float x[PULSE_ILP];
+    #pragma unroll
+    for (int k = 0; k < PULSE_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED(k);
 
     for(int i = 0; i < iters; ++i) {
-        #pragma unroll 32
-        for(int j = 0; j < 32; ++j) {
+        #pragma unroll 8
+        for(int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int k = 0; k < PULSE_ILP; ++k) {
             #ifdef __HIP_PLATFORM_AMD__
-                a = __builtin_fmaf(a, b, c);
-                b = __builtin_fmaf(b, c, a);
-                c = __builtin_fmaf(c, a, b);
+                x[k] = __builtin_fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #else
-                a = fmaf(a, b, c);
-                b = fmaf(b, c, a);
-                c = fmaf(c, a, b);
+                x[k] = fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #endif
+            }
         }
-        // Clamp variables to prevent infinity/NaN
-        if ((i & 0xFF) == 0) { a = -a; b = -b; }
     }
-    
+
+    float a = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < PULSE_ILP; ++k) a += x[k];
+
     // Cast the float to bits so we can reliably accumulate it
     golden_sink[tid] = pantheon_bit_cast<unsigned int>(a);
 }
@@ -38,24 +46,28 @@ __global__ void golden_pulse_kernel(int iters, unsigned int* golden_sink) {
 __global__ void pulse_load_kernel(int iters, unsigned int* sink, int inject_error) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    float a = 0.999f, b = -0.999f, c = 0.5f;
+    float x[PULSE_ILP];
+    #pragma unroll
+    for (int k = 0; k < PULSE_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED(k);
 
     for(int i = 0; i < iters; ++i) {
-        #pragma unroll 32
-        for(int j = 0; j < 32; ++j) {
+        #pragma unroll 8
+        for(int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int k = 0; k < PULSE_ILP; ++k) {
             #ifdef __HIP_PLATFORM_AMD__
-                a = __builtin_fmaf(a, b, c);
-                b = __builtin_fmaf(b, c, a);
-                c = __builtin_fmaf(c, a, b);
+                x[k] = __builtin_fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #else
-                a = fmaf(a, b, c);
-                b = fmaf(b, c, a);
-                c = fmaf(c, a, b);
+                x[k] = fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #endif
+            }
         }
-        if ((i & 0xFF) == 0) { a = -a; b = -b; }
     }
-    
+
+    float a = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < PULSE_ILP; ++k) a += x[k];
+
     unsigned int final_bits = pantheon_bit_cast<unsigned int>(a);
     
     // --- DYNAMIC FAULT INJECTION ---
@@ -209,7 +221,7 @@ int main(int argc, char* argv[]) {
         
         kernel_launches++;
         // 3 FMAs * 2 ops/FMA * 32 unrolls
-        ops_performed += total_threads * kernel_loops * 32 * 6;
+        ops_performed += total_threads * kernel_loops * 8 * PULSE_ILP * 2;
 
         // PHASE 2: DROOP (Load OFF)
         // Uses the hijacked 'init_pattern' parameter as the sleep duration

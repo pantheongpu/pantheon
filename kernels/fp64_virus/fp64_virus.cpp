@@ -1,4 +1,10 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent FP64 FMA chains per thread. FP64 FMA latency is no shorter
+// than FP32, so a single chain leaves the double-precision pipe idle most
+// of the time.
+#define FP64_ILP 8
 #include <vector>
 #include <chrono>
 #include <string>
@@ -12,44 +18,39 @@ void fp64_virus_kernel(int iters, double* sink, int inject_error) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
     // Register-locked 64-bit floats
-    double a = 1.0;
-    double b = 0.999; // Slightly less than 1 to prevent runaway divergence
-    double c = 0.001;
-    double d = -0.001;
+    double x[FP64_ILP];
+    #pragma unroll
+    for (int k = 0; k < FP64_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED_D(k);
 
+    // No clamp: the map is closed, so there is nothing to rescue, and a reset
+    // path is a path that can heal a real fault before verification sees it.
+    // The previous clamp did exactly that to the injected fault below.
     for(int i = 0; i < iters; ++i) {
-        #pragma unroll 32
-        for(int j = 0; j < 32; ++j) {
+        #pragma unroll 8
+        for(int j = 0; j < 8; ++j) {
             // Fused Multiply-Add (Double Precision)
+            #pragma unroll
+            for (int k = 0; k < FP64_ILP; ++k) {
             #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
-                a = __builtin_fma(a, b, c);
-                b = __builtin_fma(b, c, d);
-                c = __builtin_fma(c, d, a);
-                d = __builtin_fma(d, a, b);
+                x[k] = __builtin_fma(x[k], x[k], PANTHEON_CHAOS_CONST_D(k));
             #else
-                a = fma(a, b, c);
-                b = fma(b, c, d);
-                c = fma(c, d, a);
-                d = fma(d, a, b);
+                x[k] = fma(x[k], x[k], PANTHEON_CHAOS_CONST_D(k));
             #endif
-        }
-        
-        // Polarity Shock + Value Clamp
-        // Keeps the 64-bit ALUs busy without hitting Infinity/NaN
-        if ((i & 0xFF) == 0) {
-            a = (a > 2.0 || a < -2.0) ? 1.0 : -a;
-            b = (b > 2.0 || b < -2.0) ? 0.999 : -b;
+            }
         }
 
         // --- DYNAMIC FAULT INJECTION ---
         if (inject_error && tid == 1337 && i == 500) {
             // Intentionally corrupt the 64-bit FMA chain
-            a += 100.0; 
+            x[0] += 100.0; 
         }
     }
 
     // Sink accumulator to prevent Dead Code Elimination (DCE)
-    sink[tid] = a + b + c + d;
+    double acc = 0.0;
+    #pragma unroll
+    for (int k = 0; k < FP64_ILP; ++k) acc += x[k];
+    sink[tid] = acc;
 }
 
 // --- VERIFICATION KERNEL (64-Bit Integer Comparison) ---
@@ -191,7 +192,7 @@ int main(int argc, char* argv[]) {
         
         // 4 instructions * 2 (FMA is 2 ops) = 8 ops per inner loop. 
         // We unroll 32 times, so 8 * 32 = 256 operations per outer loop iteration.
-        ops_performed += total_threads * kernel_loops * 256;
+        ops_performed += total_threads * kernel_loops * 8 * FP64_ILP * 2;
         
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;

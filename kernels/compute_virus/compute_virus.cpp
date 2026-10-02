@@ -1,4 +1,9 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent FMA chains per thread. Two coupled FMAs per iteration left the
+// pipe waiting on its own latency; eight chains keep it issuing.
+#define VOLTAGE_ILP 8
 #include <vector>
 #include <chrono>
 #include <string>
@@ -9,30 +14,27 @@ __global__
 void voltage_droop_kernel(int iters, float* sink, int inject_error) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    float a = 1.0f; 
-    float b = 0.999f; // Slightly less than 1 to prevent divergence
-    float c = 0.001f;
-    float d = -0.001f;
+    float x[VOLTAGE_ILP];
+    #pragma unroll
+    for (int k = 0; k < VOLTAGE_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED(k);
 
+    // No clamp and no polarity shock: the map is closed by construction, so
+    // there is nothing to rescue, and a reset path is a path that can heal a
+    // real fault before verification sees it.
     for(int i = 0; i < iters; ++i) {
+        #pragma unroll
+        for (int k = 0; k < VOLTAGE_ILP; ++k) {
         #ifdef __HIP_PLATFORM_AMD__
-            a = __builtin_fmaf(a, b, c);
-            b = __builtin_fmaf(b, c, d);
+            x[k] = __builtin_fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
         #else
-            a = fmaf(a, b, c);
-            b = fmaf(b, c, d);
+            x[k] = fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
         #endif
-        
-        // Polarity Shock + Value Clamp
-        // If the value gets too large, we reset it to a known state
-        // to keep the ALUs busy without hitting NaN.
-        if ((i & 0xFF) == 0) {
-            a = (a > 2.0f || a < -2.0f) ? 1.0f : -a;
-            b = (b > 2.0f || b < -2.0f) ? 0.999f : -b;
         }
     }
 
-    float final_val = a + b;
+    float final_val = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < VOLTAGE_ILP; ++k) final_val += x[k];
     
     // --- DYNAMIC FAULT INJECTION ---
     // If the Python flag was passed, flip a bit on thread 1337
@@ -176,7 +178,7 @@ int main(int argc, char* argv[]) {
         CHECK(hipDeviceSynchronize());
         
         // 4 operations per FMA loop iteration
-        ops_performed += total_threads * kernel_loops * 4;
+        ops_performed += total_threads * kernel_loops * VOLTAGE_ILP * 2;
         
         if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >= duration) break;
     }

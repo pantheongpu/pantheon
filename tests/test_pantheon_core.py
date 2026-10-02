@@ -2205,6 +2205,14 @@ def test_detect_platform_rejects_unknown_backend_in_env(monkeypatch):
     assert exc.value.code == 1
 
 
+def _no_compiler(monkeypatch, tmp_path):
+    """A node with no nvcc and an empty build cache, whatever this machine has."""
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: None)
+    monkeypatch.setattr(pantheon, "_CUDA_ARCH_SUFFIX_CACHE", {})
+    monkeypatch.setattr(pantheon, "SOURCE_BUILD_DIR", str(tmp_path / "source-build"))
+    monkeypatch.setenv("PANTHEON_BUILD_CACHE_DIR", str(tmp_path / "cache"))
+
+
 @pytest.mark.parametrize("value, target", [
     ("9.0", "90a"),
     ("sm_90", "90a"),
@@ -2213,7 +2221,8 @@ def test_detect_platform_rejects_unknown_backend_in_env(monkeypatch):
     ("120", "120"),
     ("sm_120", "120"),
 ])
-def test_detect_build_target_takes_cuda_arch_from_env(monkeypatch, value, target):
+def test_detect_build_target_takes_cuda_arch_from_env(monkeypatch, tmp_path, value, target):
+    _no_compiler(monkeypatch, tmp_path)
     monkeypatch.setenv("PANTHEON_CUDA_ARCH", value)
 
     def no_nvidia_smi(*_args, **_kwargs):
@@ -2230,6 +2239,7 @@ def test_detect_build_target_rejects_malformed_cuda_arch(monkeypatch):
 
 
 def test_build_kernels_passes_cuda_target_to_make(tmp_path, monkeypatch):
+    _no_compiler(monkeypatch, tmp_path)
     base = tmp_path / "base"
     kernels = base / "kernels" / "demo"
     cache_root = tmp_path / "cache"
@@ -2302,3 +2312,152 @@ def test_build_only_fails_when_a_workload_did_not_compile(monkeypatch):
         pantheon.main()
 
     assert exc.value.code == 1
+
+
+def test_cuda_toolkit_directories_sort_by_version_not_by_text(monkeypatch):
+    """Sorted as text, "cuda-9.0" outranks "cuda-12.8" because '9' > '1'.
+
+    A box carrying an old toolkit next to a current one would then compile
+    every kernel with the old one, which on a recent part means no matching
+    architecture target at all.
+    """
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    monkeypatch.setattr(
+        pantheon.glob,
+        "glob",
+        lambda _pattern: [
+            "/usr/local/cuda-9.0/bin",
+            "/usr/local/cuda-12.8/bin",
+            "/usr/local/cuda-11.4/bin",
+        ],
+    )
+    monkeypatch.setattr(pantheon.os.path, "isdir", lambda _path: True)
+
+    directories = pantheon.cuda_bin_directories()
+    versioned = [d for d in directories if "cuda-" in d]
+    assert versioned == [
+        "/usr/local/cuda-12.8/bin",
+        "/usr/local/cuda-11.4/bin",
+        "/usr/local/cuda-9.0/bin",
+    ]
+
+
+def test_gpu_without_its_compiler_refuses_instead_of_mocking(monkeypatch, capsys):
+    """A GPU box that cannot find its compiler must not quietly simulate.
+
+    The mock backend runs every workload on the CPU, yet still prints
+    throughput, writes a report and reaches a HEALTHY verdict while the GPU
+    stays at idle temperature -- so a run that measured nothing reads like a
+    run that measured something.
+    """
+    monkeypatch.delenv("PANTHEON_MOCK", raising=False)
+    monkeypatch.setattr(
+        pantheon,
+        "find_tool",
+        lambda name: "/usr/bin/nvidia-smi" if name in ("nvidia-smi", "g++") else None,
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        pantheon.detect_platform("auto")
+
+    assert excinfo.value.code == 1
+    out = capsys.readouterr().out
+    assert "nvcc was not found" in out
+    # And it has to say how to get the mock on purpose, or the refusal is a
+    # dead end for anyone who wanted it.
+    assert "--platform mock" in out
+
+
+def test_explicit_mock_still_wins_on_a_gpu_box(monkeypatch):
+    """The refusal above must not take the deliberate mock run with it."""
+    monkeypatch.setattr(
+        pantheon,
+        "find_tool",
+        lambda name: "/usr/bin/nvidia-smi" if name in ("nvidia-smi", "g++") else None,
+    )
+    assert pantheon.detect_platform("mock") == "MOCK"
+
+    monkeypatch.setenv("PANTHEON_MOCK", "1")
+    assert pantheon.detect_platform("auto") == "MOCK"
+
+
+# --- the "a" target on build nodes and run nodes -------------------------------
+
+def test_cuda_arch_from_env_goes_through_the_nvcc_probe(monkeypatch):
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: "/usr/bin/nvcc" if name == "nvcc" else None)
+    monkeypatch.setattr(pantheon, "_CUDA_ARCH_SUFFIX_CACHE", {})
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", "10.0")
+    accepted = []
+
+    def probe(cmd, **_kwargs):
+        accepted.append(cmd[1])
+        if cmd[1] != "--gpu-architecture=sm_100a":
+            raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(pantheon.subprocess, "check_call", probe)
+    assert pantheon.detect_build_target("CUDA") == "100a"
+    assert accepted == ["--gpu-architecture=sm_100a"]
+
+    # A toolkit that has no sm_100a keeps the portable target.
+    monkeypatch.setattr(pantheon, "_CUDA_ARCH_SUFFIX_CACHE", {})
+    monkeypatch.setattr(pantheon.subprocess, "check_call",
+                        lambda cmd, **_kw: (_ for _ in ()).throw(subprocess.CalledProcessError(1, cmd)))
+    assert pantheon.detect_build_target("CUDA") == "100"
+
+
+def test_run_node_without_nvcc_reads_the_suffix_from_the_cache_directory(monkeypatch, tmp_path):
+    _no_compiler(monkeypatch, tmp_path)
+    monkeypatch.setattr(pantheon, "PANTHEON_VERSION", "9.9.9")
+    monkeypatch.setattr(pantheon.subprocess, "check_output", lambda *_a, **_k: "10.0\n")
+    version_dir = tmp_path / "cache" / "9.9.9"
+
+    # Nothing built yet: nothing is assumed beyond the old Hopper rule.
+    assert pantheon.detect_build_target("CUDA") == "100"
+
+    # A build node compiled for sm_100a: the run node must find that directory.
+    (version_dir / "cuda-100a").mkdir(parents=True)
+    (version_dir / "cuda-100a" / ".pantheon_build_cache.json").write_text("{}")
+    assert pantheon.detect_build_target("CUDA") == "100a"
+    assert pantheon.configure_build_directory("CUDA") == str(version_dir / "cuda-100a")
+
+    # The same holds when the architecture comes from PANTHEON_CUDA_ARCH.
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", "sm_100")
+    assert pantheon.detect_build_target("CUDA") == "100a"
+
+
+def test_run_node_prefers_the_build_that_exists_over_the_hopper_rule(monkeypatch, tmp_path):
+    _no_compiler(monkeypatch, tmp_path)
+    monkeypatch.setattr(pantheon, "PANTHEON_VERSION", "9.9.9")
+    monkeypatch.setenv("PANTHEON_CUDA_ARCH", "9.0")
+    marker = tmp_path / "cache" / "9.9.9" / "cuda-90" / ".pantheon_build_cache.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    assert pantheon.detect_build_target("CUDA") == "90"
+
+
+def test_source_tree_build_records_its_target_for_run_nodes(monkeypatch, tmp_path):
+    _no_compiler(monkeypatch, tmp_path)
+    monkeypatch.delenv("PANTHEON_BUILD_CACHE_DIR")
+    monkeypatch.setattr(pantheon, "build_cache_root", lambda: str(tmp_path / "source-build"))
+    monkeypatch.setattr(pantheon.subprocess, "check_output", lambda *_a, **_k: "12.0\n")
+    build = tmp_path / "source-build"
+    build.mkdir()
+    (build / ".pantheon_build_cache.json").write_text(json.dumps({"target": "120a"}))
+    assert pantheon.detect_build_target("CUDA") == "120a"
+
+
+def test_platform_from_env_still_runs_on_a_gpu_box_without_a_compiler(monkeypatch):
+    """The refusal to fall back to the mock only applies to auto-detection;
+    an installation with precompiled workloads names its backend."""
+    monkeypatch.setattr(
+        pantheon, "find_tool",
+        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+    )
+    monkeypatch.delenv("PANTHEON_MOCK", raising=False)
+    monkeypatch.setenv("PANTHEON_PLATFORM", "cuda")
+    assert pantheon.detect_platform("auto") == "CUDA"
+    monkeypatch.delenv("PANTHEON_PLATFORM")
+    assert pantheon.detect_platform("cuda") == "CUDA"
+    with pytest.raises(SystemExit):
+        pantheon.detect_platform("auto")

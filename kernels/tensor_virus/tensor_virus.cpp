@@ -3,26 +3,35 @@
 #include <string>
 #include <iostream>
 #include "../common/fp16_shim.h"
+#include "../common/toggle_chaos.h"
+
+// Independent packed-FP16 chains per thread. One chain issues at a quarter of
+// the pipe's rate because every __hfma2 consumes the previous result.
+#define TENSOR_ILP 8
 
 // --- GOLDEN PASS KERNEL ---
 __global__ void golden_tensor_kernel(int iters, unsigned int* golden_sink, int init_pattern) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Use init_pattern to modulate the starting polarity of the FP16 vectors
+    // init_pattern modulates the starting polarity of the FP16 chains.
     float sign = (init_pattern == 1) ? -1.0f : 1.0f;
-    __half2 a = make_half2_universal(1.0f * sign);
-    __half2 b = make_half2_universal(0.5f * sign);
-    __half2 c = make_half2_universal(-1.0f * sign);
+    __half2 x[TENSOR_ILP], c[TENSOR_ILP];
+    #pragma unroll
+    for (int k = 0; k < TENSOR_ILP; ++k) {
+        x[k] = make_half2_universal(PANTHEON_CHAOS_SEED(k) * sign);
+        c[k] = make_half2_universal(PANTHEON_CHAOS_CONST(k));
+    }
 
     for(int i = 0; i < iters; ++i) {
-        a = __hfma2(a, b, c);
-        b = __hfma2(b, c, a);
-        c = __hfma2(c, a, b);
-
-        if ((i & 0xF) == 0) {
-            a = __hneg2(a);
+        #pragma unroll
+        for (int k = 0; k < TENSOR_ILP; ++k) {
+            x[k] = __hfma2(x[k], x[k], c[k]);
         }
     }
+
+    __half2 a = x[0];
+    #pragma unroll
+    for (int k = 1; k < TENSOR_ILP; ++k) a = __hfma2(a, make_half2_universal(1.0f), x[k]);
 
     // Convert to float2, extract the raw bits of both 16-bit calculations, 
     // and XOR them into a single deterministic 32-bit state hash.
@@ -33,31 +42,38 @@ __global__ void golden_tensor_kernel(int iters, unsigned int* golden_sink, int i
 }
 
 // --- TENSOR VIRUS (FP16 HAMMER) ---
-// Uses Half-Precision (FP16) to saturate Tensor/Matrix cores.
+// Saturates the packed half-precision vector pipe (__hfma2). This is the
+// FP16 ALU path, not the matrix cores -- mma_virus covers those.
 __global__ void tensor_virus_kernel(int iters, unsigned int* sink, int inject_error, int init_pattern) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     float sign = (init_pattern == 1) ? -1.0f : 1.0f;
-    __half2 a = make_half2_universal(1.0f * sign);
-    __half2 b = make_half2_universal(0.5f * sign);
-    __half2 c = make_half2_universal(-1.0f * sign);
+    __half2 x[TENSOR_ILP], c[TENSOR_ILP];
+    #pragma unroll
+    for (int k = 0; k < TENSOR_ILP; ++k) {
+        x[k] = make_half2_universal(PANTHEON_CHAOS_SEED(k) * sign);
+        c[k] = make_half2_universal(PANTHEON_CHAOS_CONST(k));
+    }
 
     for(int i = 0; i < iters; ++i) {
-        a = __hfma2(a, b, c);
-        b = __hfma2(b, c, a);
-        c = __hfma2(c, a, b);
+        #pragma unroll
+        for (int k = 0; k < TENSOR_ILP; ++k) {
+            x[k] = __hfma2(x[k], x[k], c[k]);
+        }
 
         // --- DYNAMIC FAULT INJECTION ---
-        // Inject on the absolute final iteration to prevent the FP16 math 
-        // from contractively "healing" the corrupted state over time.
+        // Inject on the absolute final iteration. Mid-run the chaotic map
+        // amplifies a real flip rather than healing it, but an injected value
+        // this far out of range overflows the chain to infinity, and infinity
+        // is what the old saturating recurrence produced on its own.
         if (inject_error && tid == 1337 && i == iters - 1) {
-            a = make_half2_universal(9999.0f);
-        }
-
-        if ((i & 0xF) == 0) {
-            a = __hneg2(a);
+            x[0] = make_half2_universal(9999.0f);
         }
     }
+
+    __half2 a = x[0];
+    #pragma unroll
+    for (int k = 1; k < TENSOR_ILP; ++k) a = __hfma2(a, make_half2_universal(1.0f), x[k]);
 
     float2 res = __half22float2(a);
     unsigned int bits_x = pantheon_bit_cast<unsigned int>(res.x);
@@ -208,7 +224,7 @@ int main(int argc, char* argv[]) {
         kernel_launches++;
 
         // 12 FLOPs per loop * iterations per thread
-        ops_performed += (size_t)num_blocks * block_size * kernel_loops * 12;
+        ops_performed += (size_t)num_blocks * block_size * kernel_loops * TENSOR_ILP * 4;
 
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;
@@ -219,7 +235,7 @@ int main(int argc, char* argv[]) {
 
     // --- 6. VERIFICATION PASS ---
     if (verify_mode) {
-        std::cout << "[PANTHEON] Running FP16 Tensor Core State Verification Pass..." << std::endl;
+        std::cout << "[PANTHEON] Running Packed FP16 State Verification Pass..." << std::endl;
         
         unsigned int* d_err_count;
         CHECK(hipMalloc(&d_err_count, sizeof(unsigned int)));

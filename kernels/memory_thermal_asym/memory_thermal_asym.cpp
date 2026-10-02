@@ -1,4 +1,8 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent FMA chains per thread for the burn half of this workload.
+#define ASYM_ILP 8
 #include <chrono>
 #include <string>
 #include <iostream>
@@ -9,23 +13,26 @@ __global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int inject
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
-    float a = 1.0f, b = -1.0f, c = 0.5f;
-    
+    float x[ASYM_ILP];
+    #pragma unroll
+    for (int k = 0; k < ASYM_ILP; ++k) x[k] = PANTHEON_CHAOS_SEED(k);
+
     // Determine the physical bits to write based on fuzzer config
     uint32_t val = (init_pattern == 1) ? 0xFFFFFFFF : 0x00000000;
     uint4 pattern = make_uint4(val, val, val, val);
 
     for (int i = 0; i < loops; ++i) {
         // 1. Extreme Compute Burn (Heat Generation)
-        #pragma unroll 32
-        for (int j = 0; j < 32; ++j) {
+        #pragma unroll 8
+        for (int j = 0; j < 8; ++j) {
+            #pragma unroll
+            for (int k = 0; k < ASYM_ILP; ++k) {
             #ifdef __HIP_PLATFORM_AMD__
-                a = __builtin_fmaf(a, b, c);
-                b = __builtin_fmaf(b, c, a);
+                x[k] = __builtin_fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #else
-                a = fmaf(a, b, c);
-                b = fmaf(b, c, a);
+                x[k] = fmaf(x[k], x[k], PANTHEON_CHAOS_CONST(k));
             #endif
+            }
         }
 
         // --- DYNAMIC FAULT INJECTION ---
@@ -39,11 +46,12 @@ __global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int inject
         // We use modulo 'n' to trap the writes inside the isolated buffer
         size_t write_idx = (idx + i * stride) % n;
         store_nt(&data[write_idx], write_val);
-        
-        if ((i & 0xF) == 0) a = -a;
     }
 
     // Dependency sink to prevent DCE
+    float a = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < ASYM_ILP; ++k) a += x[k];
     if (a == 12345.0f) data[0].x = 1;
 }
 
@@ -189,7 +197,7 @@ int main(int argc, char* argv[]) {
         LAUNCH_KERNEL(thermal_asym_kernel, num_blocks, block_size, d_data, num_elements, kernel_loops, inject_error, init_pattern);
         CHECK(hipDeviceSynchronize());
         
-        ops_performed += (size_t)num_blocks * block_size * kernel_loops * 64; // Approx FLOPs
+        ops_performed += (size_t)num_blocks * block_size * kernel_loops * 8 * ASYM_ILP * 2; // Approx FLOPs
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;
     }
