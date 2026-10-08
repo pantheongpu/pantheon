@@ -1,4 +1,10 @@
 #include "../common/common.h"
+#include "../common/toggle_chaos.h"
+
+// Independent transcendental chains per thread. SFU latency is long and its
+// throughput is a fraction of the FMA pipe's, so one chain per thread leaves
+// the unit idle between results.
+#define SFU_ILP 4
 #include <chrono>
 #include <string>
 #include <iostream>
@@ -7,24 +13,29 @@
 __global__ void golden_sfu_kernel(int iters, unsigned int* golden_sink, int init_pattern) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Use init_pattern to modulate the starting scale and sign of the transcendental chain
-    float a = (float)tid * 0.0001f * (init_pattern + 1);
-    float b = (init_pattern % 2 == 1) ? -1.0f : 1.0f;
+    // Use init_pattern to modulate the starting scale and sign of the chains.
+    float a[SFU_ILP], b[SFU_ILP];
+    #pragma unroll
+    for (int k = 0; k < SFU_ILP; ++k) {
+        a[k] = PANTHEON_CHAOS_SFU_SEED_A(k)
+             + (float)tid * 0.0001f * (float)(init_pattern + 1);
+        b[k] = (init_pattern % 2 == 1) ? -PANTHEON_CHAOS_SFU_SEED_B(k)
+                                      :  PANTHEON_CHAOS_SFU_SEED_B(k);
+    }
 
     for(int i = 0; i < iters; ++i) {
-        a = sinf(a) * cosf(b);
-        b = expf(a) / (1.0f + fabsf(a));
-        a = logf(fabsf(b) + 0.00001f);
-        b = rsqrtf(a * a + 1.0f);
-        
-        if ((i & 0x1F) == 0) {
-            a += 0.1f;
-            b = 1.0f - b;
+        #pragma unroll
+        for (int k = 0; k < SFU_ILP; ++k) {
+            PANTHEON_CHAOS_SFU_STEP(a[k], b[k]);
         }
     }
 
+    float acc = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < SFU_ILP; ++k) acc += a[k];
+
     // Cast the final float to bits for exact hardware verification
-    golden_sink[tid] = pantheon_bit_cast<unsigned int>(a);
+    golden_sink[tid] = pantheon_bit_cast<unsigned int>(acc);
 }
 
 // --- SFU (SPECIAL FUNCTION UNIT) VIRUS ---
@@ -34,32 +45,39 @@ __global__ void sfu_stress_kernel(int iters, unsigned int* sink, int inject_erro
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     
     // Seed with thread ID to prevent caching
-    float a = (float)tid * 0.0001f * (init_pattern + 1);
-    float b = (init_pattern % 2 == 1) ? -1.0f : 1.0f;
+    float a[SFU_ILP], b[SFU_ILP];
+    #pragma unroll
+    for (int k = 0; k < SFU_ILP; ++k) {
+        a[k] = PANTHEON_CHAOS_SFU_SEED_A(k)
+             + (float)tid * 0.0001f * (float)(init_pattern + 1);
+        b[k] = (init_pattern % 2 == 1) ? -PANTHEON_CHAOS_SFU_SEED_B(k)
+                                      :  PANTHEON_CHAOS_SFU_SEED_B(k);
+    }
 
+    // The "Transcendental Torture" Chain: high-latency, low-throughput
+    // instructions, amplified before the sine so the orbit stays chaotic.
+    // The old chain needed a periodic nudge to "avoid convergence to 0/INF"
+    // and still settled onto a short orbit toggling 1.2 bits of 32; this one
+    // is bounded by construction and needs no nudge.
     for(int i = 0; i < iters; ++i) {
-        // The "Transcendental Torture" Chain
-        // High-latency, low-throughput instructions
-        a = sinf(a) * cosf(b);
-        b = expf(a) / (1.0f + fabsf(a));
-        a = logf(fabsf(b) + 0.00001f);
-        b = rsqrtf(a * a + 1.0f);
-        
-        // --- DYNAMIC FAULT INJECTION ---
-        if (inject_error && tid == 1337 && i == iters - 1) {
-            a += 9999.0f; 
+        #pragma unroll
+        for (int k = 0; k < SFU_ILP; ++k) {
+            PANTHEON_CHAOS_SFU_STEP(a[k], b[k]);
         }
 
-        // Periodic perturbation to avoid convergence to 0/INF
-        if ((i & 0x1F) == 0) {
-            a += 0.1f;
-            b = 1.0f - b;
+        // --- DYNAMIC FAULT INJECTION ---
+        if (inject_error && tid == 1337 && i == iters - 1) {
+            a[0] += 9999.0f; 
         }
     }
 
+    float acc = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < SFU_ILP; ++k) acc += a[k];
+
     // Accumulate the bits. If an SDC occurs during ANY transient spike,
     // it permanently poisons this thread's accumulator via integer addition.
-    sink[tid] += pantheon_bit_cast<unsigned int>(a);
+    sink[tid] += pantheon_bit_cast<unsigned int>(acc);
 }
 
 // --- VERIFICATION KERNEL ---
@@ -203,7 +221,9 @@ int main(int argc, char* argv[]) {
         kernel_launches++;
 
         // 13 FLOPs per loop * iterations per thread
-        ops_performed += (size_t)num_blocks * block_size * kernel_loops * 13;
+        // Twelve ops per chain step: five transcendentals counted as one each,
+        // plus the seven arithmetic operations that compose them.
+        ops_performed += (size_t)num_blocks * block_size * kernel_loops * SFU_ILP * 12;
 
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;

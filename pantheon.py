@@ -15,6 +15,7 @@ import shutil
 import hashlib
 import shlex
 import re
+import tempfile
 import statistics
 import pandas as pd
 import numpy as np
@@ -910,9 +911,9 @@ TEST_REGISTRY = {
     "sfu_stress":     {"bin": "sfu_stress",      "args": [], "desc": "SFU Virus (Transcendental Math)"},
     "pcie_bandwidth": {"bin": "pcie_bandwidth",  "args": [], "desc": "PCIe Thrasher (Host <-> Device)"},
     "pulse_virus":    {"bin": "pulse_virus",     "args": [], "desc": "Transient Pulse (VRM Attack 10Hz)"},
-    "tensor_virus":   {"bin": "tensor_virus",    "args": [], "desc": "Tensor Virus (FP16 Matrix Power)"},
+    "tensor_virus":   {"bin": "tensor_virus",    "args": [], "desc": "Tensor Virus (Packed FP16 Vector Pipe)"},
     "atomic_virus":   {"bin": "atomic_virus",    "args": [], "desc": "Atomic Virus (L2 Cache Thrash)"},
-    "omni_virus":      {"bin": "omni_virus",       "args": [], "desc": "Omni Virus (Mem + FP16 + FP32 Async)"},
+    "omni_virus":      {"bin": "omni_virus",       "args": [], "desc": "Omni Virus (Tensor + Mem + FP16/FP32 + SFU Async)"},
 
     # --- NEW: Specialized Hardware Blocks ---
     "p2p_thrasher":     {"bin": "p2p_thrasher",     "args": [], "desc": "P2P Thrasher (Multi-GPU Interconnect)"},
@@ -1071,7 +1072,18 @@ def cuda_bin_directories():
         if root:
             candidates.append(os.path.join(os.path.expanduser(root), "bin"))
     candidates.append("/usr/local/cuda/bin")
-    candidates.extend(sorted(glob.glob("/usr/local/cuda-*/bin"), reverse=True))
+    # Newest first, by version number rather than by string. Sorted as text,
+    # "cuda-9.0" outranks "cuda-12.8" because '9' > '1', so a box carrying an
+    # old toolkit alongside a current one would compile against the old one --
+    # and on a recent part that means no matching architecture target at all.
+    def toolkit_version(path):
+        match = re.search(r"cuda-([0-9]+(?:\.[0-9]+)*)", path)
+        if not match:
+            return ()
+        return tuple(int(part) for part in match.group(1).split("."))
+
+    candidates.extend(sorted(glob.glob("/usr/local/cuda-*/bin"),
+                             key=toolkit_version, reverse=True))
 
     directories = []
     for candidate in candidates:
@@ -1548,7 +1560,33 @@ def detect_platform(preferred="auto"):
     if has_hipcc:
         return "HIP"
     
-    # 4. Fallback to Mock if nothing else found (Optional, good for local dev without GPU)
+    # 4. A GPU is present but its compiler is not. Do not quietly simulate.
+    #
+    # The mock backend runs every workload on the CPU. It still prints
+    # throughput, still writes a report, and still reaches a HEALTHY verdict,
+    # while the GPU sits at idle temperature the whole time -- so a run that
+    # measured nothing looks very much like a run that measured something.
+    # That is worth an error rather than a warning line in a long log: on a
+    # machine with no GPU at all the fallback is genuinely useful, but here it
+    # can only mislead. PANTHEON_PLATFORM and --platform were handled above,
+    # so an installation with precompiled workloads and no compiler still runs.
+    if has_nvidia_gpu or has_amd_gpu:
+        vendor, compiler = ("NVIDIA", "nvcc") if has_nvidia_gpu else ("AMD", "hipcc")
+        print(f"[ERROR] {vendor} GPU detected, but {compiler} was not found.")
+        print("        Searched PATH and:")
+        for directory in (cuda_bin_directories() if has_nvidia_gpu
+                          else rocm_bin_directories()):
+            print(f"          {directory}")
+        if has_nvidia_gpu:
+            print("        Set CUDA_HOME to the toolkit root, or add its bin")
+            print("        directory to PATH, then run again.")
+        else:
+            print("        Set ROCM_PATH to the ROCm root, or add its bin")
+            print("        directory to PATH, then run again.")
+        print("        To measure the CPU mock deliberately, pass --platform mock.")
+        sys.exit(1)
+
+    # 5. No GPU at all. The mock backend is the useful answer here.
     if find_tool("g++"):
         print("[PANTHEON] Warning: No GPU compiler found. Defaulting to CPU Mock mode.")
         return "MOCK"
@@ -1557,7 +1595,10 @@ def detect_platform(preferred="auto"):
 
 
 def normalize_cuda_arch(value):
-    """The target name for a compute capability: '9.0', 'sm_90', '90' and '90a' all give '90a'."""
+    """The target name for a compute capability: '9.0', 'sm_90' and '90' all give '90'.
+
+    A suffix written by the user is kept; otherwise cuda_arch_suffix() adds it.
+    """
     text = str(value or "").strip().lower()
     if text.startswith("sm_"):
         text = text[3:]
@@ -1567,10 +1608,76 @@ def normalize_cuda_arch(value):
     if not re.fullmatch(r"[0-9]+[a-z]?", text):
         print(f"[ERROR] PANTHEON_CUDA_ARCH={value!r}: expected a compute capability such as 8.0, sm_90 or 120.")
         sys.exit(1)
-    if text == "90":
-        # Hopper needs the 'a' suffix for the WGMMA instructions, as the Makefile does
-        text = "90a"
     return text
+
+
+_CUDA_ARCH_SUFFIX_CACHE = {}
+
+
+def cached_cuda_arch_suffix(arch):
+    """The suffix of an existing build for this architecture, or None.
+
+    A node that runs workloads compiled elsewhere (see --build-only) has no
+    nvcc to probe, so the suffix is read from what the build wrote: the
+    per-target directory under the cache root, or the target recorded in the
+    source tree's build cache file.
+    """
+    version_dir = os.path.join(build_cache_root(), path_component(PANTHEON_VERSION))
+    for suffix in ("a", ""):
+        marker = os.path.join(version_dir, f"cuda-{path_component(arch + suffix)}",
+                              ".pantheon_build_cache.json")
+        if os.path.isfile(marker):
+            return suffix
+    try:
+        with open(os.path.join(SOURCE_BUILD_DIR, ".pantheon_build_cache.json"),
+                  "r", encoding="utf-8") as f:
+            target = json.load(f).get("target", "")
+    except (OSError, ValueError):
+        return None
+    for suffix in ("a", ""):
+        if target == arch + suffix:
+            return suffix
+    return None
+
+
+def cuda_arch_suffix(arch):
+    """The family-specific ("a") suffix for a compute capability, or "".
+
+    Some architectures expose their matrix-core instructions only under the
+    "a" suffix -- sm_90a, and the Blackwell targets. Which suffixes exist
+    depends on the toolkit as well as the architecture, so the Makefile and
+    this function ask nvcc instead of carrying a list.
+
+    The value is part of the build cache key, so it has to be the same at
+    build time and at run time. With nvcc present it comes from the probe. On
+    a node that only runs precompiled workloads there is no nvcc, so it comes
+    from the cache directory the build wrote. With neither, sm_90 keeps the
+    "a" it always had and nothing else is assumed.
+    """
+    nvcc = find_tool("nvcc")
+    if not nvcc:
+        cached = cached_cuda_arch_suffix(arch)
+        if cached is not None:
+            return cached
+        return "a" if arch == "90" else ""
+
+    if arch in _CUDA_ARCH_SUFFIX_CACHE:
+        return _CUDA_ARCH_SUFFIX_CACHE[arch]
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = os.path.join(tmp, "probe.cu")
+            open(probe, "w", encoding="utf-8").close()
+            subprocess.check_call(
+                [nvcc, f"--gpu-architecture=sm_{arch}a", "-ptx",
+                 probe, "-o", os.path.join(tmp, "probe.ptx")],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        suffix = "a"
+    except Exception:
+        suffix = ""
+    _CUDA_ARCH_SUFFIX_CACHE[arch] = suffix
+    return suffix
 
 
 def detect_build_target(platform_name):
@@ -1580,6 +1687,8 @@ def detect_build_target(platform_name):
         # (see --build-only); otherwise it is read from the card that is present.
         requested = normalize_cuda_arch(os.environ.get("PANTHEON_CUDA_ARCH", ""))
         if requested:
+            if requested[-1].isdigit():
+                requested += cuda_arch_suffix(requested)
             return requested
         detected_arch = ""
         try:
@@ -1591,9 +1700,8 @@ def detect_build_target(platform_name):
             detected_arch = out.splitlines()[0].strip().replace(".", "")
         except:
             detected_arch = ""
-        if detected_arch == "90":
-            detected_arch = "90a"
-        return detected_arch or "86"
+        detected_arch = detected_arch or "86"
+        return detected_arch + cuda_arch_suffix(detected_arch)
 
     if platform_name == "HIP":
         target_gfx = os.environ.get("TARGET_GFX", "").strip()

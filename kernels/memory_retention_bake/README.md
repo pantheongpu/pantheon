@@ -16,7 +16,7 @@
 
 1. The test allocates `--mem` percent of VRAM.
 2. A deterministic payload is written to the allocation.
-3. The active phase repeatedly launches an FP32 ALU bake kernel.
+3. The active phase repeatedly launches an FP32 ALU bake kernel, running eight independent bounded-chaos chains per thread so the datapath keeps toggling instead of saturating to infinity after eight FMAs. See [`toggle_chaos.h`](../common/toggle_chaos.h).
 4. With `--verify`, the original payload is read back and compared.
 
 ## Command Examples

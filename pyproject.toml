@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pantheon-gpu"
+dynamic = ["version"]
+description = "GPU stress, power and reliability test suite"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+
+# pandas and numpy are imported unconditionally. psutil and nvidia-ml-py are
+# guarded by try/except, but without nvidia-ml-py there is no core-temperature
+# reading at all, which is the number most runs are here to look at, so they
+# are dependencies rather than extras.
+dependencies = [
+    "pandas",
+    "numpy",
+    "psutil",
+    "nvidia-ml-py",
+]
+
+[project.optional-dependencies]
+# The summary workbook is skipped with a notice when openpyxl is absent; the
+# same rows are always written to summary.csv.
+reports = ["openpyxl"]
+docs = ["mkdocs-material"]
+dev = ["pytest"]
+
+[project.scripts]
+pantheon = "pantheon:main"
+
+[project.urls]
+Homepage = "https://github.com/pantheongpu/pantheon"
+Discussions = "https://github.com/pantheongpu/pantheon/discussions"
+
+# One source of truth for the version: pantheon.py reads the same VERSION file
+# at runtime, relative to itself, so a second copy here would be free to drift.
+[tool.hatch.version]
+path = "VERSION"
+pattern = "(?P<version>\\S+)"
+
+# Flat layout: pantheon.py and monitor.py are top-level modules, and the
+# kernel sources plus the Makefile have to travel with them. The runner
+# compiles kernels at run time from KERNEL_DIR, which it resolves relative to
+# pantheon.py -- ship them and an installed copy builds the same workloads a
+# source checkout does. Leave them out and the install compiles nothing.
+[tool.hatch.build.targets.wheel]
+only-include = ["pantheon.py", "monitor.py", "kernels", "Makefile", "VERSION"]
+sources = ["."]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "pantheon.py",
+    "monitor.py",
+    "kernels",
+    "tests",
+    "docs",
+    "Makefile",
+    "VERSION",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "requirements.txt",
+    "pytest.ini",
+    "mkdocs.yml",
+]

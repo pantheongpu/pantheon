@@ -28,19 +28,27 @@ else ifeq ($(PLATFORM), CUDA)
     # Print it immediately during the parsing phase
     $(info [DEBUG] The detected architecture is: $(DETECTED_ARCH))
 
-    # 2. Hopper WGMMA Promotion
-    # Hopper requires the 'a' suffix (sm_90a) to unlock WGMMA PTX instructions
-    ifeq ($(DETECTED_ARCH), 90)
-        DETECTED_ARCH := 90a
-    endif
-
-    # 3. The Ultimate Failsafe
-    # If nvidia-smi fails (e.g., compiling on a CPU-only login node), 
-    # default to Hopper (90a) so the build doesn't crash with an empty 'sm_' flag.
+    # 2. The Ultimate Failsafe
+    # If nvidia-smi fails (e.g., compiling on a CPU-only login node),
+    # default so the build doesn't crash with an empty 'sm_' flag.
     ifeq ($(DETECTED_ARCH),)
         $(info [DEBUG] Hardware detection failed. Falling back to default sm_86...)
-        DETECTED_ARCH := 86 
+        DETECTED_ARCH := 86
     endif
+
+    # 3. Family-Specific Target Promotion
+    # Some architectures expose their matrix-core instructions only under the
+    # 'a' suffix -- WGMMA on sm_90a, and the equivalents on the Blackwell
+    # targets. Without it nvcc compiles the portable subset, so a card runs
+    # tensor code written for an older generation and the matrix pipes never
+    # reach their real issue rate, which shows up directly as missing power.
+    # Which suffixes exist depends on both the architecture and the toolkit
+    # version, so ask the compiler rather than maintaining a list here: one
+    # probe compile of an empty translation unit is cheaper than a hardcoded
+    # target that is wrong on the next part.
+    ARCH_SUFFIX := $(shell d=$$(mktemp -d 2>/dev/null) && : > $$d/probe.cu && nvcc --gpu-architecture=sm_$(DETECTED_ARCH)a -ptx $$d/probe.cu -o $$d/probe.ptx >/dev/null 2>&1 && printf 'a'; rm -rf $$d)
+    DETECTED_ARCH := $(strip $(DETECTED_ARCH))$(ARCH_SUFFIX)
+    $(info [DEBUG] Compiling for sm_$(DETECTED_ARCH))
 
     # --- Vendored Headers ---
     # OptiX headers are NVIDIA-proprietary and are not redistributable, so this
@@ -146,7 +154,7 @@ endif
 BINS := $(foreach src,$(SRCS),$(BUILD_DIR)/$(basename $(notdir $(src))))
 
 # Shared headers included by many kernel translation units.
-COMMON_HEADERS := kernels/common/common.h kernels/common/ai_workload_template.h
+COMMON_HEADERS := kernels/common/common.h kernels/common/ai_workload_template.h kernels/common/toggle_chaos.h kernels/common/vendor_gemm.h
 
 # --- Targets ---
 

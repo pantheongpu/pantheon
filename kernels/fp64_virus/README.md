@@ -21,8 +21,8 @@ Consumer GPUs often have intentionally limited FP64 throughput, so this workload
 1. The host selects the target GPU and configures the requested sync mode.
 2. The test calculates a launch grid from `grid_size` or derives one from the GPU multiprocessor count and `block_size`.
 3. Each thread initializes four double-precision registers: `a`, `b`, `c`, and `d`.
-4. Inside the kernel, each thread repeatedly runs an unrolled chain of FP64 FMA operations.
-5. Every 256 outer iterations, the kernel flips/clamps selected values to keep the math bounded and avoid `NaN` or infinity.
+4. Inside the kernel, each thread repeatedly runs eight independent unrolled chains of FP64 FMA operations.
+5. The chains are bounded by construction, so no clamp is needed to avoid `NaN` or infinity.
 6. Each thread writes one final `double` to a sink buffer so the compiler cannot remove the arithmetic.
 7. The host repeats launches until `--duration` has elapsed and reports aggregate FP64 throughput in `TFLOPS`.
 
@@ -90,6 +90,21 @@ Key fields to watch:
 | Low TFLOPS but high power | FP64 hardware ratio bottleneck or aggressive power limiting. |
 | High `Limit Reason` frequency | Power, thermal, or clock throttling during sustained FP64 pressure. |
 | Process timeout or driver reset | Driver watchdog, unstable overclock, insufficient cooling, or power delivery instability. |
+
+## Why The Chain Looks Like This
+
+Dynamic power is switching activity, so a furnace has to make its datapath
+*toggle*, not merely issue. The previous chain failed that: seeded near 1.0 it
+converged onto a fixed point within a few dozen steps, after which every instruction recomputed the same
+value at full issue rate while the die cooled. It also made `--verify`
+vacuous, because a golden pass in that state compares a constant against the
+same constant and cannot fail.
+
+`x <- x*x + c` with `c` in `[-1.435, -1.4]` is chaotic and closed: `|x| <=
+1.435` implies `x*x + c` lands back in the same interval, so it needs no clamp
+and cannot saturate, and a real flipped bit diverges instead of healing. Each
+thread runs several independent chains because one chain issues at most one
+FMA per FMA latency. See [`toggle_chaos.h`](../common/toggle_chaos.h).
 
 ## Source
 

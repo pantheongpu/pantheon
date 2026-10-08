@@ -18,6 +18,7 @@ typedef int hipStream_t;
 struct hipDeviceProp_t { 
 	int multiProcessorCount; 
 	
+	int warpSize;
 	int maxThreadsPerMultiProcessor;
 	int maxGridSize[3];
 	int memoryClockRate;
@@ -56,6 +57,7 @@ inline hipError_t hipSetDevice(int dev) { return hipSuccess; }
 inline hipError_t hipGetDeviceProperties(hipDeviceProp_t* p, int d) { 
 	p->multiProcessorCount = 1; 
 
+	p->warpSize = 32;
 	p->maxThreadsPerMultiProcessor = 1024;
 	p->maxGridSize[0] = 65535;
 	p->maxGridSize[1] = 65535;

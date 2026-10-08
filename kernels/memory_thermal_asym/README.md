@@ -15,7 +15,7 @@
 ## How It Works
 
 1. The test allocates up to a 16 GiB target region, bounded by `--mem` and free VRAM.
-2. Each loop performs unrolled FP32 FMA work.
+2. Each loop performs unrolled FP32 FMA work on eight independent bounded-chaos chains, so the ALU datapath keeps toggling instead of saturating to infinity after eight FMAs. See [`toggle_chaos.h`](../common/toggle_chaos.h).
 3. The same loop writes a selected zero/one pattern into the local region.
 4. With `--verify`, the region is scanned for corruption.
 
