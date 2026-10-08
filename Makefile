@@ -115,6 +115,11 @@ else
         CXXFLAGS += -std=c++17 --offload-arch=native
     endif
     
+    # The vendor GEMM header loads hipBLASLt with dlopen. glibc before 2.34
+    # keeps dlopen in libdl, and clang does not add it by itself (nvcc does,
+    # which is why the CUDA branch above names it too).
+    LDFLAGS += -ldl
+
     # --- Optional Local HIP-RT Vendoring ---
     # The RT kernel builds a dummy fallback when HIP-RT headers are absent, so
     # do not make every AMD build clone and compile HIP-RT by default.

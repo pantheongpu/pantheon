@@ -44,7 +44,7 @@ pantheon --test mma_virus --gpu 0 --duration 30 --mem 99
 | `init_pattern` | `0` | `0=Positive fragments`, `1=Negative fragments`. |
 | `mma_acc` | `16` | Accumulator fragments per warp: `2`, `4`, `8` or `16`. WMMA only. |
 | `gemm` | `1` | Use the vendor GEMM when it can be loaded. `0` forces WMMA. |
-| `gemm_type` | `auto` | `auto`, `bf16`, `fp16`, `tf32`, `fp32` or `fp8`. |
+| `gemm_type` | `bf16` | `bf16`, `fp16`, `tf32`, `fp32`, `fp8` or `auto` (pick by measured power). |
 | `gemm_probe_ms` | `1500` | Per-format power probe used by `auto`. `0` skips it. |
 | `gemm_margin` | `15` | Percent by which another format must beat the default for `auto` to switch. |
 | `gemm_size`, `gemm_m`, `gemm_n`, `gemm_k` | `8192` | GEMM shape. |

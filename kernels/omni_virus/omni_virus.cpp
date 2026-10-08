@@ -363,8 +363,18 @@ __global__ void verify_compute_stream(int stream_id, float* sink, float* golden,
 // stream that finishes early therefore parks its share of the SMs until the
 // next device sync, so most of every launch ran with most of the pipes idle.
 // Matching the launch times keeps all five furnaces lit for the whole run.
+//
+// The first launch of a kernel also pays for loading its code and, for the
+// first stream calibrated, for creating the context state: 40 to 55 ms on an
+// A10G, against a few microseconds for the memory stream's real per-loop cost.
+// Timed cold, the memory stream was sized at three loops per launch and wrote
+// 0.04 GB/s for the whole run. One untimed launch first keeps that cost out of
+// the measurement.
 template <typename Fn>
 static int omni_calibrate(const char* name, double target_s, int probe, Fn launch) {
+    launch(probe);
+    CHECK(hipDeviceSynchronize());
+
     double dt = 0.0;
     for (int attempt = 0; attempt < 5; ++attempt) {
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -513,6 +523,12 @@ int main(int argc, char* argv[]) {
         int status = pantheon_gemm_setup(gemm, gemm_opt, gpu_id);
         if (status < 0) return 1;
         use_gemm = (status == 1);
+        // The reference output has to exist before the memory buffer is
+        // sized. The buffer takes mem_pct of whatever is free, so at the
+        // default 99% only a sliver is left afterwards, and an FP32 output
+        // (256 MiB at the default shape) no longer fits: the golden pass then
+        // died with an out-of-memory error on a 24 GB card.
+        if (use_gemm && verify_mode) CHECK(hipMalloc(&d_gold_gemm, gemm.out_size_bytes()));
     }
 #else
     if (gemm_opt.enabled && mma_pct > 0) {
@@ -732,7 +748,6 @@ int main(int argc, char* argv[]) {
         if (use_gemm) {
             // One matmul is the whole reference: beta is 0, so every later
             // run must reproduce these bits exactly.
-            CHECK(hipMalloc(&d_gold_gemm, gemm.out_size_bytes()));
             if (!gemm.run(stream_mma)) { std::cerr << "[PANTHEON] Vendor GEMM matmul failed." << std::endl; return 1; }
             CHECK(hipStreamSynchronize(stream_mma));
             CHECK(hipMemcpy(d_gold_gemm, gemm.c, gemm.out_size_bytes(), hipMemcpyDeviceToDevice));

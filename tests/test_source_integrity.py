@@ -273,9 +273,10 @@ def test_omni_virus_can_drive_the_tensor_cores_through_the_vendor_gemm():
         assert flag in header
     assert "Unknown --gemm_type" in header
 
-    # The default format is chosen by measurement, not hardcoded: BF16 is not
-    # available on every part.
-    assert 'std::string type = "auto"' in header
+    # The default is one fixed format, so scores from different cards compare
+    # and a run does not depend on how a power probe happened to read. The
+    # power-probing pick stays available as an explicit --gemm_type auto.
+    assert 'std::string type = "bf16"' in header
     assert "pantheon_gemm_pick" in header
 
 
