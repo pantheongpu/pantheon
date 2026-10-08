@@ -32,7 +32,7 @@
 // ---------------------------------------------------------------------------
 struct PantheonGemmOptions {
     int enabled = 1;                  // --gemm 0 forces the portable path
-    std::string type = "auto";        // auto | bf16 | fp16 | tf32 | fp32 | fp8
+    std::string type = "bf16";        // bf16 | fp16 | tf32 | fp32 | fp8 | auto (opt-in: picks by measured power)
     int probe_ms = 1500;              // per-format power probe for auto; 0 = skip
     int margin_pct = 15;              // auto keeps the default format unless another beats it by this much
     int m = 8192, n = 8192, k = 8192; // C is m x n, contracted over k

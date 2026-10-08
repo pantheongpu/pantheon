@@ -84,8 +84,8 @@ Measured on 8x B200, 45 s, all GPUs at once, steady-state power:
 
 | `--gemm_type` | Operands | Output | Datapath |
 | :--- | :--- | :--- | :--- |
-| `auto` (default) | See below | | |
-| `bf16` | BF16 | BF16 | Tensor cores |
+| `bf16` (default) | BF16 | BF16 | Tensor cores |
+| `auto` | See below | | |
 | `fp16` | FP16 | FP16 | Tensor cores |
 | `tf32` | FP32 storage | FP32 | Tensor cores, TF32 math (NVIDIA only) |
 | `fp32` | FP32 | FP32 | Vector FMA pipes |
@@ -97,9 +97,11 @@ On one B200, 15 s, default shape, with the other streams running: BF16 907 TFLOP
 
 ### Choosing the format
 
-`auto` gives the same format on every GPU. The formats are tried in a fixed order, BF16, FP16, TF32, FP8, FP32, and the first one the part and library accept is the default (BF16 needs Ampere or later, FP8 Ada or later). Each accepted format is also run alone for `--gemm_probe_ms` and its board power is read from NVML, matched by PCI bus ID. The default is replaced only by a format that draws at least `--gemm_margin` percent more. Without NVML, or with `--gemm_probe_ms 0`, the default is used.
+The default is BF16: the tensor path every Ampere and later part has, and the same format on every card, so scores from different GPUs compare. A part or library with no BF16 algorithm (Turing and earlier) keeps the WMMA stream and prints why.
 
-The margin is there because the probe is noisy. On a B200 one format varied by up to 9% between probes (TF32 959 to 1041 W, BF16 956 to 1022 W) while the gaps between tensor formats were 1 to 4%. Picking the maximum reading gave different formats on different GPUs of one node, and an 8% margin still did. With 15%, 8 of 8 GPUs chose BF16 in all 8 repeated rounds of `omni_virus` and `mma_virus`. Formats closer than the margin are not told apart; on a B200 only FP32 (about 25% lower) is separated. Use `--gemm_type` to choose a format. The probe runs without the other streams, so it ranks formats for the tensor path only.
+`--gemm_type auto` is opt-in. It tries the formats in a fixed order, BF16, FP16, TF32, FP8, FP32, runs each accepted one alone for `--gemm_probe_ms`, reads the board power from NVML (matched by PCI bus ID), and replaces BF16 only by a format that draws at least `--gemm_margin` percent more. Without NVML, or with `--gemm_probe_ms 0`, it stays on BF16.
+
+The margin exists because the probe is noisy. On a B200 one format varied by up to 9% between probes while the gaps between tensor formats were 1 to 4%; with 15%, 8 of 8 GPUs chose BF16 in all 8 repeated rounds. That does not hold everywhere. On an A10G, FP32 drew 14% more than BF16 in one run and 18% more in the next, so `auto` chose BF16 and then FP32 on the same card, and FP32 is a CUDA-core GEMM that leaves the matrix cores idle. Use `auto` to explore a part, and `--gemm_type` to pin a format when runs have to be comparable. The probe runs without the other streams, so it ranks formats for the tensor path only.
 
 ### AMD
 
@@ -137,7 +139,7 @@ build/omni_virus 0 60 90 --mma_pct 75 --launch_ms 400
 | `mma_groups` | `4` | Operand reloads per iteration. |
 | `mma_reuse` | `1` | MMA passes per operand reload. |
 | `gemm` | `1` | Use the vendor GEMM when it can be loaded. `0` forces WMMA. |
-| `gemm_type` | `auto` | `auto`, `bf16`, `fp16`, `tf32`, `fp32` or `fp8`. |
+| `gemm_type` | `bf16` | `bf16`, `fp16`, `tf32`, `fp32`, `fp8` or `auto` (pick by measured power). |
 | `gemm_size` | `8192` | Sets `gemm_m`, `gemm_n` and `gemm_k` together. |
 | `gemm_m`, `gemm_n`, `gemm_k` | `8192` | GEMM shape, each rounded down to a multiple of 16. |
 | `gemm_probe_ms` | `1500` | Per-format power probe used by `auto`. `0` skips it. |
