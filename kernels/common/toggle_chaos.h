@@ -28,16 +28,28 @@
 // that could never detect an SDC reports PASS. That is the same class of
 // defect as a self-test that never ran.
 //
-// x <- x*x + c with c in [-1.435, -1.4] avoids both:
+// x <- x*x + c with c just past the onset of chaos avoids both:
 //
 //   * Chaotic, so the mantissa churns on every step -- 13.4 bits of 32 -- and
 //     a single flipped bit diverges instead of being healed away.
-//   * Closed, so it needs no clamp: |x| <= 1.435 gives x*x <= 2.059 and
-//     x*x + c in [-1.435, 0.659], back inside the same interval. Escape
-//     would need |x| > 1.685, which the invariant forbids. A clamp would be
-//     worse than unnecessary -- it is a path that can heal a real fault.
+//   * Closed, so it needs no clamp: with beta = (1 + sqrt(1 - 4c)) / 2 the map
+//     sends [-beta, beta] into [c, beta], inside itself. For these constants
+//     beta is below 1.82 and the seeds are below 0.2, so an orbit cannot
+//     escape. A clamp would be worse than unnecessary -- it is a path that can
+//     heal a real fault.
 //   * Seeded from constants, not from the thread index, so the workloads that
 //     verify against a single consensus value still have one.
+//
+// The constants are not arbitrary. The parameter interval is full of periodic
+// windows, where the orbit falls onto a short stable cycle and a flipped bit
+// decays back onto it instead of spreading. c = -1.4 is the worst of them: a
+// cycle of length 32, entered after about 400 steps, in which 72% of random
+// single-bit flips were forgotten (median 95 steps), against about 10% in the
+// chaotic regions, where the only flips lost are the lowest mantissa bits that
+// ordinary rounding absorbs. Others sit near -1.400 to -1.401, -1.4045,
+// -1.411, -1.417 to -1.418 and -1.4325. The eight values below were chosen to
+// stay at least 0.0005 clear of every window found, and
+// tests/test_chaos_constants.py checks them in float32 on every CI run.
 //
 // The per-chain index k matters as much as the toggling. One chain issues at
 // most one FMA per FMA latency -- four cycles on every current part -- so a
@@ -46,12 +58,12 @@
 // keep it issuing every cycle.
 
 #define PANTHEON_CHAOS_SEED(k)  (0.1f + 0.01f * (float)(k))
-#define PANTHEON_CHAOS_CONST(k) (-1.4f - 0.005f * (float)(k))
+#define PANTHEON_CHAOS_CONST(k) (-1.4078f - 0.004f * (float)(k))
 
 // FP64 spellings, so the constants are not rounded through a float literal
 // before being widened again.
 #define PANTHEON_CHAOS_SEED_D(k)  (0.1 + 0.01 * (double)(k))
-#define PANTHEON_CHAOS_CONST_D(k) (-1.4 - 0.005 * (double)(k))
+#define PANTHEON_CHAOS_CONST_D(k) (-1.4078 - 0.004 * (double)(k))
 
 // Bounded-chaos state for the transcendental furnaces.
 //

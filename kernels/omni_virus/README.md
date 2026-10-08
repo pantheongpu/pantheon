@@ -21,7 +21,7 @@ Three things decide whether this test lands near the card's power limit or near 
 
 **The matrix cores have to be running.** On Hopper and Blackwell the tensor pipes are worth more than an order of magnitude more FLOPS than the vector pipes and they draw accordingly. A test built only from FMA, transcendental and store traffic cannot reach the power limit. The tensor stream takes the largest share of the grid; `mma_pct` controls it.
 
-**The datapaths have to toggle.** Dynamic power is switching activity. A recurrence that saturates to infinity, or a WMMA loop whose operand fragments never change, keeps the pipes issuing while the same values are recomputed and the die stays cool. The compute streams run a chaotic map that stays bounded (`x <- x*x + c` with `c` in `[-1.435, -1.4]` cannot leave `|x| <= 1.435`), and the tensor stream rotates through hashed operand tiles.
+**The datapaths have to toggle.** Dynamic power is switching activity. A recurrence that saturates to infinity, or a WMMA loop whose operand fragments never change, keeps the pipes issuing while the same values are recomputed and the die stays cool. The compute streams run a chaotic map that stays bounded (`x <- x*x + c` with `c` between -1.4078 and -1.4358 cannot leave `|x| <= 1.82`), and the tensor stream rotates through hashed operand tiles.
 
 **The streams have to finish together.** Each stream owns a fixed slice of the grid, so a stream that finishes early leaves its SMs idle until the next device sync. With fixed loop counts the memory stream finished in milliseconds while the tensor stream took seconds. `launch_ms` calibrates each stream's loop count at startup so one launch of each takes about the same time.
 

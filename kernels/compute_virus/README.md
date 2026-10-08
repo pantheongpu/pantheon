@@ -63,8 +63,8 @@ value at full issue rate while the die cooled. It also made `--verify`
 vacuous, because a golden pass in that state compares a constant against the
 same constant and cannot fail.
 
-`x <- x*x + c` with `c` in `[-1.435, -1.4]` is chaotic and closed: `|x| <=
-1.435` implies `x*x + c` lands back in the same interval, so it needs no clamp
+`x <- x*x + c` with `c` between -1.4078 and -1.4358 is chaotic and closed:
+the map sends `[-beta, beta]` into itself (`beta` is below 1.82), so it needs no clamp
 and cannot saturate, and a real flipped bit diverges instead of healing. Each
 thread runs several independent chains because one chain issues at most one
 FMA per FMA latency. See [`toggle_chaos.h`](../common/toggle_chaos.h).
