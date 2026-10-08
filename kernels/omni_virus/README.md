@@ -48,7 +48,7 @@ To see which pipe limits the test, run with `--profile` and compare `sm__inst_ex
 To sweep the settings, build once through the runner so the CUDA toolkit is found, then drive the binary on all GPUs at once (one GPU does not reach node-level power or neighbour heating):
 
 ```bash
-uv run pantheon --test omni_virus --duration 5 --mem 10   # build only
+python3 pantheon.py --test omni_virus --duration 5 --mem 10   # build only
 
 nvidia-smi --query-gpu=index,power.draw,temperature.gpu --format=csv -l 2 > sweep.csv &
 smi=$!
