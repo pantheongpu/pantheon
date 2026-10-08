@@ -363,8 +363,18 @@ __global__ void verify_compute_stream(int stream_id, float* sink, float* golden,
 // stream that finishes early therefore parks its share of the SMs until the
 // next device sync, so most of every launch ran with most of the pipes idle.
 // Matching the launch times keeps all five furnaces lit for the whole run.
+//
+// The first launch of a kernel also pays for loading its code and, for the
+// first stream calibrated, for creating the context state: 40 to 55 ms on an
+// A10G, against a few microseconds for the memory stream's real per-loop cost.
+// Timed cold, the memory stream was sized at three loops per launch and wrote
+// 0.04 GB/s for the whole run. One untimed launch first keeps that cost out of
+// the measurement.
 template <typename Fn>
 static int omni_calibrate(const char* name, double target_s, int probe, Fn launch) {
+    launch(probe);
+    CHECK(hipDeviceSynchronize());
+
     double dt = 0.0;
     for (int attempt = 0; attempt < 5; ++attempt) {
         auto t0 = std::chrono::high_resolution_clock::now();
