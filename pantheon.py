@@ -2405,6 +2405,22 @@ def throughput_variance_percent(out):
     return round(float(np.std(samples) / abs(np.mean(samples)) * 100.0), 2)
 
 
+def redact_host_paths(text):
+    """Make a path-bearing string safe to publish.
+
+    Reports are published, and a command line or a failure message carries the
+    absolute path of the build directory, which contains the operator's home
+    directory and so their user name. The build directory is shown as
+    ./build, the source directory as ., and any other home directory as ~.
+    """
+    text = str(text)
+    for prefix, short in ((BUILD_DIR, "./build"), (BASE_DIR, "."), (os.path.expanduser("~"), "~")):
+        prefix = os.path.abspath(prefix).rstrip(os.sep) if os.path.isabs(prefix) else ""
+        if len(prefix) > 1:
+            text = re.sub(re.escape(prefix) + r"(?=/|$|[^\w.-])", short, text)
+    return re.sub(r"(?<![\w.~])(?:/mnt/[a-z])?/(?:home|Users)/[^/\s'\"]+", "~", text)
+
+
 def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats, status="PASS", commands=None, profile_commands=None, profile_files=None, counter_summary=None, throughput_variance="N/A"):
     eff = 0
     # avg_pwr is "N/A" when the card exposed no power sensor, so this cannot
@@ -2457,11 +2473,11 @@ def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats,
     if status != "PASS":
         row["Status"] = status
     if commands:
-        row["Command Lines"] = " || ".join(commands or [])
+        row["Command Lines"] = redact_host_paths(" || ".join(commands or []))
     if profile_commands:
-        row["Profiler Command Lines"] = " || ".join(profile_commands or [])
+        row["Profiler Command Lines"] = redact_host_paths(" || ".join(profile_commands or []))
     if profile_files:
-        row["Profiler Counter Files"] = " || ".join(profile_files or [])
+        row["Profiler Counter Files"] = redact_host_paths(" || ".join(profile_files or []))
     row.update(counter_summary or {})
     return row
 
@@ -2472,7 +2488,7 @@ def build_failure_row(test_name, gpu, duration, mem_pct, reason, stage):
         test_name, gpu, duration, mem_pct, 0.0, "ERR", {}, status="FAIL",
     )
     row["Failure Stage"] = stage
-    row["Failure Reason"] = str(reason)
+    row["Failure Reason"] = redact_host_paths(reason)
     row["RAS Status"] = "NOT RUN"
     row["RAS Error Delta"] = "Workload did not start"
     return row
@@ -3126,15 +3142,15 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         ras_summary = summarize_ras_delta(ras_delta, ras_before_by_gpu.get(gpu, {}), ras_after)
         row["RAS Status"] = ras_summary["status"]
         row["RAS Error Delta"] = " || ".join(ras_summary["details"]) or "None"
-        row["RAS Report"] = ras_path
+        row["RAS Report"] = redact_host_paths(ras_path)
         if ras_summary["status"] != "CLEAN":
             tprint(f"[RAS] GPU {gpu} {ras_summary['status']}: {row['RAS Error Delta']}")
 
         if profile and gpu_proc_infos:
             proc_info = gpu_proc_infos[0]
-            row["Profile Artifact Directory"] = proc_info["profile_artifact_dir"]
-            row["Profile Manifest"] = proc_info["profile_manifest"]
-            row["Profiler Trace Files"] = " || ".join(proc_info["trace_files"])
+            row["Profile Artifact Directory"] = redact_host_paths(proc_info["profile_artifact_dir"])
+            row["Profile Manifest"] = redact_host_paths(proc_info["profile_manifest"])
+            row["Profiler Trace Files"] = redact_host_paths(" || ".join(proc_info["trace_files"]))
             workload_summary = {
                 "test": test_name,
                 "gpu_id": gpu,
