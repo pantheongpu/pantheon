@@ -55,13 +55,19 @@ node was drained.
 | 0 | `SKIPPED` | The job has no GPU, so nothing was tested |
 | 1 | `WATCH` | The card works, and something deserves a look: it throttled on temperature, it reached 90 C, its memory reached 95 C, it counted correctable errors, or a workload that is not a memory test did not complete |
 | 2 | `FAULT` | A memory test failed, or the card counted uncorrectable errors during the run |
-| 3 | `INCOMPLETE`, `NO GPU TESTED`, `NOT RUN` | Nothing was tested or the run did not finish. It is never a pass |
+| 3 | `INCOMPLETE`, `NO GPU TESTED`, `NOT RUN` | Nothing was tested or the run did not finish: a workload hung until the timeout, exited without writing a result, or skipped itself, and nothing else ran. It is never a pass |
 
 Three things to know:
 
 - **The verdict comes from the reports, not from Pantheon's exit code.**
   Pantheon exits with an error when a workload fails. Errors that a card
-  counted during a run that completed are in the report only.
+  counted during a run that completed are in the report only. The reports are
+  the ones this run wrote: with a reused `--report-dir`, the files of earlier
+  runs are ignored.
+- **A workload that did not finish is not a pass.** One that hangs until the
+  timeout, or ends without a result, makes the verdict `INCOMPLETE` (exit code
+  3) whatever the other workloads showed. A workload that skips itself is
+  noted and not counted as run; when nothing ran, the verdict is `INCOMPLETE`.
 - **No compiler, no test.** Pantheon compiles its workloads with `nvcc` or
   `hipcc` for the cards it finds. Without a compiler it runs on a CPU backend
   that tests no hardware, and the check answers `NO GPU TESTED`, exit code 3.

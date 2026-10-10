@@ -53,7 +53,11 @@ Reason=PANTHEON FAULT: GPU 0 FAULT (march_test failed: memory errors detected or
 Things to know:
 
 - Only a fault drains the node. A warning, or a check that could not run,
-  goes to the log and the node stays in service.
+  goes to the log and the node stays in service. A workload that hung or
+  left no result is `INCOMPLETE` (exit code 3): it is logged, and it drains
+  the node only if `PANTHEON_DRAIN_CODES="2 3"` is set in
+  `/etc/pantheon/epilog.conf`. Code 3 is also what a missing `pantheon`
+  returns, so it is off by default.
 - The node is in the state `completing` while the epilog runs. With the
   defaults that is about 20 seconds for each job that had a GPU.
 - Run the node check once by hand as root on each node, so that the
