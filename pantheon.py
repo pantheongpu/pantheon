@@ -771,8 +771,13 @@ def assess_gpu(rows, gpu_id, gpu_name):
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
             notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
+            if test != "baseline_metrics":
+                incomplete.append(test)
             continue
         unit = row.get("Unit")
+        if unit == "SKIP":
+            notes.append(f"{test} was skipped: this GPU or build does not support it")
+            continue
         failed = unit == "ERR" or str(row.get("Status", "PASS")).upper() == "FAIL"
         if failed:
             if test in DIAGNOSTIC_TESTS:
@@ -796,7 +801,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
         limit = str(row.get("Limit Reason", "") or "")
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if limit.lower() == "thermal":
+        if "thermal" in limit.lower():
             throttled.append((test, tmax))
         elif tmax >= THERMAL_WATCH_C:
             hot.append((test, tmax))

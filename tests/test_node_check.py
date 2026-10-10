@@ -384,3 +384,35 @@ def test_grafana_dashboard_shows_every_exported_metric_and_nothing_else():
 
 def test_label_values_are_escaped():
     assert node_check._label('a "quoted" name\\') == 'a \\"quoted\\" name\\\\'
+
+
+def test_a_workload_that_timed_out_keeps_the_others_from_reading_healthy(node, capsys):
+    code, out = node.run(capsys, "--test", "memory_read", "--test", "march_test", "--timeout", "1",
+                         gpus=NVIDIA, rows=[row("memory_read", 0), row("memory_read", 1)],
+                         sleep=0, exit={"march_test": 1})
+    assert code == 1
+    assert "did not complete: march_test" in out
+
+
+def test_a_workload_that_could_not_be_built_is_not_counted_as_completed(node, capsys):
+    code, out = node.run(capsys, "--test", "memory_read", "--test", "march_test", gpus=NVIDIA,
+                         rows=[row("memory_read", 0), row("memory_read", 1),
+                               row("march_test", 0, Unit="ERR", Score=0.0, **{"Failure Stage": "compile"}),
+                               row("march_test", 1, Unit="ERR", Score=0.0, **{"Failure Stage": "compile"})])
+    assert code == 1
+    assert "march_test did not complete" in out
+
+
+def test_a_skipped_workload_is_not_counted_as_completed(node, capsys):
+    code, out = node.run(capsys, "--test", "mma_virus", gpus=NVIDIA,
+                         rows=[row("mma_virus", 0, Unit="SKIP", Score=0.0), row("mma_virus", 1, Unit="SKIP", Score=0.0)])
+    assert code == 3
+    assert "mma_virus was skipped" in out or "no workload completed" in out
+
+
+def test_a_card_that_is_power_capped_and_thermally_slowed_is_a_watch(node, capsys):
+    code, out = node.run(capsys, "--test", "memory_read", gpus=NVIDIA,
+                         rows=[row("memory_read", 0, **{"Limit Reason": "Power|Thermal", "Max Temp (C)": 86.0}),
+                               row("memory_read", 1)])
+    assert code == 1
+    assert "thermally throttled" in out

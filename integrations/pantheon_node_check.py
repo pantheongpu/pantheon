@@ -90,6 +90,11 @@ def assess_gpu(rows, gpu_id, gpu_name):
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
             notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
+            if test != "baseline_metrics":
+                watches.append(f"{test} did not complete")
+            continue
+        if row.get("Unit") == "SKIP":
+            notes.append(f"{test} was skipped: this GPU or build does not support it")
             continue
         failed = row.get("Unit") == "ERR" or str(row.get("Status") or "PASS").upper() == "FAIL"
         if failed:
@@ -113,7 +118,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
 
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if str(row.get("Limit Reason", "") or "").lower() == "thermal":
+        if "thermal" in str(row.get("Limit Reason", "") or "").lower():
             watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C")
         elif tmax >= THERMAL_WATCH_C:
             watches.append(f"{test}: GPU reached {tmax:.0f} C")
@@ -285,9 +290,11 @@ def check(args, environ):
     os.makedirs(workdir, exist_ok=True)
     try:
         ended_badly = {}
+        timed_out = []
         for workload in args.test:
             code = run_pantheon(executable, workload, ids, args, workdir, environ)
             if code is None:
+                timed_out.append(workload)
                 result["messages"].append(f"{workload}: stopped, it did not finish in time")
             elif code != 0:
                 ended_badly[workload] = f"pantheon exited with code {code} ({log_tail(workdir, workload)})"
@@ -324,6 +331,15 @@ def check(args, environ):
     judged = ids if ids is not None else sorted({r.get("GPU ID") for r in rows}, key=str)
     for gpu_id in judged:
         result["gpus"].append(assess_gpu(rows, gpu_id, gpus.get(gpu_id, "not found on this node")))
+    # A workload that was stopped, or ended badly without leaving a row, never
+    # judged any card: a verdict of HEALTHY would be about the workloads that
+    # did finish.
+    unfinished = timed_out + [w for w in ended_badly if w not in reported]
+    if unfinished:
+        for gpu in result["gpus"]:
+            if gpu["verdict"] == HEALTHY:
+                gpu["verdict"] = WATCH
+                gpu["reasons"].append("did not complete: " + ", ".join(unfinished))
     result["verdict"] = max((g["verdict"] for g in result["gpus"]), key=lambda v: SEVERITY[v])
     result["results"] = [row_result(r) for r in rows if r.get("GPU ID") in judged]
     if result["backend"] == "cpu":

@@ -2461,3 +2461,27 @@ def test_platform_from_env_still_runs_on_a_gpu_box_without_a_compiler(monkeypatc
     assert pantheon.detect_platform("cuda") == "CUDA"
     with pytest.raises(SystemExit):
         pantheon.detect_platform("auto")
+
+
+def test_a_workload_that_could_not_be_built_does_not_leave_the_card_healthy():
+    failed = pantheon.build_failure_row("march_test", 0, 60, 99, "no compiler output", "compile")
+    v = pantheon.assess_gpu([_row("memory_read", 868.4), failed], 0, "X")
+    assert v["verdict"] == "WATCH"
+    assert "did not complete: march_test" in v["reasons"][0]
+    assert v["workloads_completed"] == 1
+
+
+def test_a_skipped_workload_is_not_counted_as_completed():
+    rows = [_row("baseline_metrics", 0.0), _row("mma_virus", 0.0, "SKIP")]
+    v = pantheon.assess_gpu(rows, 0, "X")
+    assert v["verdict"] == "INCOMPLETE" and v["workloads_completed"] == 0
+    assert any("mma_virus was skipped" in note for note in v["notes"])
+    rows.append(_row("memory_read", 868.4))
+    v = pantheon.assess_gpu(rows, 0, "X")
+    assert v["verdict"] == "HEALTHY" and v["workloads_completed"] == 1
+
+
+def test_power_and_thermal_together_is_a_thermal_throttle():
+    v = pantheon.assess_gpu([_row("memory_read", 1900.0, max_temp=86, throttle_reason="Power|Thermal")], 0, "H")
+    assert v["verdict"] == "WATCH"
+    assert v["findings"]["throttled"] == [{"test": "memory_read", "temp_c": 86.0}]
