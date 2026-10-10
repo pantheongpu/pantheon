@@ -2463,6 +2463,54 @@ def test_platform_from_env_still_runs_on_a_gpu_box_without_a_compiler(monkeypatc
         pantheon.detect_platform("auto")
 
 
+@pytest.fixture
+def operator_paths(monkeypatch, tmp_path):
+    home = tmp_path / "home" / "alice"
+    build = home / ".cache" / "pantheongpu" / "builds" / "1.2.2" / "cuda-86"
+    source = home / "src" / "pantheon"
+    monkeypatch.setattr(pantheon, "BUILD_DIR", str(build))
+    monkeypatch.setattr(pantheon, "BASE_DIR", str(source))
+    monkeypatch.setenv("HOME", str(home))
+    return str(home), str(build), str(source)
+
+
+def test_command_lines_do_not_carry_the_build_directory(operator_paths):
+    home, build, source = operator_paths
+    row = pantheon.build_result_row(
+        "fp64_virus", gpu=0, duration=10, mem_pct=99, throughput=1.0, unit="TFLOPS", stats={},
+        commands=[f"{build}/fp64_virus 0 10 99 --verify"],
+        profile_commands=[f"ncu --csv -- {build}/fp64_virus 0 10 99"],
+    )
+    assert row["Command Lines"] == "./build/fp64_virus 0 10 99 --verify"
+    assert row["Profiler Command Lines"] == "ncu --csv -- ./build/fp64_virus 0 10 99"
+    assert "alice" not in json.dumps(row)
+
+
+def test_failure_rows_do_not_carry_host_paths(operator_paths):
+    home, build, source = operator_paths
+    row = pantheon.build_failure_row(
+        "march_test", 0, 10, 99,
+        f"Compilation did not produce march_test. See {build}/compile.log for compiler output.",
+        "compile",
+    )
+    assert row["Failure Reason"] == "Compilation did not produce march_test. See ./build/compile.log for compiler output."
+    launch = pantheon.build_failure_row(
+        "march_test", 0, 10, 99, f"Could not launch march_test: [Errno 2] No such file: '{build}/march_test'", "launch"
+    )
+    assert "alice" not in launch["Failure Reason"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/home/bob/work/run.json", "~/work/run.json"),
+    ("/Users/carol/Documents/x", "~/Documents/x"),
+    ("/mnt/c/Users/dave/OneDrive/x", "~/OneDrive/x"),
+    ("results/run/fp64_gpu0.csv", "results/run/fp64_gpu0.csv"),
+    ("ncu --csv -- ./build/fp64_virus 0 10 99", "ncu --csv -- ./build/fp64_virus 0 10 99"),
+])
+def test_other_users_homes_are_masked(operator_paths, text, expected):
+    assert pantheon.redact_host_paths(text) == expected
+
+
 # --- skipped, failed and non-finite runs ---------------------------------------
 
 def test_a_skip_line_on_stdout_or_stderr_is_a_skip_with_its_reason():
