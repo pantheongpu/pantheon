@@ -220,13 +220,12 @@ int main(int argc, char* argv[]) {
     // ---------------------------------------------------------
     if (cuInit(0) != CUDA_SUCCESS) {
         std::cerr << "[PANTHEON ERROR] cuInit(0) failed." << std::endl;
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0;
+        return 1;
     }
 
     if (optixInit() != OPTIX_SUCCESS) {
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0;
+        std::cerr << "[PANTHEON ERROR] optixInit failed." << std::endl;
+        return 1;
     }
 
     OptixDeviceContextOptions options = {};
@@ -392,7 +391,8 @@ int main(int argc, char* argv[]) {
     hiprtContext rtContext = nullptr;
     
     if (hiprtCreateContext(HIPRT_API_VERSION, ctxInput, rtContext) != hiprtSuccess) {
-        std::cerr << "[PANTHEON ERROR] hiprtCreateContext failed! Ensure libhiprt64.so is installed." << std::endl;
+        // Without libhiprt64.so this host cannot run the workload; that is not a card failure.
+        std::cout << "[PANTHEON] Skipping RT_VIRUS: hiprtCreateContext failed, ensure libhiprt64.so is installed." << std::endl;
         std::cout << "Throughput: 0.0 GRays/s" << std::endl;
         return 0;
     }

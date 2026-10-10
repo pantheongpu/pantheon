@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 
 def test_transformer_build_target_is_portable_by_default():
@@ -309,3 +311,20 @@ def test_gemm_auto_format_keeps_the_default_unless_clearly_beaten():
     assert "GEMM_BF16, GEMM_FP16, GEMM_TF32, GEMM_FP8, GEMM_FP32" in header
     margin = re.search(r"int margin_pct = (\d+);", header)
     assert margin and int(margin.group(1)) >= 15, "margin below the measured probe noise"
+
+
+@pytest.mark.parametrize("path, init_call", [
+    ("kernels/media_enc_virus/media_enc_virus.cpp", "cuInit(0) != CUDA_SUCCESS"),
+    ("kernels/rt_virus/rt_virus.cpp", "cuInit(0) != CUDA_SUCCESS"),
+    ("kernels/rt_virus/rt_virus.cpp", "optixInit() != OPTIX_SUCCESS"),
+])
+def test_a_failed_initialisation_fails_the_workload(path, init_call):
+    """A workload that cannot start must not exit 0 with a Score of 0.0.
+
+    Pantheon records exit 0 without a fault as a pass, so the verdict counted a
+    card that never ran the workload as having completed it.
+    """
+    src = Path(path).read_text(encoding="utf-8")
+    block = src[src.index(init_call):]
+    block = block[:block.index("}")]
+    assert "return 1;" in block and "return 0;" not in block

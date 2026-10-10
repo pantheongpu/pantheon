@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
     CHECK(hipSetDevice(gpu_id));
 
 #if !NVENC_SUPPORTED
-    std::cerr << "[PANTHEON] GPU " << gpu_id << ": Skipping MEDIA_ENC_VIRUS (Requires NVIDIA CUDA)." << std::endl;
+    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping MEDIA_ENC_VIRUS (Requires NVIDIA CUDA)." << std::endl;
     std::cout << "Throughput: 0.0 FPS" << std::endl;
     return 0;
 #else
@@ -76,8 +76,7 @@ int main(int argc, char* argv[]) {
     // 1. Initialize CUDA Driver and Hook Primary Context
     if (cuInit(0) != CUDA_SUCCESS) {
         std::cerr << "[PANTHEON ERROR] cuInit(0) failed." << std::endl;
-        std::cout << "Throughput: 0.0 FPS" << std::endl;
-        return 0;
+        return 1;
     }
 
     CUdevice cuDev = 0;
@@ -89,12 +88,18 @@ int main(int argc, char* argv[]) {
     // 2. Dynamically Load the NVIDIA Encode Driver
     void* encode_lib = dlopen("libnvidia-encode.so.1", RTLD_LAZY);
     if (!encode_lib) {
-        std::cerr << "[PANTHEON ERROR] libnvidia-encode.so.1 not found! Is the driver installed?" << std::endl;
+        // Containers without the video driver capability do not have the library; that is a
+        // host that cannot run this workload, not a card that failed it.
+        std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping MEDIA_ENC_VIRUS (libnvidia-encode.so.1 not found)." << std::endl;
         std::cout << "Throughput: 0.0 FPS" << std::endl;
         return 0;
     }
 
     auto NvEncCreate = (PNVENCODEAPICREATEINSTANCE)dlsym(encode_lib, "NvEncodeAPICreateInstance");
+    if (!NvEncCreate) {
+        std::cerr << "[PANTHEON ERROR] NvEncodeAPICreateInstance not found in libnvidia-encode.so.1." << std::endl;
+        return 1;
+    }
     
     NV_ENCODE_API_FUNCTION_LIST nvenc = { NV_ENCODE_API_FUNCTION_LIST_VER };
     NVENC_CHECK(NvEncCreate(&nvenc));
