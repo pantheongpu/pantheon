@@ -71,6 +71,11 @@ def _num(value, default=0.0):
     return out if out == out else default
 
 
+def limit_reason_is_thermal(label):
+    """True if a Limit Reason label names a thermal reason ("Power|Thermal" does)."""
+    return "thermal" in (token.strip().lower() for token in str(label or "").split("|"))
+
+
 def split_ras_details(delta_text):
     benign, serious = [], []
     for token in str(delta_text or "").split("||"):
@@ -113,7 +118,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
 
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if str(row.get("Limit Reason", "") or "").lower() == "thermal":
+        if limit_reason_is_thermal(row.get("Limit Reason")):
             watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C")
         elif tmax >= THERMAL_WATCH_C:
             watches.append(f"{test}: GPU reached {tmax:.0f} C")

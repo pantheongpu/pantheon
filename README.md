@@ -328,7 +328,7 @@ bandwidth: `march_test`, `memory_hammer`, `galpat`, `memory_retention` and
 `ras_validator`.
 
 ```bash
-python3 pantheon.py --suite diagnostics --duration 300 --gpu 0 --mem 90
+python3 pantheon.py --test diagnostics --duration 300 --gpu 0 --mem 90
 ```
 
 See [`docs/memory_diagnostics.md`](docs/memory_diagnostics.md) for what each

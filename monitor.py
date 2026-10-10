@@ -48,6 +48,15 @@ def decode_throttle_mask(mask):
     return "|".join(labels) if labels else "None"
 
 
+def limit_reason_is_thermal(label):
+    """True if a decode_throttle_mask label names a thermal reason.
+
+    The label joins every active reason with "|" ("Power|Thermal"), so it is
+    matched by token and never compared whole.
+    """
+    return "thermal" in (token.strip().lower() for token in str(label or "").split("|"))
+
+
 def _nvml_field_number(field):
     """The numeric value of one NVML field reading, by its declared value type."""
     return getattr(field.value, _NVML_VALUE_MEMBERS.get(getattr(field, "valueType", 1), "uiVal"))

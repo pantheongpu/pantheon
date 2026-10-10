@@ -145,6 +145,7 @@ def test_a_workload_that_is_no_memory_test_and_fails_is_a_watch(node, capsys):
 
 @pytest.mark.parametrize("fields, reason", [
     ({"Limit Reason": "Thermal", "Max Temp (C)": 95.0}, "thermally throttled, GPU at 95 C"),
+    ({"Limit Reason": "Power|Thermal", "Max Temp (C)": 88.0}, "thermally throttled, GPU at 88 C"),
     ({"Max Temp (C)": 91.0}, "GPU reached 91 C"),
     ({"Max Mem Temp (C)": 96.0}, "memory reached 96 C"),
     ({"RAS Status": "WARNING", "RAS Error Delta": "vendor_ras.pcie.bad_tlp +1972"},
@@ -384,3 +385,13 @@ def test_grafana_dashboard_shows_every_exported_metric_and_nothing_else():
 
 def test_label_values_are_escaped():
     assert node_check._label('a "quoted" name\\') == 'a \\"quoted\\" name\\\\'
+
+
+def test_the_check_and_pantheon_agree_on_thermal_for_every_label_the_monitor_emits():
+    # The check repeats the rule because it imports nothing from Pantheon.
+    import monitor
+    for mask in range(256):
+        label = monitor.decode_throttle_mask(mask)
+        assert node_check.limit_reason_is_thermal(label) == monitor.limit_reason_is_thermal(label), label
+    assert node_check.limit_reason_is_thermal("Power|Thermal")
+    assert not node_check.limit_reason_is_thermal("Power Brake")

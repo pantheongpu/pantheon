@@ -318,3 +318,14 @@ def test_cli_fallback_records_an_absent_sensor_as_absent(monkeypatch):
     assert history["temp_mem"] == []
     assert history["pwr"] == []
     assert history["temp_core"] == [60.0]
+
+
+def test_thermal_is_found_among_the_reasons_of_a_combined_label():
+    from monitor import decode_throttle_mask, limit_reason_is_thermal
+    assert decode_throttle_mask(0x04 | 0x20) == "Power|Thermal"
+    assert limit_reason_is_thermal("Power|Thermal")
+    assert limit_reason_is_thermal("thermal")
+    assert limit_reason_is_thermal("Power Brake|Thermal")
+    assert not limit_reason_is_thermal("Power Brake")
+    assert not limit_reason_is_thermal("Idle|Power")
+    assert not limit_reason_is_thermal("N/A") and not limit_reason_is_thermal(None)
