@@ -159,7 +159,7 @@ endif
 BINS := $(foreach src,$(SRCS),$(BUILD_DIR)/$(basename $(notdir $(src))))
 
 # Shared headers included by many kernel translation units.
-COMMON_HEADERS := kernels/common/common.h kernels/common/ai_workload_template.h kernels/common/toggle_chaos.h kernels/common/vendor_gemm.h
+COMMON_HEADERS := kernels/common/common.h kernels/common/ai_workload_template.h kernels/common/toggle_chaos.h kernels/common/vendor_gemm.h kernels/common/fault_log.h kernels/common/fp16_shim.h kernels/common/mock_gpu.h $(wildcard kernels/common/nvenc/*.h)
 
 # --- Targets ---
 
