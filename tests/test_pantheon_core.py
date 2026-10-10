@@ -2466,8 +2466,9 @@ def test_platform_from_env_still_runs_on_a_gpu_box_without_a_compiler(monkeypatc
 def test_a_workload_that_could_not_be_built_does_not_leave_the_card_healthy():
     failed = pantheon.build_failure_row("march_test", 0, 60, 99, "no compiler output", "compile")
     v = pantheon.assess_gpu([_row("memory_read", 868.4), failed], 0, "X")
-    assert v["verdict"] == "WATCH"
-    assert "did not complete: march_test" in v["reasons"][0]
+    assert v["verdict"] == "INCOMPLETE" and v["reasons"] == []
+    assert "1 workload(s) did not run: march_test" in v["notes"]
+    assert v["summary"] == "1 did not run"
     assert v["workloads_completed"] == 1
 
 

@@ -390,7 +390,7 @@ def test_a_workload_that_timed_out_keeps_the_others_from_reading_healthy(node, c
     code, out = node.run(capsys, "--test", "memory_read", "--test", "march_test", "--timeout", "1",
                          gpus=NVIDIA, rows=[row("memory_read", 0), row("memory_read", 1)],
                          sleep=0, exit={"march_test": 1})
-    assert code == 1
+    assert code == 3
     assert "did not complete: march_test" in out
 
 
@@ -399,8 +399,8 @@ def test_a_workload_that_could_not_be_built_is_not_counted_as_completed(node, ca
                          rows=[row("memory_read", 0), row("memory_read", 1),
                                row("march_test", 0, Unit="ERR", Score=0.0, **{"Failure Stage": "compile"}),
                                row("march_test", 1, Unit="ERR", Score=0.0, **{"Failure Stage": "compile"})])
-    assert code == 1
-    assert "march_test did not complete" in out
+    assert code == 3
+    assert "march_test did not run" in out
 
 
 def test_a_skipped_workload_is_not_counted_as_completed(node, capsys):

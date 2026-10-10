@@ -765,14 +765,14 @@ def assess_gpu(rows, gpu_id, gpu_name):
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
     faults, notes = [], []
     throttled, hot, hot_memory, incomplete = [], [], [], []
-    ras_serious, benign_ras = {}, []
+    ras_serious, benign_ras, not_run = {}, [], []
     ran = 0
     for row in mine:
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
             notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
             if test != "baseline_metrics":
-                incomplete.append(test)
+                not_run.append(test)
             continue
         unit = row.get("Unit")
         if unit == "SKIP":
@@ -837,11 +837,16 @@ def assess_gpu(rows, gpu_id, gpu_name):
         verdict = "FAULT"
     elif watches:
         verdict = "WATCH"
-    elif ran:
+    elif ran and not not_run:
         verdict = "HEALTHY"
     else:
+        # Nothing was wrong with the card, but not everything that was asked for
+        # ran, so "healthy" would claim more than the run showed.
         verdict = "INCOMPLETE"
-        notes.append("no workload beyond the idle baseline completed")
+        if ran:
+            notes.append(f"{len(not_run)} workload(s) did not run: {', '.join(not_run)}")
+        else:
+            notes.append("no workload beyond the idle baseline completed")
 
     summary_bits = []
     if faults:
@@ -854,6 +859,8 @@ def assess_gpu(rows, gpu_id, gpu_name):
         summary_bits.append(f"correctable errors on {len(ras_serious)}")
     if incomplete:
         summary_bits.append(f"{len(incomplete)} incomplete")
+    if not_run:
+        summary_bits.append(f"{len(not_run)} did not run")
     if verdict == "HEALTHY":
         summary_bits.append(f"{ran} workload(s) completed")
 

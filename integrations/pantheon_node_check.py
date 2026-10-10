@@ -84,14 +84,14 @@ def split_ras_details(delta_text):
 def assess_gpu(rows, gpu_id, gpu_name):
     """Turn the result rows of one GPU into a verdict with its reasons."""
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
-    faults, watches, notes, link_recovery = [], [], [], []
+    faults, watches, notes, link_recovery, not_run = [], [], [], [], []
     ran = 0
     for row in mine:
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
             notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
             if test != "baseline_metrics":
-                watches.append(f"{test} did not complete")
+                not_run.append(test)
             continue
         if row.get("Unit") == "SKIP":
             notes.append(f"{test} was skipped: this GPU or build does not support it")
@@ -132,11 +132,11 @@ def assess_gpu(rows, gpu_id, gpu_name):
         verdict = FAULT
     elif watches:
         verdict = WATCH
-    elif ran:
+    elif ran and not not_run:
         verdict = HEALTHY
     else:
         verdict = INCOMPLETE
-        notes.append("no workload completed")
+        notes.append(f"{', '.join(not_run)} did not run" if ran else "no workload completed")
     scores = [f"{r.get('Test Name')} {r.get('Score')} {r.get('Unit')}" for r in mine
               if r.get("Unit") not in (None, "ERR") and not r.get("Failure Stage")]
     return {"gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
@@ -338,7 +338,7 @@ def check(args, environ):
     if unfinished:
         for gpu in result["gpus"]:
             if gpu["verdict"] == HEALTHY:
-                gpu["verdict"] = WATCH
+                gpu["verdict"] = INCOMPLETE
                 gpu["reasons"].append("did not complete: " + ", ".join(unfinished))
     result["verdict"] = max((g["verdict"] for g in result["gpus"]), key=lambda v: SEVERITY[v])
     result["results"] = [row_result(r) for r in rows if r.get("GPU ID") in judged]
