@@ -33,7 +33,11 @@ __global__ void llm_prefill_kernel(const uint4* data, size_t count, unsigned int
 }
 __global__ void verify_prefill(const uint4* data, size_t count, unsigned int* errors) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x;
-    for (; idx < count; idx += stride) { unsigned int x = prefill_hash(static_cast<unsigned int>(idx)); if (data[idx].x != (x | 1u)) atomicAdd(errors, 1); }
+    for (; idx < count; idx += stride) { unsigned int x = prefill_hash(static_cast<unsigned int>(idx));
+        // All four lanes, matching initialize_prefill; `.x` alone misses 96 of 128 bits.
+        uint4 want = make_uint4(x | 1u, x + 3u, x ^ 0x9E3779B9u, x + 11u);
+        if (pantheon_uint4_differs(data[idx], want)) atomicAdd(errors, 1);
+    }
 }
 int main(int argc, char* argv[]) {
     if (argc < 4) return 1;

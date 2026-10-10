@@ -9,7 +9,7 @@
 
 // --- ASYMMETRIC THERMAL GRADIENT ---
 // Hammers a small, isolated memory region while drawing maximum compute power.
-__global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int inject_error, int init_pattern) {
+__global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int init_pattern) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
@@ -35,17 +35,10 @@ __global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int inject
             }
         }
 
-        // --- DYNAMIC FAULT INJECTION ---
-        uint4 write_val = pattern;
-        if (inject_error && idx == 1337 && i == 500) {
-            // Intentionally corrupt the payload before writing
-            write_val.x ^= 0xBADBEEF; 
-        }
-
         // 2. Localized Memory Write (Confined to specific stack)
         // We use modulo 'n' to trap the writes inside the isolated buffer
         size_t write_idx = (idx + i * stride) % n;
-        store_nt(&data[write_idx], write_val);
+        store_nt(&data[write_idx], pattern);
     }
 
     // Dependency sink to prevent DCE
@@ -53,6 +46,19 @@ __global__ void thermal_asym_kernel(uint4* data, size_t n, int loops, int inject
     #pragma unroll
     for (int k = 0; k < ASYM_ILP; ++k) a += x[k];
     if (a == 12345.0f) data[0].x = 1;
+}
+
+// --- FAULT INJECTION ---
+// Runs once, after the last workload launch and before verification. It used to
+// live inside the workload kernel, gated on thread 1337 and loop iteration 500,
+// so it never fired with --kernel_loops 500 or less, or with fewer than 1338
+// threads, and later launches rewrote the cell with the correct pattern anyway.
+// Flipping a bit in the .w lane also shows the verifier checks all four lanes.
+__global__ void inject_thermal_asym_error(uint4* data, size_t n) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && n > 0) {
+        size_t at = (n > 1337) ? 1337 : n - 1;
+        data[at].w ^= 0xBADBEEF;
+    }
 }
 
 // --- VERIFICATION KERNEL ---
@@ -128,14 +134,19 @@ int main(int argc, char* argv[]) {
 
     CHECK(hipSetDevice(gpu_id));
 
-    // Force allocation to exactly 16GB (or less depending on mem_pct)
-    // This isolates the traffic to typically 1 or 2 physical Memory stacks.
+    // Allocate min(16 GiB, --mem percent of free VRAM). The 16 GiB cap keeps the
+    // traffic on typically 1 or 2 physical memory stacks; --mem can only shrink
+    // it. (The cap used to replace --mem whenever more than 16 GiB was free, so
+    // --mem 10 on an 80 GB card still allocated 16 GiB.)
     size_t free, total; CHECK(hipMemGetInfo(&free, &total));
     if (mem_pct > 99) mem_pct = 99;
-    
-    size_t target_size = 16ULL * 1024 * 1024 * 1024; 
-    size_t alloc_size = (free > target_size) ? target_size : (free * mem_pct) / 100;
-    size_t num_elements = alloc_size / 16; 
+    if (mem_pct < 1) mem_pct = 1;
+
+    size_t target_size = 16ULL * 1024 * 1024 * 1024;
+    size_t requested_size = (size_t)(((unsigned long long)free * (unsigned long long)mem_pct) / 100ULL);
+    size_t alloc_size = (requested_size > target_size) ? target_size : requested_size;
+    size_t num_elements = alloc_size / 16;
+    if (num_elements == 0) { std::cerr << "[PANTHEON] Allocation too small." << std::endl; return 1; }
 
     uint4* d_data; CHECK(hipMalloc(&d_data, alloc_size));
     
@@ -163,6 +174,7 @@ int main(int argc, char* argv[]) {
               << (alloc_size / 1e9) << " GB Target..." << std::endl;
     std::cout << "  -> Duration (s):  " << duration << std::endl;
     std::cout << "  -> Mem Alloc (%): " << mem_pct << std::endl;
+    std::cout << "  -> Allocation:    " << (alloc_size / (1024 * 1024)) << " MiB" << std::endl;
     std::cout << "  -> Block Size:    " << block_size << std::endl;
     std::cout << "  -> Grid Size:     " << num_blocks << (auto_grid ? " (Auto-calculated)" : " (Explicit)") << std::endl;
     std::cout << "  -> Kernel Loops:  " << kernel_loops << std::endl;
@@ -176,7 +188,7 @@ int main(int argc, char* argv[]) {
     if (warmup_iters > 0) {
         std::cout << "[PANTHEON] Running " << warmup_iters << " warmup iterations..." << std::endl;
         for(int i = 0; i < warmup_iters; i++) {
-            LAUNCH_KERNEL(thermal_asym_kernel, num_blocks, block_size, d_data, num_elements, kernel_loops, inject_error, init_pattern);
+            LAUNCH_KERNEL(thermal_asym_kernel, num_blocks, block_size, d_data, num_elements, kernel_loops, init_pattern);
         }
         CHECK(hipDeviceSynchronize());
         
@@ -194,7 +206,7 @@ int main(int argc, char* argv[]) {
 
     // --- 5. ACTIVE LOOP ---
     while (true) {
-        LAUNCH_KERNEL(thermal_asym_kernel, num_blocks, block_size, d_data, num_elements, kernel_loops, inject_error, init_pattern);
+        LAUNCH_KERNEL(thermal_asym_kernel, num_blocks, block_size, d_data, num_elements, kernel_loops, init_pattern);
         CHECK(hipDeviceSynchronize());
         
         ops_performed += (size_t)num_blocks * block_size * kernel_loops * 8 * ASYM_ILP * 2; // Approx FLOPs
@@ -208,6 +220,11 @@ int main(int argc, char* argv[]) {
     // --- 6. VERIFICATION PASS ---
     if (verify_mode) {
         std::cout << "[PANTHEON] Running Asymmetric Thermal Verification Pass..." << std::endl;
+
+        if (inject_error) {
+            LAUNCH_KERNEL(inject_thermal_asym_error, 1, 1, d_data, num_elements);
+            CHECK(hipDeviceSynchronize());
+        }
         
         unsigned int* d_err_count;
         CHECK(hipMalloc(&d_err_count, sizeof(unsigned int)));
