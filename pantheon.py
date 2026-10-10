@@ -2405,16 +2405,19 @@ def throughput_variance_percent(out):
     return round(float(np.std(samples) / abs(np.mean(samples)) * 100.0), 2)
 
 
-def redact_host_paths(text):
+def redact_host_paths(text, build_paths=True):
     """Make a path-bearing string safe to publish.
 
     Reports are published, and a command line or a failure message carries the
     absolute path of the build directory, which contains the operator's home
     directory and so their user name. The build directory is shown as
     ./build, the source directory as ., and any other home directory as ~.
+    Files the run wrote (``build_paths=False``) keep their location, since
+    that is where the reader would look; only home directories are masked.
     """
     text = str(text)
-    for prefix, short in ((BUILD_DIR, "./build"), (BASE_DIR, "."), (os.path.expanduser("~"), "~")):
+    prefixes = ((BUILD_DIR, "./build"), (BASE_DIR, ".")) if build_paths else ()
+    for prefix, short in prefixes + ((os.path.expanduser("~"), "~"),):
         prefix = os.path.abspath(prefix).rstrip(os.sep) if os.path.isabs(prefix) else ""
         if len(prefix) > 1:
             text = re.sub(re.escape(prefix) + r"(?=/|$|[^\w.-])", short, text)
@@ -2477,7 +2480,7 @@ def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats,
     if profile_commands:
         row["Profiler Command Lines"] = redact_host_paths(" || ".join(profile_commands or []))
     if profile_files:
-        row["Profiler Counter Files"] = redact_host_paths(" || ".join(profile_files or []))
+        row["Profiler Counter Files"] = redact_host_paths(" || ".join(profile_files or []), build_paths=False)
     row.update(counter_summary or {})
     return row
 
@@ -3142,15 +3145,15 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         ras_summary = summarize_ras_delta(ras_delta, ras_before_by_gpu.get(gpu, {}), ras_after)
         row["RAS Status"] = ras_summary["status"]
         row["RAS Error Delta"] = " || ".join(ras_summary["details"]) or "None"
-        row["RAS Report"] = redact_host_paths(ras_path)
+        row["RAS Report"] = redact_host_paths(ras_path, build_paths=False)
         if ras_summary["status"] != "CLEAN":
             tprint(f"[RAS] GPU {gpu} {ras_summary['status']}: {row['RAS Error Delta']}")
 
         if profile and gpu_proc_infos:
             proc_info = gpu_proc_infos[0]
-            row["Profile Artifact Directory"] = redact_host_paths(proc_info["profile_artifact_dir"])
-            row["Profile Manifest"] = redact_host_paths(proc_info["profile_manifest"])
-            row["Profiler Trace Files"] = redact_host_paths(" || ".join(proc_info["trace_files"]))
+            row["Profile Artifact Directory"] = redact_host_paths(proc_info["profile_artifact_dir"], build_paths=False)
+            row["Profile Manifest"] = redact_host_paths(proc_info["profile_manifest"], build_paths=False)
+            row["Profiler Trace Files"] = redact_host_paths(" || ".join(proc_info["trace_files"]), build_paths=False)
             workload_summary = {
                 "test": test_name,
                 "gpu_id": gpu,
