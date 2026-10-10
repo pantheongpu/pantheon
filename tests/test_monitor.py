@@ -318,3 +318,146 @@ def test_cli_fallback_records_an_absent_sensor_as_absent(monkeypatch):
     assert history["temp_mem"] == []
     assert history["pwr"] == []
     assert history["temp_core"] == [60.0]
+
+
+# --- Missing sensors are N/A, never 0 ------------------------------------------
+
+def _raise(*_args, **_kwargs):
+    raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+
+
+def test_nvml_skips_fan_pcie_and_memory_when_unreadable(monkeypatch):
+    fake = _fake_nvml()
+    fake.nvmlDeviceGetFanSpeed = _raise
+    fake.nvmlDeviceGetCurrPcieLinkGeneration = _raise
+    fake.nvmlDeviceGetCurrPcieLinkWidth = _raise
+    fake.nvmlDeviceGetMemoryInfo = _raise
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", fake)
+    mon = HardwareMonitor("CUDA")
+    mon.history = {0: _history()}
+    mon._poll_nvidia([0])
+    h = mon.history[0]
+    for key in ("fan_pct", "pcie_gen", "pcie_width", "mem_used", "mem_total",
+                "volts_core", "volts_soc"):
+        assert h[key] == [], key
+    assert h["pwr"] == [250.0]
+
+    stats = mon._aggregate()[0]
+    for key in ("max_fan", "pcie_gen", "pcie_width", "peak_mem_used", "mem_total",
+                "max_volts_core", "max_volts_soc"):
+        assert stats[key] == "N/A", key
+
+
+def test_nvml_still_reports_fan_pcie_and_memory_when_readable(monkeypatch):
+    h = _nvml_monitor(monkeypatch)
+    assert h["fan_pct"] == [40]
+    assert h["pcie_gen"] == [4]
+    assert h["pcie_width"] == [16]
+    assert h["mem_total"] == [80 * 1024.0]
+
+
+def test_cli_fallback_records_absent_fan_pcie_and_memory_as_absent(monkeypatch):
+    line = "0, 60, 71, 250.0, 1980, [N/A], [N/A], [N/A], 0x0, [N/A], [N/A], [N/A]\n"
+    h = _cli_monitor(monkeypatch, line)
+    for key in ("fan_pct", "pcie_gen", "pcie_width", "gpu_util", "mem_used", "mem_total"):
+        assert h[key] == [], key
+    assert h["temp_core"] == [60.0]
+
+
+def test_cli_fallback_reads_fan_pcie_and_memory_when_present(monkeypatch):
+    line = "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0, 99, 1024, 81559\n"
+    h = _cli_monitor(monkeypatch, line)
+    assert h["fan_pct"] == [40.0]
+    assert h["pcie_gen"] == [4.0]
+    assert h["pcie_width"] == [16.0]
+    assert h["mem_used"] == [1024.0]
+    assert h["mem_total"] == [81559.0]
+
+
+def test_empty_history_aggregates_to_na_everywhere_but_energy():
+    mon = HardwareMonitor("MOCK")
+    mon.history = {0: _history()}
+    stats = mon._aggregate()[0]
+    for key in ("avg_temp", "max_temp", "avg_mem_temp", "max_mem_temp", "avg_pwr",
+                "avg_clk", "min_clk", "avg_gpu_util", "peak_mem_used", "mem_total",
+                "thermal_rise", "max_fan", "max_volts_core", "max_volts_soc",
+                "pcie_gen", "pcie_width", "throttle_reason"):
+        assert stats[key] == "N/A", key
+
+
+def test_time_series_csv_writes_na_for_sensors_never_read(tmp_path, monkeypatch):
+    monitor = HardwareMonitor("MOCK")
+    monkeypatch.setattr("monitor.time.sleep", lambda _s: setattr(monitor, "running", False))
+    monitor.start_collection([0], tmp_path, "t")
+    monitor.stop_collection()
+    with (tmp_path / "time_series.csv").open(newline="", encoding="utf-8") as f:
+        row = list(csv.DictReader(f))[0]
+    for column in ("Temp_Core(C)", "Temp_Mem(C)", "Power(W)", "Fan(%)", "PCIe_Gen",
+                   "GPU_Utilization(%)", "Memory_Used(MiB)", "Memory_Total(MiB)"):
+        assert row[column] == "N/A", column
+
+
+def _amd_monitor(monkeypatch, card, fail_usage_flags=False):
+    """A HIP monitor whose rocm-smi prints `card`; records the argument lists."""
+    calls = []
+
+    def fake_check_output(cmd):
+        calls.append(list(cmd))
+        if fail_usage_flags and "--showuse" in cmd:
+            raise RuntimeError("unrecognized arguments: --showuse")
+        return json.dumps({"card0": card}).encode()
+
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
+    monkeypatch.setattr("monitor.subprocess.check_output", fake_check_output)
+    mon = HardwareMonitor("HIP")
+    mon.history = {0: _history()}
+    mon._poll_amd([0])
+    return mon, calls
+
+
+AMD_FULL = {
+    "Temperature (Sensor junction) (C)": "70.0",
+    "Temperature (Sensor edge) (C)": "60.0",
+    "Temperature (Sensor memory) (C)": "66.0",
+    "Average Graphics Package Power (W)": "300.0",
+    "sclk clock speed:": "(2100Mhz)",
+    "GPU use (%)": "97",
+    "VRAM Total Memory (B)": str(16 * 1024 ** 3),
+    "VRAM Total Used Memory (B)": str(2 * 1024 ** 3),
+}
+
+
+def test_amd_poll_asks_for_utilization_and_vram_and_reads_them(monkeypatch):
+    mon, calls = _amd_monitor(monkeypatch, AMD_FULL)
+    assert "--showuse" in calls[0] and "--showmeminfo" in calls[0] and "--json" in calls[0]
+    h = mon.history[0]
+    assert h["gpu_util"] == [97.0]
+    assert h["mem_used"] == [2048.0]      # bytes reported, MiB stored
+    assert h["mem_total"] == [16384.0]
+    stats = mon._aggregate()[0]
+    assert stats["avg_gpu_util"] == 97.0
+    assert stats["mem_total"] == 16384.0
+
+
+def test_amd_poll_missing_sensors_are_absent_not_zero(monkeypatch):
+    card = {"Temperature (Sensor edge) (C)": "55.0"}
+    mon, _ = _amd_monitor(monkeypatch, card)
+    h = mon.history[0]
+    assert h["temp_core"] == [55.0]
+    for key in ("temp_mem", "pwr", "clk_core", "gpu_util", "mem_used", "mem_total", "fan_pct"):
+        assert h[key] == [], key
+    stats = mon._aggregate()[0]
+    assert stats["avg_mem_temp"] == "N/A"
+    assert stats["mem_total"] == "N/A"
+    assert stats["avg_gpu_util"] == "N/A"
+
+
+def test_amd_poll_falls_back_when_usage_flags_are_rejected(monkeypatch):
+    mon, calls = _amd_monitor(monkeypatch, AMD_FULL, fail_usage_flags=True)
+    assert len(calls) == 2 and "--showuse" not in calls[1]
+    h = mon.history[0]
+    assert h["temp_core"] == [70.0]
+    assert h["pwr"] == [300.0]

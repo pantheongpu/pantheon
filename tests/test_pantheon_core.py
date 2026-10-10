@@ -2509,3 +2509,256 @@ def test_failure_rows_do_not_carry_host_paths(operator_paths):
 ])
 def test_other_users_homes_are_masked(operator_paths, text, expected):
     assert pantheon.redact_host_paths(text) == expected
+
+
+# --- skipped, failed and non-finite runs ---------------------------------------
+
+def test_a_skip_line_on_stdout_or_stderr_is_a_skip_with_its_reason():
+    out = "Skipping: this card has no ray tracing hardware\nThroughput: 0.0 GRays/s\n"
+    throughput, unit, status, had_error, lines = pantheon.parse_kernel_output(out, "", 0, test_name="rt_virus")
+    assert (throughput, unit, status, had_error) == (0.0, "SKIP", "SKIP", False)
+    assert "Skipping: this card has no ray tracing hardware" in lines
+    assert pantheon.find_skip_reason(out, "").startswith("Skipping:")
+
+    # media_enc_virus prints its skip on stderr and exits 0.
+    err = "[PANTHEON] GPU 0: Skipping MEDIA_ENC_VIRUS (Requires NVIDIA CUDA).\n"
+    _, unit, status, had_error, _ = pantheon.parse_kernel_output("Throughput: 0.0 FPS\n", err, 0, test_name="media_enc_virus")
+    assert (unit, status, had_error) == ("SKIP", "SKIP", False)
+    assert "Requires NVIDIA CUDA" in pantheon.find_skip_reason("", err)
+
+
+def test_a_failing_kernel_that_mentions_skipping_is_still_a_failure():
+    _, unit, status, had_error, _ = pantheon.parse_kernel_output("Skipping warmup\n", "boom", 3)
+    assert (unit, status, had_error) == ("ERR", "FAIL", True)
+
+
+def test_zero_throughput_without_a_skip_is_not_a_pass():
+    _, unit, status, had_error, lines = pantheon.parse_kernel_output(
+        "Throughput: 0.0 GB/s\n", "", 0, test_name="memory_read")
+    assert (unit, status, had_error) == ("ERR", "FAIL", True)
+    assert any("zero throughput" in line for line in lines)
+    # The idle baseline is the one workload for which zero is the measurement.
+    _, unit, status, had_error, _ = pantheon.parse_kernel_output(
+        "Throughput: 0.0 GB/s\n", "", 0, test_name="baseline_metrics")
+    assert (unit, status, had_error) == ("GB/s", "PASS", False)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "NaN"])
+def test_a_non_finite_score_fails_the_workload_and_the_reports_still_write(value):
+    out = f"Throughput: {value} GB/s\nThroughput: 5.0 GB/s\n"
+    throughput, unit, status, had_error, lines = pantheon.parse_kernel_output(out, "", 0, test_name="memory_read")
+    assert (throughput, unit, status, had_error) == (0.0, "ERR", "FAIL", True)
+    assert any("non-finite" in line for line in lines)
+    assert pantheon.throughput_variance_percent(out) == "N/A"
+    row = pantheon.build_result_row("memory_read", 0, 10, 99, throughput, unit, {}, status=status,
+                                    throughput_variance=pantheon.throughput_variance_percent(out))
+    json.dumps(row, allow_nan=False)
+
+
+def test_skipped_workloads_are_not_counted_as_run():
+    skipped = _row("p2p_thrasher", 0.0, "SKIP", status="SKIP")
+    skipped["Skip Reason"] = "[PANTHEON] Skipping P2P_THRASHER (Only 1 GPU detected)."
+    v = pantheon.assess_gpu([skipped, _row("rt_virus", 0.0, "SKIP", status="SKIP")], 0, "X")
+    assert v["verdict"] == "INCOMPLETE" and v["workloads_completed"] == 0
+    assert any("nothing ran" in note for note in v["notes"])
+    assert any("Only 1 GPU detected" in note for note in v["notes"])
+    assert "nothing ran" in v["summary"]
+
+    v = pantheon.assess_gpu([skipped, _row("memory_read", 868.0)], 0, "X")
+    assert v["verdict"] == "HEALTHY" and v["workloads_completed"] == 1
+    assert v["summary"] == "1 skipped; 1 workload(s) completed"
+
+
+@pytest.mark.parametrize("reason", ["Power|Thermal", "thermal", "Thermal|Power Brake"])
+def test_combined_and_lowercase_thermal_reasons_are_a_finding(reason):
+    row = _row("memory_read", 1900.0, max_temp=88, throttle_reason=reason)
+    row["Throttle Time (s)"] = 12.0
+    v = pantheon.assess_gpu([row], 0, "H")
+    assert v["verdict"] == "WATCH"
+    assert "memory_read thermally throttled, GPU at 88 C, 12 s throttled" in v["reasons"][0]
+
+
+def test_power_only_throttling_is_not_a_thermal_finding_and_unknown_cause_is_a_note():
+    v = pantheon.assess_gpu([_row("memory_read", 1900.0, throttle_reason="Power")], 0, "H")
+    assert v["verdict"] == "HEALTHY"
+    row = _row("memory_read", 1900.0, throttle_reason="None")
+    row["Throttle Time (s)"] = 4.0
+    v = pantheon.assess_gpu([row], 0, "H")
+    assert v["verdict"] == "HEALTHY"
+    assert "memory_read: throttled for 4 s, cause not recorded" in v["notes"]
+
+
+# --- PCIe counters and kernel-log blame ------------------------------------------
+
+def test_pci_address_from_nvidia_smi_matches_sysfs(monkeypatch):
+    class Done:
+        returncode = 0
+        stdout = "00000000:01:00.0\n"
+        stderr = ""
+    monkeypatch.setattr(pantheon.subprocess, "run", lambda *a, **k: Done())
+    assert pantheon.gpu_pci_bdf("CUDA", 0) == "0000:01:00.0"
+    assert pantheon.gpu_pci_bdf("HIP", 0) == ""
+
+
+GPU0 = "0000:01:00.0"
+GPU1 = "0000:02:00.0"
+
+
+def test_kernel_log_lines_are_attributed_to_the_gpu_they_name():
+    lines = [
+        "pcieport 0000:00:01.1: AER: Uncorrected (Fatal) error received: 0000:03:00.0",   # an NVMe drive
+        "nvme 0000:03:00.0: PCIe Bus Error: severity=Uncorrected (Fatal), type=Transaction Layer",
+        "NVRM: Xid (PCI:0000:02:00): 79, pid=1, GPU has fallen off the bus.",
+        "nvidia 0000:01:00.0: PCIe Bus Error: severity=Corrected, type=Physical Layer",
+    ]
+    mine0, system0 = pantheon.split_events_by_gpu(lines, GPU0)
+    mine1, system1 = pantheon.split_events_by_gpu(lines, GPU1)
+    assert mine0 == [lines[3]] and mine1 == [lines[2]]
+    assert lines[0] in system0 and lines[1] in system0 and lines[2] in system0
+    # Without an address (HIP) nothing can be attributed.
+    assert pantheon.split_events_by_gpu(lines, "") == ([], lines)
+
+
+def _snapshot(events, system):
+    return {"sources": {"vendor_ras": {"status": "supported", "metrics": {}},
+                        "linux_pcie_aer": {"status": "supported", "metrics": {},
+                                           "events": events, "system_events": system}}}
+
+
+def test_another_devices_error_does_not_change_a_gpu_verdict():
+    before, after = _snapshot([], []), _snapshot([], ["nvme 0000:03:00.0: PCIe Bus Error: severity=Uncorrected (Fatal)"])
+    summary = pantheon.summarize_ras_delta(pantheon.diff_ras_snapshots(before, after), before, after)
+    assert summary["status"] == "CLEAN"
+    assert summary["system_events"] == ["nvme 0000:03:00.0: PCIe Bus Error: severity=Uncorrected (Fatal)"]
+
+    own = "nvidia 0000:01:00.0: PCIe Bus Error: severity=Uncorrected (Fatal)"
+    after = _snapshot([own], [])
+    summary = pantheon.summarize_ras_delta(pantheon.diff_ras_snapshots(before, after), before, after)
+    assert summary["status"] == "ERROR"
+
+
+def test_collect_ras_snapshot_splits_the_system_log_per_gpu(monkeypatch):
+    lines = ["nvme 0000:03:00.0: PCIe Bus Error: severity=Uncorrected (Fatal)",
+             "nvidia 0000:02:00.0: PCIe Bus Error: severity=Corrected"]
+    monkeypatch.setattr(pantheon, "linux_aer_events", lambda: (lines, ""))
+    monkeypatch.setattr(pantheon, "gpu_pci_bdf", lambda _p, gpu: {0: GPU0, 1: GPU1}[gpu])
+    monkeypatch.setattr(pantheon, "linux_aer_snapshot", lambda *a, **k: {"status": "supported", "metrics": {}})
+    monkeypatch.setattr(pantheon, "nvidia_ras_snapshot", lambda _gpu: {"status": "supported", "metrics": {}})
+    first = pantheon.collect_ras_snapshot("CUDA", 0)["sources"]["linux_pcie_aer"]
+    second = pantheon.collect_ras_snapshot("CUDA", 1)["sources"]["linux_pcie_aer"]
+    assert first["events"] == [] and second["events"] == [lines[1]]
+    assert first["system_events"] == lines and second["system_events"] == [lines[0]]
+
+
+def test_a_double_bit_page_retirement_is_uncorrectable():
+    delta = {"metrics": [{"source": "vendor_ras", "metric": "retired_pages.dbe", "delta": 1,
+                          "status": "supported"}], "new_aer_events": []}
+    assert pantheon.summarize_ras_delta(delta)["status"] == "ERROR"
+    delta["metrics"][0]["metric"] = "retired_pages.sbe"
+    assert pantheon.summarize_ras_delta(delta)["status"] == "WARNING"
+
+
+def test_an_event_line_in_the_summary_has_no_made_up_counter():
+    row = _row("memory_read", 868.0, ras_status="WARNING",
+               ras_delta="PCIe AER: nvidia 0000:01:00.0: PCIe Bus Error: severity=Corrected "
+                         "|| vendor_ras.pcie.bad_tlp +3")
+    v = pantheon.assess_gpu([row], 0, "X")
+    text = " ".join(v["reasons"])
+    assert "+0" not in text
+    assert "pcie.bad_tlp +3" in text and "severity=Corrected" in text
+
+
+# --- cleanup on termination ----------------------------------------------------
+
+def test_the_termination_handler_kills_the_workloads_and_exits_128_plus_signal(monkeypatch):
+    import signal as _signal
+    import subprocess as _subprocess
+    child = _subprocess.Popen(["sleep", "60"], start_new_session=True)
+    monkeypatch.setattr(pantheon, "ACTIVE_PROCS", [child])
+    try:
+        with pytest.raises(SystemExit) as stopped:
+            pantheon.handle_termination_signal(_signal.SIGTERM)
+        assert stopped.value.code == 128 + int(_signal.SIGTERM)
+        assert child.wait(timeout=10) != 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_termination_handlers_are_installed_only_from_the_main_thread():
+    import signal as _signal
+    import threading
+    seen = {}
+    thread = threading.Thread(target=lambda: seen.setdefault("installed", pantheon.install_termination_handlers()))
+    thread.start()
+    thread.join()
+    assert seen["installed"] == []
+    previous = {s: _signal.getsignal(s) for s in (_signal.SIGTERM, _signal.SIGHUP)}
+    try:
+        assert set(pantheon.install_termination_handlers()) == {_signal.SIGTERM, _signal.SIGHUP}
+        assert _signal.getsignal(_signal.SIGTERM) is pantheon.handle_termination_signal
+    finally:
+        for signum, handler in previous.items():
+            _signal.signal(signum, handler)
+
+
+def test_the_profile_telemetry_pass_registers_its_process_for_cleanup(monkeypatch):
+    registered = []
+
+    class Process:
+        returncode = 0
+        def communicate(self, timeout=None):
+            registered.append(list(pantheon.ACTIVE_PROCS))
+            return "Throughput: 1.0 GB/s\n", ""
+
+    class Monitor:
+        def start_collection(self, *_a): pass
+        def stop_collection(self): return {}
+
+    process = Process()
+    monkeypatch.setattr(pantheon, "ACTIVE_PROCS", [])
+    monkeypatch.setattr(pantheon.subprocess, "Popen", lambda *a, **k: process)
+    pantheon.run_profile_telemetry_pass("memory_read", [{"gpu": 0, "workload_argv": ["x"]}],
+                                        [0], 5, Monitor(), "unused")
+    assert registered == [[process]]
+
+
+# --- a failed rebuild must not leave a stale binary running ----------------------
+
+def test_a_failed_rebuild_with_an_older_binary_is_not_marked_current(tmp_path, monkeypatch):
+    base = tmp_path / "base"
+    kernels = base / "kernels" / "demo"
+    cache_root = tmp_path / "cache"
+    kernels.mkdir(parents=True)
+    (base / "Makefile").write_text("all:\n\t@true\n", encoding="utf-8")
+    source = kernels / "demo.cpp"
+    source.write_text("int main(){return 0;}\n", encoding="utf-8")
+
+    def fake_run(cmd, **_kwargs):
+        build_dir = Path(cmd[3].split("=", 1)[1])
+        build_dir.mkdir(parents=True, exist_ok=True)
+        binary = build_dir / "demo"
+        if not binary.exists():
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            os.utime(binary, (1_000_000, 1_000_000))        # an old build, left behind
+        os.utime(source, None)                              # the source was edited since
+        return type("Result", (), {"returncode": 2, "stdout": "", "stderr": "demo.cpp: error"})()
+
+    monkeypatch.setenv("PANTHEON_BUILD_CACHE_DIR", str(cache_root))
+    monkeypatch.setattr(pantheon, "BUILD_DIR", pantheon.BUILD_DIR)
+    monkeypatch.setattr(pantheon, "BUILD_CACHE_FILE", pantheon.BUILD_CACHE_FILE)
+    monkeypatch.setattr(pantheon, "BASE_DIR", str(base))
+    monkeypatch.setattr(pantheon, "KERNEL_DIR", str(base / "kernels"))
+    monkeypatch.setattr(pantheon, "PANTHEON_VERSION", "9.9.9")
+    monkeypatch.setattr(pantheon, "detect_build_target", lambda _platform: "gfx942")
+    monkeypatch.setattr(pantheon, "TEST_REGISTRY", {"demo": {"bin": "demo", "args": [], "desc": "Demo"}})
+    monkeypatch.setattr(pantheon.subprocess, "run", fake_run)
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: "/opt/rocm/bin/hipcc" if name == "hipcc" else None)
+
+    unavailable = pantheon.build_kernels("HIP")
+
+    assert set(unavailable) == {"demo"}
+    assert "older than its source" in unavailable["demo"]
+    assert not (cache_root / "9.9.9" / "hip-gfx942" / ".pantheon_build_cache.json").exists()

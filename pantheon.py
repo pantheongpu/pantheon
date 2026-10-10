@@ -1,5 +1,6 @@
 import argparse
 import io
+import math
 import signal
 import subprocess
 import time
@@ -90,6 +91,38 @@ def cleanup_zombies():
 
 # Register immediately so it catches early crashes
 atexit.register(cleanup_zombies)
+
+
+def handle_termination_signal(signum, _frame=None):
+    """Stop the workloads, then exit with the conventional 128+signal status.
+
+    Python's default for SIGTERM and SIGHUP is to die without running atexit,
+    and the workloads run in sessions of their own, so a scheduler, a
+    container runtime or a dropped ssh connection used to leave them loading
+    the GPU with nothing watching.
+    """
+    cleanup_zombies()
+    raise SystemExit(128 + int(signum))
+
+
+def install_termination_handlers():
+    """Route SIGTERM and SIGHUP through handle_termination_signal.
+
+    Only the main thread may install a handler. Returns the signals handled.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return []
+    installed = []
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, handle_termination_signal)
+            installed.append(signum)
+        except (ValueError, OSError):
+            pass
+    return installed
 
 def is_frozen_app():
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
@@ -576,16 +609,19 @@ def gpu_pci_bdf(platform_name, gpu_id):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False,
             )
             if result.returncode == 0:
-                return result.stdout.strip().splitlines()[0].lower()
+                # nvidia-smi prints 00000000:01:00.0 and sysfs names the device
+                # 0000:01:00.0, so the domain is cut to four digits.
+                return nvidia_proc_bus_id(result.stdout.strip().splitlines()[0])
         except (OSError, IndexError):
             return ""
     return ""
 
 
-def linux_aer_snapshot(platform_name, gpu_id):
+def linux_aer_snapshot(platform_name, gpu_id, bdf=None):
     if platform.system().lower() != "linux":
         return ras_source("unavailable", detail="PCIe AER is collected only on Linux")
-    bdf = gpu_pci_bdf(platform_name, gpu_id)
+    if bdf is None:
+        bdf = gpu_pci_bdf(platform_name, gpu_id)
     if not bdf:
         return ras_source("unavailable", detail="GPU PCI bus identifier was unavailable")
     device_path = os.path.realpath(os.path.join("/sys/bus/pci/devices", bdf))
@@ -622,6 +658,36 @@ def linux_aer_events():
     return events[-100:], ""
 
 
+def event_names_device(line, bdf):
+    """True when a kernel log line names the PCI device with this address.
+
+    AER lines carry the full address (0000:01:00.0), an NVIDIA Xid line spells
+    it without the function (NVRM: Xid (PCI:0000:01:00): 79, ...).
+    """
+    if not bdf:
+        return False
+    text = str(line).lower()
+    if bdf in text:
+        return True
+    for found in re.findall(r"pci:([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2})(?![0-9a-f.])", text):
+        if bdf.startswith(found + "."):
+            return True
+    return False
+
+
+def split_events_by_gpu(events, bdf):
+    """Separate the kernel log lines that name this GPU from all the others.
+
+    dmesg is system-wide: an NVMe or NIC error, or another GPU's Xid, is not
+    this GPU's. Lines that name no GPU of ours are returned second, to be
+    reported once for the system and never held against a card.
+    """
+    mine, system = [], []
+    for line in events:
+        (mine if event_names_device(line, bdf) else system).append(line)
+    return mine, system
+
+
 def collect_ras_snapshot(platform_name, gpu_id):
     """Return a non-fatal, capability-aware RAS snapshot for one GPU."""
     if platform_name == "CUDA":
@@ -630,14 +696,17 @@ def collect_ras_snapshot(platform_name, gpu_id):
         vendor = amd_ras_snapshot(gpu_id)
     else:
         vendor = ras_source("unsupported", detail=f"RAS collection is not available for {platform_name}")
-    aer = linux_aer_snapshot(platform_name, gpu_id)
+    bdf = gpu_pci_bdf(platform_name, gpu_id)
+    aer = linux_aer_snapshot(platform_name, gpu_id, bdf)
     events, event_error = linux_aer_events() if platform_name in ("CUDA", "HIP") else ([], "")
     if event_error:
         aer["event_status"] = "unavailable"
         aer["event_detail"] = event_error
     else:
         aer["event_status"] = "supported"
-        aer["events"] = events
+        # Only the lines that name this GPU count for it. Where the PCI address
+        # is unknown (HIP) nothing can be attributed, and all of it is system-level.
+        aer["events"], aer["system_events"] = split_events_by_gpu(events, bdf)
     sources = {"vendor_ras": vendor, "linux_pcie_aer": aer}
     if platform_name == "HIP":
         sources["amd_cper"] = amd_cper_snapshot(gpu_id)
@@ -675,7 +744,13 @@ def diff_ras_snapshots(before, after):
             })
     before_events = set(before.get("sources", {}).get("linux_pcie_aer", {}).get("events", []))
     after_events = after.get("sources", {}).get("linux_pcie_aer", {}).get("events", [])
-    return {"metrics": rows, "new_aer_events": [event for event in after_events if event not in before_events]}
+    before_system = set(before.get("sources", {}).get("linux_pcie_aer", {}).get("system_events", []))
+    after_system = after.get("sources", {}).get("linux_pcie_aer", {}).get("system_events", [])
+    return {
+        "metrics": rows,
+        "new_aer_events": [event for event in after_events if event not in before_events],
+        "new_system_events": [event for event in after_system if event not in before_system],
+    }
 
 
 def summarize_ras_delta(delta, before=None, after=None):
@@ -690,7 +765,10 @@ def summarize_ras_delta(delta, before=None, after=None):
             continue
         label = f"{item.get('source')}.{item.get('metric')} +{value:g}"
         name = str(item.get("metric", "")).lower()
-        if any(token in name for token in ("uncorrect", "fatal", "poison", "unrecoverable")):
+        # A double-bit-error page retirement (retired_pages.dbe) is the card
+        # retiring memory that returned uncorrectable data.
+        if any(token in name for token in ("uncorrect", "fatal", "poison", "unrecoverable", ".dbe")) \
+                or name == "dbe":
             errors.append(label)
         else:
             warnings.append(label)
@@ -702,10 +780,12 @@ def summarize_ras_delta(delta, before=None, after=None):
         else:
             warnings.append(label)
 
+    # Lines that name no GPU of ours are reported, never judged.
+    system_events = list(delta.get("new_system_events", []))
     if errors:
-        return {"status": "ERROR", "details": errors + warnings}
+        return {"status": "ERROR", "details": errors + warnings, "system_events": system_events}
     if warnings:
-        return {"status": "WARNING", "details": warnings}
+        return {"status": "WARNING", "details": warnings, "system_events": system_events}
     snapshots = (before or {}, after or {})
     available = any(
         source.get("status") in ("supported", "partial")
@@ -713,8 +793,9 @@ def summarize_ras_delta(delta, before=None, after=None):
         for source in snapshot.get("sources", {}).values()
     )
     if not available:
-        return {"status": "UNAVAILABLE", "details": ["RAS/AER telemetry is not exposed by this system"]}
-    return {"status": "CLEAN", "details": []}
+        return {"status": "UNAVAILABLE", "details": ["RAS/AER telemetry is not exposed by this system"],
+                "system_events": system_events}
+    return {"status": "CLEAN", "details": [], "system_events": system_events}
 
 # --------------------------------------------------------------------------
 # Verdict: what a run says about the card, in one word, with the evidence.
@@ -755,6 +836,16 @@ def split_ras_details(delta_text):
     return benign, serious
 
 
+def limit_reason_set(value):
+    """The lower-case labels of a Limit Reason such as "Power|Thermal"."""
+    return {part.strip().lower() for part in str(value or "").split("|") if part.strip()}
+
+
+def is_skipped_row(row):
+    """True for a row of a workload that declined to run, which is not a pass."""
+    return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
+
+
 def assess_gpu(rows, gpu_id, gpu_name):
     """Turn one GPU's result rows into a verdict with its evidence.
 
@@ -766,6 +857,8 @@ def assess_gpu(rows, gpu_id, gpu_name):
     faults, notes = [], []
     throttled, hot, hot_memory, incomplete = [], [], [], []
     ras_serious, benign_ras = {}, []
+    skipped = []
+    throttle_seconds = {}
     ran = 0
     for row in mine:
         test = row.get("Test Name", "?")
@@ -773,12 +866,18 @@ def assess_gpu(rows, gpu_id, gpu_name):
             notes.append(f"{test} did not run ({row.get('Failure Stage')}: {row.get('Failure Reason')})")
             continue
         unit = row.get("Unit")
-        failed = unit == "ERR" or str(row.get("Status", "PASS")).upper() == "FAIL"
+        failed = unit == "ERR" or str(row.get("Status") or "PASS").upper() == "FAIL"
         if failed:
             if test in DIAGNOSTIC_TESTS:
                 faults.append(f"{test} failed: memory errors detected or the workload aborted, see its log")
             else:
                 incomplete.append(test)
+            continue
+        if is_skipped_row(row):
+            # It declined to run; there is no measurement and nothing to judge.
+            skipped.append(test)
+            reason = row.get("Skip Reason")
+            notes.append(f"{test} was skipped" + (f" ({reason})" if reason else ""))
             continue
         if test != "baseline_metrics":
             ran += 1
@@ -793,20 +892,32 @@ def assess_gpu(rows, gpu_id, gpu_name):
             if benign:
                 benign_ras.append(test)
 
-        limit = str(row.get("Limit Reason", "") or "")
+        # The reason is the most common label of the samples, joined with "|"
+        # when a sample had several ("Power|Thermal"), so it is read as a set.
+        reasons = limit_reason_set(row.get("Limit Reason"))
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if limit.lower() == "thermal":
+        throttle_s = _num(row.get("Throttle Time (s)"))
+        if "thermal" in reasons:
             throttled.append((test, tmax))
+            throttle_seconds[test] = throttle_s
         elif tmax >= THERMAL_WATCH_C:
             hot.append((test, tmax))
+        if throttle_s > 0 and not (reasons - {"none", "n/a", "idle"}):
+            # Throttled for part of the run, but the commonest label of the
+            # samples is "None", so the cause was not recorded. Not a finding
+            # (power-cap throttling is normal under load), but not silent.
+            notes.append(f"{test}: throttled for {throttle_s:.0f} s, cause not recorded")
         if tmem >= MEMORY_THERMAL_WATCH_C:
             hot_memory.append((test, tmem))
 
     watches = []
     if throttled:
         throttled.sort(key=lambda t: -t[1])
-        watches.append("thermal: " + ", ".join(f"{t} thermally throttled, GPU at {c:.0f} C" for t, c in throttled))
+        watches.append("thermal: " + ", ".join(
+            f"{t} thermally throttled, GPU at {c:.0f} C"
+            + (f", {throttle_seconds[t]:.0f} s throttled" if throttle_seconds.get(t, 0) > 0 else "")
+            for t, c in throttled))
     if hot:
         hot.sort(key=lambda t: -t[1])
         watches.append("hot: " + ", ".join(f"{t} GPU reached {c:.0f} C" for t, c in hot))
@@ -814,14 +925,20 @@ def assess_gpu(rows, gpu_id, gpu_name):
         hot_memory.sort(key=lambda t: -t[1])
         watches.append("hot memory: " + ", ".join(f"{t} memory reached {c:.0f} C" for t, c in hot_memory))
     if ras_serious:
-        totals = {}
+        totals, events = {}, []
         for details in ras_serious.values():
             for item in details:
-                name, _, delta = item.rpartition(" ")
+                counted = re.match(r"^(.*\S)\s+\+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)$", item)
+                if not counted:
+                    # An event line, not a counter: keep its words, not a "+0".
+                    if item not in events:
+                        events.append(item if len(item) <= 120 else item[:117] + "...")
+                    continue
+                name = counted.group(1)
                 short = name.split(".")[-2] + "." + name.split(".")[-1] if name.count(".") >= 2 else name
-                totals[short] = totals.get(short, 0) + _num(delta.lstrip("+"))
-        watches.append(f"correctable errors on {len(ras_serious)} workload(s): "
-                       + ", ".join(f"{k} +{v:g}" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])))
+                totals[short] = totals.get(short, 0) + _num(counted.group(2))
+        parts = [f"{k} +{v:g}" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])] + events
+        watches.append(f"correctable errors on {len(ras_serious)} workload(s): " + ", ".join(parts))
     if incomplete:
         watches.append("did not complete: " + ", ".join(incomplete))
 
@@ -836,7 +953,10 @@ def assess_gpu(rows, gpu_id, gpu_name):
         verdict = "HEALTHY"
     else:
         verdict = "INCOMPLETE"
-        notes.append("no workload beyond the idle baseline completed")
+        if skipped:
+            notes.append(f"nothing ran: {len(skipped)} workload(s) skipped ({', '.join(skipped)})")
+        else:
+            notes.append("nothing ran: no workload beyond the idle baseline completed")
 
     summary_bits = []
     if faults:
@@ -849,6 +969,10 @@ def assess_gpu(rows, gpu_id, gpu_name):
         summary_bits.append(f"correctable errors on {len(ras_serious)}")
     if incomplete:
         summary_bits.append(f"{len(incomplete)} incomplete")
+    if skipped and verdict != "INCOMPLETE":
+        summary_bits.append(f"{len(skipped)} skipped")
+    if verdict == "INCOMPLETE" and skipped:
+        summary_bits.append("nothing ran")
     if verdict == "HEALTHY":
         summary_bits.append(f"{ran} workload(s) completed")
 
@@ -863,6 +987,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
             "hot_memory": [{"test": t, "temp_c": c} for t, c in hot_memory],
             "correctable_errors": ras_serious,
             "incomplete": incomplete,
+            "skipped": skipped,
         },
         "workloads_completed": ran,
     }
@@ -1812,6 +1937,41 @@ def write_build_cache(platform_name):
         json.dump(build_cache_key(platform_name), f, indent=2, sort_keys=True)
 
 
+def stale_workload_binaries():
+    """Workload binaries in BUILD_DIR that are older than what they are built from.
+
+    Only meaningful after a failed `make -k`: make rebuilds an out-of-date
+    binary or fails, so a binary that is older than its source, the Makefile
+    or a shared header is one whose rebuild failed. Maps the binary name to
+    the file that is newer.
+    """
+    shared = [os.path.join(BASE_DIR, "Makefile")]
+    for pattern in ("*.h", "*.hpp", "*.cuh"):
+        shared.extend(glob.glob(os.path.join(KERNEL_DIR, "common", "**", pattern), recursive=True))
+    sources = {}
+    for path in glob.glob(os.path.join(KERNEL_DIR, "**", "*.cpp"), recursive=True):
+        if os.path.relpath(path, KERNEL_DIR).split(os.sep)[0] != "common":
+            sources[os.path.splitext(os.path.basename(path))[0]] = path
+    stale = {}
+    for name in {config["bin"] for config in TEST_REGISTRY.values()}:
+        binary = os.path.join(BUILD_DIR, name)
+        try:
+            built = os.path.getmtime(binary)
+        except OSError:
+            continue
+        inputs = list(shared)
+        if name in sources:
+            inputs.append(sources[name])
+        for path in inputs:
+            try:
+                if os.path.getmtime(path) > built:
+                    stale[name] = os.path.relpath(path, BASE_DIR).replace(os.sep, "/")
+                    break
+            except OSError:
+                continue
+    return stale
+
+
 def build_kernels(platform):
     configure_build_directory(platform)
     try:
@@ -1858,15 +2018,25 @@ def build_kernels(platform):
                 handle.write("\n--- stderr ---\n")
                 handle.write(result.stderr)
 
-        unavailable = {
-            test_name: (
-                f"Compilation did not produce {config['bin']}. "
-                f"See {build_log} for compiler output."
-            )
-            for test_name, config in TEST_REGISTRY.items()
-            if not (os.path.isfile(os.path.join(BUILD_DIR, config["bin"]))
-                    and os.access(os.path.join(BUILD_DIR, config["bin"]), os.X_OK))
-        }
+        stale = stale_workload_binaries()
+        unavailable = {}
+        for test_name, config in TEST_REGISTRY.items():
+            binary = os.path.join(BUILD_DIR, config["bin"])
+            if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+                unavailable[test_name] = (
+                    f"Compilation did not produce {config['bin']}. "
+                    f"See {build_log} for compiler output."
+                )
+            elif config["bin"] in stale:
+                # An older binary is still on disk, but the source it was
+                # built from has changed and its rebuild failed. Running it
+                # would measure code nobody asked for, and the cache would
+                # call it current.
+                unavailable[test_name] = (
+                    f"Compilation of {config['bin']} failed, and the binary left in "
+                    f"{BUILD_DIR} is older than its source ({stale[config['bin']]}). "
+                    f"See {build_log} for compiler output."
+                )
         if not unavailable:
             # `make -k` can return non-zero after an optional target fails
             # even though every registered workload binary is usable.
@@ -2324,14 +2494,32 @@ def cooldown_after_workload(duration):
     return cooldown_seconds
 
 
-def parse_kernel_output(out, err, returncode):
+def find_skip_reason(out, err=""):
+    """The line in which a workload says it decided not to run, or None.
+
+    A kernel that skips on purpose prints a line that starts with "Skipping"
+    and exits 0. The older kernels print "[PANTHEON] ... Skipping ..." instead,
+    some of them on stderr, so both streams are read and both spellings count.
+    """
+    for text in (out, err):
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if line.startswith("Skipping"):
+                return line
+            if "Skipping" in line and ("[PANTHEON]" in line or line.startswith("->")):
+                return line
+    return None
+
+
+def parse_kernel_output(out, err, returncode, test_name=None):
     throughput = "N/A"
     unit = ""
     status = "PASS"
     had_error = False
     pantheon_lines = []
+    throughput_line = False
 
-    skipped_reason = None
+    skipped_reason = find_skip_reason(out, err)
     if returncode != 0:
         throughput = 0.0
         unit = "ERR"
@@ -2347,11 +2535,27 @@ def parse_kernel_output(out, err, returncode):
                     # after a double space and the score after a tab, while
                     # throughput_variance_percent read the same line correctly.
                     parts = raw_val.split()
-                    throughput = float(parts[0])
+                    value = float(parts[0])
+                except (ValueError, IndexError):
+                    continue
+                if not math.isfinite(value):
+                    # nan and inf float() fine, and a score that is neither
+                    # cannot be written to the JSON reports. Fail the workload
+                    # here so the rest of the run is not lost to a write error.
+                    if not had_error:
+                        pantheon_lines.append(
+                            f"[PANTHEON] Workload reported a non-finite throughput ({parts[0]}); "
+                            "recorded as a failure.")
+                    throughput = 0.0
+                    unit = "ERR"
+                    status = "FAIL"
+                    had_error = True
+                    continue
+                if not had_error:
+                    throughput = value
+                    throughput_line = True
                     if len(parts) > 1:
                         unit = parts[1]
-                except:
-                    pass
             elif "[SDC FAULT]" in line:
                 throughput = 0.0
                 unit = "ERR"
@@ -2371,18 +2575,30 @@ def parse_kernel_output(out, err, returncode):
                     had_error = True
                 pantheon_lines.append(line.strip())
             elif "[PANTHEON]" in line or line.strip().startswith("->"):
-                if "Skipping" in line:
-                    # The kernel decided at runtime that it cannot run here --
-                    # P2P between GPUs with no link between them, for example.
-                    # It still prints Throughput: 0.0, which would otherwise be
-                    # recorded as a real measurement and be indistinguishable
-                    # from catastrophically slow hardware.
-                    skipped_reason = line.strip()
                 pantheon_lines.append(line.strip())
 
     if skipped_reason and not had_error:
+        # The kernel decided at runtime that it cannot run here -- P2P between
+        # GPUs with no link between them, for example. It still prints
+        # Throughput: 0.0, which would otherwise be recorded as a real
+        # measurement and be indistinguishable from catastrophically slow
+        # hardware.
+        throughput = 0.0
         unit = "SKIP"
         status = "SKIP"
+        if skipped_reason not in pantheon_lines:
+            pantheon_lines.append(skipped_reason)
+    elif (not had_error and throughput_line and throughput == 0.0
+          and test_name not in (None, "baseline_metrics")):
+        # Zero is a measurement only for the idle baseline. Anywhere else it
+        # means nothing ran, and a workload that does not say it skipped has
+        # not earned a PASS.
+        unit = "ERR"
+        status = "FAIL"
+        had_error = True
+        pantheon_lines.append(
+            "[PANTHEON] Workload reported zero throughput without saying it skipped; "
+            "recorded as a failure.")
 
     if err and returncode != 0:
         pantheon_lines.append(err.strip())
@@ -2397,9 +2613,11 @@ def throughput_variance_percent(out):
         if "Throughput:" not in line:
             continue
         try:
-            samples.append(float(line.split("Throughput:", 1)[1].strip().split()[0]))
+            value = float(line.split("Throughput:", 1)[1].strip().split()[0])
         except (ValueError, IndexError):
             continue
+        if math.isfinite(value):
+            samples.append(value)
     if len(samples) < 2 or np.mean(samples) == 0:
         return "N/A"
     return round(float(np.std(samples) / abs(np.mean(samples)) * 100.0), 2)
@@ -2918,6 +3136,9 @@ def run_profile_telemetry_pass(test_name, proc_infos, gpu_ids, duration, monitor
                     universal_newlines=True,
                     start_new_session=True,
                 )
+                # It runs in a session of its own, so an interrupt that does
+                # not reach it would leave it loading the GPU.
+                ACTIVE_PROCS.append(process)
                 try:
                     stdout, stderr = process.communicate(
                         timeout=process_timeout_seconds(test_name, duration, False),
@@ -2995,6 +3216,8 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
                     tprint(f"[ERROR] {detail}")
 
     trial_status_by_gpu = {gpu: "PASS" for gpu in gpu_ids}
+    reported_system_events = set()
+    skip_reasons = {}
     parsed = []
     for proc_info in procs:
         gpu = proc_info["gpu"]
@@ -3005,7 +3228,8 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         telemetry_sample = telemetry_outputs.get(gpu)
         if telemetry_sample is not None:
             out, err, returncode = telemetry_sample
-            throughput, unit, status, had_error, pantheon_lines = parse_kernel_output(out, err, returncode)
+            throughput, unit, status, had_error, pantheon_lines = parse_kernel_output(
+                out, err, returncode, test_name=component_name)
         elif proc_info.get("launch_error"):
             out = ""
             err = proc_info["launch_error"]
@@ -3014,7 +3238,13 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         else:
             out = profiler_out
             err = proc_info["stderr"]
-            throughput, unit, status, had_error, pantheon_lines = parse_kernel_output(out, err, p.returncode)
+            throughput, unit, status, had_error, pantheon_lines = parse_kernel_output(
+                out, err, p.returncode, test_name=component_name)
+        if status == "SKIP" and not had_error:
+            # The row says SKIP and why, so it is neither a measurement nor a
+            # pass: the verdict does not count it as a workload that ran.
+            skip_reasons[gpu] = find_skip_reason(out, err) or "workload skipped itself"
+            trial_status_by_gpu[gpu] = "SKIP"
         if had_error:
             run_had_errors = True
             trial_status_by_gpu[gpu] = "FAIL"
@@ -3068,7 +3298,7 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
 
             update_profile_manifest(
                 proc_info["profile_manifest"],
-                status="complete" if trial_status_by_gpu[gpu] == "PASS" else "failed",
+                status="complete" if trial_status_by_gpu[gpu] in ("PASS", "SKIP") else "failed",
                 artifacts={
                     "counter_files": proc_info["profile_files"],
                     "trace_files": proc_info["trace_files"],
@@ -3128,6 +3358,8 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
             counter_summary=counter_summary,
             throughput_variance=throughput_variance,
         )
+        if trial_status_by_gpu[gpu] == "SKIP":
+            row["Skip Reason"] = skip_reasons.get(gpu, "workload skipped itself")
         launch_errors = [item["launch_error"] for item in gpu_proc_infos if item.get("launch_error")]
         if launch_errors:
             row["Failure Stage"] = "launch"
@@ -3148,6 +3380,11 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         row["RAS Report"] = redact_host_paths(ras_path, build_paths=False)
         if ras_summary["status"] != "CLEAN":
             tprint(f"[RAS] GPU {gpu} {ras_summary['status']}: {row['RAS Error Delta']}")
+        for event in ras_summary.get("system_events", []):
+            if event not in reported_system_events:
+                reported_system_events.add(event)
+                tprint(f"[RAS] System-level kernel log line (names none of the GPUs under test, "
+                       f"not counted against a GPU): {event}")
 
         if profile and gpu_proc_infos:
             proc_info = gpu_proc_infos[0]
@@ -3213,6 +3450,7 @@ def main():
              "(for example 9.0) or TARGET_GFX (for example gfx942) for the cards the binaries are for.",
     )
     args = parser.parse_args()
+    install_termination_handlers()
 
     try:
         validate_run_parameters(args.duration, args.mem)

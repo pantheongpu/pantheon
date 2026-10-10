@@ -42,7 +42,7 @@ pantheon --test p2p_thrasher --gpu 0 --duration 30 --verify
 
 ## Output And Interpretation
 
-`Throughput` is reported in `GB/s` for combined bidirectional traffic. A result of `0.0 GB/s` with a skip message means the machine has only one GPU or the selected peer path does not support bidirectional P2P.
+`Throughput` is reported in `GB/s` for combined bidirectional traffic. A run that prints `Skipping: <reason>` (and no throughput line) means the machine has only one GPU or the selected peer path does not support bidirectional P2P.
 
 ## Failure Signals
 

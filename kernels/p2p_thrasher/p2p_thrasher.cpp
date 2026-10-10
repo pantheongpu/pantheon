@@ -99,9 +99,8 @@ int main(int argc, char* argv[]) {
     CHECK(hipGetDeviceCount(&device_count));
 
     if (device_count < 2) {
-        std::cout << "[PANTHEON] GPU " << primary_gpu << ": Skipping P2P_THRASHER (Only 1 GPU detected)." << std::endl;
-        std::cout << "Throughput: 0.0 GB/s" << std::endl;
-        return 0;
+        if (verify_mode) std::cout << "Verification: SKIPPED (only 1 GPU detected)" << std::endl;
+        return pantheon_skip(primary_gpu, "P2P_THRASHER", "only 1 GPU detected");
     }
 
     // Target the "next" GPU in the topology
@@ -114,9 +113,8 @@ int main(int argc, char* argv[]) {
     CHECK(hipDeviceCanAccessPeer(&can_access_bwd, peer_gpu, primary_gpu));
 
     if (!can_access_fwd || !can_access_bwd) {
-        std::cout << "[PANTHEON] GPU " << primary_gpu << ": Skipping P2P_THRASHER (Bidirectional P2P routing not supported to GPU " << peer_gpu << ")." << std::endl;
-        std::cout << "Throughput: 0.0 GB/s" << std::endl;
-        return 0;
+        if (verify_mode) std::cout << "Verification: SKIPPED (no bidirectional P2P routing)" << std::endl;
+        return pantheon_skip(primary_gpu, "P2P_THRASHER", "bidirectional P2P routing not supported to GPU " + std::to_string(peer_gpu));
     }
     
     // --- 1. SET SYNC MODE ACROSS BOTH DEVICES ---
