@@ -11,7 +11,11 @@ Exit codes follow the convention of Nagios plugins:
        SKIPPED        the job has no GPU
     1  WATCH          the card works, and something deserves a look
     2  FAULT          wrong data, uncorrectable errors, or a failed memory test
-    3  no result      nothing was tested, or the run did not finish
+    3  no result      nothing was tested, or the run did not finish: a workload
+                      that hung until the timeout, that exited without writing
+                      a result, or that skipped itself leaves the verdict
+                      INCOMPLETE, never HEALTHY (the Slurm epilog logs it and
+                      drains only when told to, see integrations/slurm)
 
 The verdict is read from the reports and not from Pantheon's exit code, which
 covers the workloads only: errors that a card counted during a run that
@@ -81,11 +85,27 @@ def split_ras_details(delta_text):
     return benign, serious
 
 
-def assess_gpu(rows, gpu_id, gpu_name):
-    """Turn the result rows of one GPU into a verdict with its reasons."""
+def limit_reason_set(value):
+    """The lower-case labels of a Limit Reason such as "Power|Thermal"."""
+    return {part.strip().lower() for part in str(value or "").split("|") if part.strip()}
+
+
+def is_skipped_row(row):
+    """True for the row of a workload that declined to run, which is not a pass."""
+    return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
+
+
+def assess_gpu(rows, gpu_id, gpu_name, unfinished=()):
+    """Turn the result rows of one GPU into a verdict with its reasons.
+
+    `unfinished` lists the workloads that were asked for and did not finish or
+    left no result. Whatever else the card showed, the node was not fully
+    tested, so the verdict is at best INCOMPLETE.
+    """
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
     faults, watches, notes, link_recovery = [], [], [], []
     ran = 0
+    skipped = []
     for row in mine:
         test = row.get("Test Name", "?")
         if row.get("Failure Stage"):
@@ -97,6 +117,11 @@ def assess_gpu(rows, gpu_id, gpu_name):
                 faults.append(f"{test} failed: memory errors detected or the workload aborted")
             else:
                 watches.append(f"{test} did not complete")
+            continue
+        if is_skipped_row(row):
+            skipped.append(test)
+            reason = row.get("Skip Reason")
+            notes.append(f"{test} was skipped" + (f" ({reason})" if reason else ""))
             continue
         if test != "baseline_metrics":
             ran += 1
@@ -113,10 +138,17 @@ def assess_gpu(rows, gpu_id, gpu_name):
 
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if str(row.get("Limit Reason", "") or "").lower() == "thermal":
-            watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C")
+        # The reason is the commonest label of the samples, joined with "|"
+        # when a sample had several ("Power|Thermal"), so it is read as a set.
+        reasons = limit_reason_set(row.get("Limit Reason"))
+        throttle_s = _num(row.get("Throttle Time (s)"))
+        if "thermal" in reasons:
+            seconds = f", {throttle_s:.0f} s throttled" if throttle_s > 0 else ""
+            watches.append(f"{test}: thermally throttled, GPU at {tmax:.0f} C{seconds}")
         elif tmax >= THERMAL_WATCH_C:
             watches.append(f"{test}: GPU reached {tmax:.0f} C")
+        if throttle_s > 0 and not (reasons - {"none", "n/a", "idle"}):
+            notes.append(f"{test}: throttled for {throttle_s:.0f} s, cause not recorded")
         if tmem >= MEMORY_THERMAL_WATCH_C:
             watches.append(f"{test}: memory reached {tmem:.0f} C")
 
@@ -131,7 +163,15 @@ def assess_gpu(rows, gpu_id, gpu_name):
         verdict = HEALTHY
     else:
         verdict = INCOMPLETE
-        notes.append("no workload completed")
+        if skipped:
+            notes.append(f"nothing ran: {len(skipped)} workload(s) skipped ({', '.join(skipped)})")
+        else:
+            notes.append("nothing ran: no workload completed")
+    unfinished = list(unfinished)
+    if unfinished:
+        if verdict in (HEALTHY, WATCH):
+            verdict = INCOMPLETE
+        watches = watches + unfinished
     scores = [f"{r.get('Test Name')} {r.get('Score')} {r.get('Unit')}" for r in mine
               if r.get("Unit") not in (None, "ERR") and not r.get("Failure Stage")]
     return {"gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
@@ -151,7 +191,7 @@ def row_result(row):
     return {
         "gpu_id": row.get("GPU ID"),
         "workload": row.get("Test Name"),
-        "score": None if row.get("Unit") == "ERR" else _maybe_num(row.get("Score")),
+        "score": None if row.get("Unit") in ("ERR", "SKIP") else _maybe_num(row.get("Score")),
         "unit": row.get("Unit"),
         "max_temp_c": _maybe_num(row.get("Max Temp (C)")),
         "max_power_w": _maybe_num(row.get("Max Power (W)")),
@@ -162,14 +202,35 @@ def row_result(row):
     }
 
 
-def load_reports(report_dir):
-    """Rows and GPUs from every report in the directory, each row once.
+def report_files(report_dir):
+    """The report files of a directory, as {path: (modification time, size)}."""
+    found = {}
+    for path in sorted(glob.glob(os.path.join(report_dir, "*.json"))):
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        found[path] = (info.st_mtime_ns, info.st_size)
+    return found
+
+
+def load_reports(report_dir, previous=None, since_ns=None):
+    """Rows and GPUs from the reports in the directory, each row once.
 
     Pantheon writes a report for the session and a second one for each workload
     that completed, holding the same row, so a row is counted once by content.
+
+    A reused --report-dir holds the reports of earlier runs, whose old FAULT
+    rows would condemn a repaired card for good and whose old HEALTHY rows
+    would hide that a new run wrote nothing. With `previous`, the listing the
+    directory had before the run (see report_files), only files that are new
+    or changed since are read; `since_ns` also accepts any file written after
+    that moment.
     """
     rows, gpus, kinds, seen = [], {}, set(), set()
-    for path in sorted(glob.glob(os.path.join(report_dir, "*.json"))):
+    for path, stamp in report_files(report_dir).items():
+        if previous is not None and previous.get(path) == stamp and not (since_ns and stamp[0] >= since_ns):
+            continue
         try:
             with open(path, encoding="utf-8") as handle:
                 report = json.load(handle)
@@ -284,18 +345,37 @@ def check(args, environ):
     workdir = args.report_dir if keep else tempfile.mkdtemp(prefix="pantheon-node-check-")
     os.makedirs(workdir, exist_ok=True)
     try:
-        ended_badly = {}
+        database = os.path.join(workdir, "database")
+        unfinished = {}
+        rows, gpus, kinds, seen = [], {}, set(), set()
         for workload in args.test:
+            # Read only what this workload wrote: the directory may hold the
+            # reports of earlier runs, and a hung workload must not be
+            # excused by a report that was there before it started.
+            before = report_files(database)
+            started = time.time_ns()
             code = run_pantheon(executable, workload, ids, args, workdir, environ)
+            new_rows, new_gpus, new_kinds = load_reports(database, previous=before, since_ns=started)
+            for new_row in new_rows:
+                key = json.dumps(new_row, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(new_row)
+            for gpu_id, name in new_gpus.items():
+                gpus.setdefault(gpu_id, name)
+            kinds |= new_kinds
             if code is None:
                 result["messages"].append(f"{workload}: stopped, it did not finish in time")
+                unfinished[workload] = f"{workload} did not finish in time and was stopped"
             elif code != 0:
-                ended_badly[workload] = f"pantheon exited with code {code} ({log_tail(workdir, workload)})"
-        rows, gpus, kinds = load_reports(os.path.join(workdir, "database"))
-        # A workload that failed on a card has a row that says so. Pantheon's
-        # own words are wanted only when it left no row behind.
-        reported = {r.get("Test Name") for r in rows}
-        result["messages"] += [f"{w}: {why}" for w, why in ended_badly.items() if w not in reported]
+                # A workload that failed on a card has a row that says so.
+                # Pantheon's own words are wanted only when it left no row.
+                if not new_rows:
+                    why = f"pantheon exited with code {code} ({log_tail(workdir, workload)})"
+                    result["messages"].append(f"{workload}: {why}")
+                    unfinished[workload] = f"{workload} left no result ({why})"
+            elif not new_rows:
+                unfinished[workload] = f"{workload} left no result"
     finally:
         if not keep:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -323,7 +403,8 @@ def check(args, environ):
     rows.sort(key=lambda r: asked.get(r.get("Test Name"), len(asked)))
     judged = ids if ids is not None else sorted({r.get("GPU ID") for r in rows}, key=str)
     for gpu_id in judged:
-        result["gpus"].append(assess_gpu(rows, gpu_id, gpus.get(gpu_id, "not found on this node")))
+        result["gpus"].append(assess_gpu(rows, gpu_id, gpus.get(gpu_id, "not found on this node"),
+                                         unfinished=list(unfinished.values())))
     result["verdict"] = max((g["verdict"] for g in result["gpus"]), key=lambda v: SEVERITY[v])
     result["results"] = [row_result(r) for r in rows if r.get("GPU ID") in judged]
     if result["backend"] == "cpu":
@@ -425,7 +506,8 @@ def write_textfile(path, text):
 def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
-        epilog="Exit codes: 0 HEALTHY, 1 WATCH, 2 FAULT, 3 nothing was tested or the run did not finish.")
+        epilog="Exit codes: 0 HEALTHY, 1 WATCH, 2 FAULT, 3 nothing was tested or the run did not finish "
+               "(a workload that hung, left no result or skipped itself is never HEALTHY).")
     parser.add_argument("--test", "-t", action="append", metavar="WORKLOAD",
                         help=f"workload or suite to run, can be given several times "
                              f"(default: {' and '.join(DEFAULT_WORKLOADS)})")

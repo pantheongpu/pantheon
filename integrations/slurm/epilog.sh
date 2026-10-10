@@ -22,6 +22,10 @@ NODE_CHECK=${PANTHEON_NODE_CHECK:-/usr/local/sbin/pantheon_node_check.py}
 WORKLOADS=${PANTHEON_WORKLOADS:-march_test}
 DURATION=${PANTHEON_DURATION:-10}
 LOG=${PANTHEON_LOG:-/var/log/pantheon-epilog.log}
+# Exit codes of the node check that drain the node. 2 is a fault. Add 3 to
+# drain also when a workload hung or left no result (verdict INCOMPLETE); the
+# same code is returned when pantheon is not installed, so it is off by default.
+DRAIN_CODES=${PANTHEON_DRAIN_CODES:-2}
 # nvcc or hipcc, and the pantheon command itself
 export PATH=${PANTHEON_PATH:-/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/bin}:$PATH
 # compiled workloads are kept here between runs
@@ -46,9 +50,10 @@ verdict=$(printf '%s\n' "$output" | head -n 1)
     [ "$code" -eq 0 ] || printf '%s\n' "$output" | sed -e '1d' -e 's/^/    /'
 } >> "$LOG" 2>/dev/null
 
-if [ "$code" -eq 2 ]; then
+case " $DRAIN_CODES " in *" $code "*)
     scontrol update NodeName="$SLURMD_NODENAME" State=DRAIN Reason="$(printf '%s' "$verdict" | cut -c1-120)"
-fi
+    ;;
+esac
 
 # Slurm drains a node when its epilog fails. Only a fault is a reason for
 # that, and the lines above have drained the node and said why. A warning, or

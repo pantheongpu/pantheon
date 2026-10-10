@@ -28,7 +28,7 @@ FAKE_PANTHEON = textwrap.dedent('''\
                                        if v.endswith("_VISIBLE_DEVICES")),
         }}) + "\\n")
     print("FINAL SUMMARY REPORT for", workload)
-    time.sleep(scenario.get("sleep", 0))
+    time.sleep(scenario.get("sleeps", {{}}).get(workload, scenario.get("sleep", 0)))
     rows = [r for r in scenario.get("rows", []) if r["Test Name"] == workload]
     if rows or scenario.get("empty_report"):
         os.makedirs("database", exist_ok=True)
@@ -145,6 +145,9 @@ def test_a_workload_that_is_no_memory_test_and_fails_is_a_watch(node, capsys):
 
 @pytest.mark.parametrize("fields, reason", [
     ({"Limit Reason": "Thermal", "Max Temp (C)": 95.0}, "thermally throttled, GPU at 95 C"),
+    ({"Limit Reason": "Power|Thermal", "Max Temp (C)": 95.0}, "thermally throttled, GPU at 95 C"),
+    ({"Limit Reason": "thermal", "Max Temp (C)": 95.0, "Throttle Time (s)": 12.0},
+     "thermally throttled, GPU at 95 C, 12 s throttled"),
     ({"Max Temp (C)": 91.0}, "GPU reached 91 C"),
     ({"Max Mem Temp (C)": 96.0}, "memory reached 96 C"),
     ({"RAS Status": "WARNING", "RAS Error Delta": "vendor_ras.pcie.bad_tlp +1972"},
@@ -203,7 +206,7 @@ def test_a_requested_card_without_a_result_is_incomplete(node, capsys):
     code, out = node.run(capsys, "--test", "memory_read", "--gpu", "0,1",
                          gpus=NVIDIA, rows=[row("memory_read", 0)])
     assert code == 3
-    assert out.splitlines()[0] == "PANTHEON INCOMPLETE: GPU 1 INCOMPLETE (no workload completed); 1 GPU HEALTHY"
+    assert out.splitlines()[0] == "PANTHEON INCOMPLETE: GPU 1 INCOMPLETE (nothing ran: no workload completed); 1 GPU HEALTHY"
 
 
 def test_an_epilog_tests_the_cards_of_the_job_by_node_number(node, capsys):
@@ -384,3 +387,83 @@ def test_grafana_dashboard_shows_every_exported_metric_and_nothing_else():
 
 def test_label_values_are_escaped():
     assert node_check._label('a "quoted" name\\') == 'a \\"quoted\\" name\\\\'
+
+
+def test_a_workload_that_hangs_leaves_the_node_incomplete_not_healthy(node, capsys):
+    rows = [row("memory_read", 0), row("memory_read", 1)]
+    code, out = node.run(capsys, "--timeout", "1", gpus=NVIDIA, rows=rows, sleeps={"march_test": 30})
+    assert code == 3
+    assert out.startswith("PANTHEON INCOMPLETE: ")
+    assert "march_test did not finish in time" in out
+    assert "GPU 0 (NVIDIA H100 PCIe): INCOMPLETE" in out
+
+
+def test_a_workload_that_exits_without_a_result_is_incomplete(node, capsys):
+    rows = [row("memory_read", 0), row("memory_read", 1)]
+    code, out = node.run(capsys, gpus=NVIDIA, rows=rows)
+    assert code == 3
+    assert "march_test left no result" in out
+    result = json.loads(node.run(capsys, "--json", gpus=NVIDIA, rows=rows)[1])
+    assert {g["verdict"] for g in result["gpus"]} == {"INCOMPLETE"}
+
+
+def test_a_fault_is_still_a_fault_when_another_workload_hung(node, capsys):
+    rows = [row("march_test", 0, Unit="ERR", Score=0.0)]
+    code, out = node.run(capsys, "--test", "march_test", "--test", "memory_read", "--timeout", "1",
+                         gpus=NVIDIA[:1], rows=rows, sleeps={"memory_read": 30}, exit={"march_test": 1})
+    assert code == 2
+    assert "march_test failed" in out
+
+
+def skipped(workload, gpu=0):
+    return row(workload, gpu, Unit="SKIP", Status="SKIP", Score=0.0,
+               **{"Skip Reason": "[PANTHEON] Skipping: needs two GPUs"})
+
+
+def test_a_run_in_which_everything_skipped_is_not_healthy(node, capsys):
+    rows = [skipped("memory_read"), skipped("march_test")]
+    code, out = node.run(capsys, gpus=NVIDIA[:1], rows=rows)
+    assert code == 3
+    assert out.startswith("PANTHEON INCOMPLETE: ")
+    assert "nothing ran" in out
+    assert "needs two GPUs" in out
+
+
+def test_a_skipped_workload_is_noted_and_not_counted_as_run(node, capsys):
+    rows = [row("memory_read", 0), skipped("march_test")]
+    code, out = node.run(capsys, "--json", gpus=NVIDIA[:1], rows=rows)
+    result = json.loads(out)
+    assert code == 0 and result["verdict"] == "HEALTHY"
+    assert any("march_test was skipped" in n for n in result["gpus"][0]["notes"])
+    skipped_result = [r for r in result["results"] if r["workload"] == "march_test"][0]
+    assert skipped_result["score"] is None
+
+
+def test_throttling_with_the_cause_unrecorded_is_a_note_not_a_finding(node, capsys):
+    fields = {"Limit Reason": "None", "Throttle Time (s)": 4.0}
+    code, out = node.run(capsys, gpus=NVIDIA, rows=both_workloads(**fields))
+    assert code == 0
+    assert "throttled for 4 s, cause not recorded" in out
+
+
+def test_a_reused_report_directory_does_not_keep_old_faults(node, capsys, tmp_path):
+    kept = tmp_path / "kept"
+    (kept / "database").mkdir(parents=True)
+    old = {"gpu_static_info": NVIDIA,
+           "test_results": [row("march_test", 0, Unit="ERR", Score=0.0)]}
+    (kept / "database" / "pantheon_report_20200101-000000.json").write_text(json.dumps(old))
+    rows = [row("memory_read", 0), row("memory_read", 1),
+            row("march_test", 0, Unit="march-ops/s"), row("march_test", 1, Unit="march-ops/s")]
+    code, out = node.run(capsys, "--report-dir", str(kept), gpus=NVIDIA, rows=rows)
+    assert code == 0, out
+    assert out.startswith("PANTHEON HEALTHY: ")
+
+
+def test_old_healthy_reports_do_not_hide_a_run_that_wrote_nothing(node, capsys, tmp_path):
+    kept = tmp_path / "kept"
+    (kept / "database").mkdir(parents=True)
+    old = {"gpu_static_info": NVIDIA, "test_results": [row("memory_read", 0), row("march_test", 0)]}
+    (kept / "database" / "pantheon_report_20200101-000000.json").write_text(json.dumps(old))
+    code, out = node.run(capsys, "--report-dir", str(kept), gpus=NVIDIA, rows=[])
+    assert code == 3
+    assert "pantheon wrote no report" in out

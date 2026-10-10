@@ -309,3 +309,15 @@ def test_gemm_auto_format_keeps_the_default_unless_clearly_beaten():
     assert "GEMM_BF16, GEMM_FP16, GEMM_TF32, GEMM_FP8, GEMM_FP32" in header
     margin = re.search(r"int margin_pct = (\d+);", header)
     assert margin and int(margin.group(1)) >= 15, "margin below the measured probe noise"
+
+
+def test_every_shared_header_triggers_rebuilds():
+    """A header that is missing from COMMON_HEADERS can be edited without make
+    rebuilding anything, while the Python digest already calls the cache stale."""
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    common = [line for line in makefile.splitlines() if line.startswith("COMMON_HEADERS")][0]
+    for header in sorted(Path("kernels/common").rglob("*.h")):
+        path = header.as_posix()
+        covered = path in common or (
+            "$(wildcard kernels/common/nvenc/*.h)" in common and header.parent.as_posix() == "kernels/common/nvenc")
+        assert covered, f"{path} is not in COMMON_HEADERS"
