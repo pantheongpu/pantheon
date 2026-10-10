@@ -6,20 +6,37 @@
 // Models paged/ragged KV-cache maintenance: sparse reads, per-token updates,
 // and non-sequential page selection. This deliberately stresses allocation-like
 // cache churn rather than a sequential bandwidth path.
+//
+// What --verify detects. Threads pick their pages from a hash of their own
+// state, so two threads can update the same entry and the final contents are a
+// race outcome that no reference can predict. The check therefore does not
+// compare against a golden value. Instead every entry carries a checksum in its
+// .w lane, computed over .x, .y and .z by whoever wrote it, and the verifier
+// recomputes it for every entry after the last launch. That catches a bit flip
+// in ANY lane (x, y, z, or the checksum itself) of an entry at rest after its
+// last update, and an entry that was never written validly. It does not catch a
+// corrupted read that was folded into a later, correctly checksummed write, nor
+// corruption of an entry that a later update overwrote, nor errors in the sink.
+// A PASS is "no entry is inconsistent at the end", not "every update was right".
 __device__ __forceinline__ unsigned int churn_hash(unsigned int value) { value ^= value >> 17; value *= 0xed5ad4bbu; value ^= value >> 11; value *= 0xac4c1b51u; return value ^ (value >> 15); }
-__global__ void initialize_churn(uint4* cache, size_t count, int inject_error) { size_t idx = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x; for (; idx < count; idx += stride) { unsigned int x = churn_hash(static_cast<unsigned int>(idx)); if (inject_error && idx == 1337) cache[idx] = make_uint4(0, 0, 0, 0); else cache[idx] = make_uint4(x | 1u, x + 7u, x ^ 0xC2B2AE35u, x + 19u); } }
+// Checksum over the three payload lanes. Nonzero for an all-zero payload, so a
+// zeroed entry is inconsistent rather than accidentally valid.
+__device__ __forceinline__ unsigned int churn_check(unsigned int x, unsigned int y, unsigned int z) { return churn_hash(x ^ (y * 0x9E3779B1u) ^ ((z << 13) | (z >> 19))) ^ 0xA5A5A5A5u; }
+__device__ __forceinline__ uint4 churn_entry(unsigned int x, unsigned int y, unsigned int z) { return make_uint4(x, y, z, churn_check(x, y, z)); }
+__global__ void initialize_churn(uint4* cache, size_t count, int inject_error) { size_t idx = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x; for (; idx < count; idx += stride) { unsigned int x = churn_hash(static_cast<unsigned int>(idx)); if (inject_error && idx == 1337) cache[idx] = make_uint4(0, 0, 0, 0); else cache[idx] = churn_entry(x | 1u, x + 7u, x ^ 0xC2B2AE35u); } }
 __global__ void kv_cache_churn_kernel(uint4* cache, size_t count, unsigned int* sink, int loops) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x; unsigned int state = churn_hash(static_cast<unsigned int>(tid) + 17u);
     for (int iteration = 0; iteration < loops; ++iteration) {
         // 256 entries acts as a page; the two offsets imitate a ragged cache lookup and append.
         size_t page = (static_cast<size_t>(state) * 256u) % (count - 256u); size_t read_idx = page + ((state >> 8) & 255u); size_t write_idx = page + ((state >> 16) & 255u);
         uint4 prior = cache[read_idx]; state = churn_hash(state ^ prior.x ^ prior.z);
-        cache[write_idx] = make_uint4((state | 1u), prior.y ^ state, prior.z + 1u, prior.w ^ 0x9E3779B9u);
+        cache[write_idx] = churn_entry((state | 1u), prior.y ^ state, prior.z + 1u);
     }
     sink[tid] = state;
 }
-__global__ void inject_churn_error(uint4* cache, size_t count) { if (count > 1337) cache[1337] = make_uint4(0, 0, 0, 0); }
-__global__ void verify_churn(const uint4* cache, size_t count, unsigned int* errors) { size_t idx = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x; for (; idx < count; idx += stride) if (cache[idx].x == 0) atomicAdd(errors, 1); }
+// Flip one bit in the .z lane (not .x): proves the verifier looks past the first 32 bits.
+__global__ void inject_churn_error(uint4* cache, size_t count) { if (count > 1337) cache[1337].z ^= 0x00010000u; }
+__global__ void verify_churn(const uint4* cache, size_t count, unsigned int* errors) { size_t idx = blockIdx.x * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.x; for (; idx < count; idx += stride) { uint4 v = cache[idx]; if (v.w != churn_check(v.x, v.y, v.z)) atomicAdd(errors, 1); } }
 int main(int argc, char* argv[]) {
     if (argc < 4) return 1; int gpu_id = atoi(argv[1]), duration = atoi(argv[2]), mem_pct = atoi(argv[3]); int block_size = 256, grid_size = 0, kernel_loops = 128, warmup_iters = 3, sync_mode = 2; bool verify_mode = false; int inject_error = 0;
     for (int i = 1; i < argc; ++i) { std::string arg(argv[i]); if (arg == "--verify") verify_mode = true; else if (arg == "--inject_error") inject_error = 1; else if (arg == "--block_size" && i + 1 < argc) block_size = atoi(argv[++i]); else if (arg == "--grid_size" && i + 1 < argc) grid_size = atoi(argv[++i]); else if (arg == "--kernel_loops" && i + 1 < argc) kernel_loops = atoi(argv[++i]); else if (arg == "--warmup_iters" && i + 1 < argc) warmup_iters = atoi(argv[++i]); else if (arg == "--sync_mode" && i + 1 < argc) sync_mode = atoi(argv[++i]); }
