@@ -617,23 +617,46 @@ def gpu_pci_bdf(platform_name, gpu_id):
     return ""
 
 
-def linux_aer_snapshot(platform_name, gpu_id, bdf=None):
+def parse_aer_counters(text):
+    """Per-counter integers from an aer_dev_* sysfs file, or None for any other layout.
+
+    The kernel prints one "Name count" line per error type, ending with a
+    TOTAL_ERR_* line, so the file as a whole is not a number.
+    """
+    counters = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            return None
+        counters[parts[0]] = int(parts[1])
+    return counters or None
+
+
+def linux_aer_snapshot(platform_name, gpu_id, bdf=None, sysfs_root="/sys"):
     if platform.system().lower() != "linux":
         return ras_source("unavailable", detail="PCIe AER is collected only on Linux")
     if bdf is None:
         bdf = gpu_pci_bdf(platform_name, gpu_id)
     if not bdf:
         return ras_source("unavailable", detail="GPU PCI bus identifier was unavailable")
-    device_path = os.path.realpath(os.path.join("/sys/bus/pci/devices", bdf))
+    sysfs_root = os.path.realpath(sysfs_root)
+    device_path = os.path.realpath(os.path.join(sysfs_root, "bus", "pci", "devices", bdf))
     metrics = {}
     current = device_path
-    while current.startswith("/sys/"):
+    while current.startswith(sysfs_root.rstrip("/") + "/"):
         for path in glob.glob(os.path.join(current, "aer_*")):
             try:
                 with open(path, "r", encoding="utf-8") as handle:
-                    metrics[f"{os.path.basename(current)}/{os.path.basename(path)}"] = ras_value(handle.read().strip())
+                    text = handle.read().strip()
             except OSError:
                 continue
+            key = f"{os.path.basename(current)}/{os.path.basename(path)}"
+            counters = parse_aer_counters(text)
+            if counters:
+                for name, count in counters.items():
+                    metrics[f"{key}/{name}"] = ras_value(count)
+            else:
+                metrics[key] = ras_value(text)
         parent = os.path.dirname(current)
         if parent == current:
             break
@@ -3403,8 +3426,7 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
     return rows, run_had_errors
 
 
-def main():
-    run_had_errors = False
+def build_arg_parser():
     parser = argparse.ArgumentParser(description="PANTHEON: Universal GPU Stress Suite")
     parser.add_argument("--version", action="version", version=f"%(prog)s {PANTHEON_VERSION}")
     parser.add_argument("--test", type=str, default="all",
@@ -3430,7 +3452,12 @@ def main():
              "For installations that compile ahead of time: set PANTHEON_BUILD_CACHE_DIR, and PANTHEON_CUDA_ARCH "
              "(for example 9.0) or TARGET_GFX (for example gfx942) for the cards the binaries are for.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    run_had_errors = False
+    args = build_arg_parser().parse_args()
     install_termination_handlers()
 
     try:

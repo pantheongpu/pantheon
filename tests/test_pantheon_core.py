@@ -2463,6 +2463,100 @@ def test_platform_from_env_still_runs_on_a_gpu_box_without_a_compiler(monkeypatc
         pantheon.detect_platform("auto")
 
 
+# --- PCIe AER on a synthetic sysfs tree -------------------------------------
+
+AER_CORRECTABLE = ("RxErr {rx}\nBadTLP {tlp}\nBadDLLP 0\nRollover 0\nTimeout 0\n"
+                   "NonFatalErr 0\nCorrIntErr 0\nHeaderOF 0\nTOTAL_ERR_COR {total}\n")
+AER_FATAL = ("Undefined 0\nDLP {dlp}\nSDES 0\nTLP {tlp}\nFCP 0\nCmpltTO 0\nCmpltAbrt 0\n"
+             "UnxCmplt 0\nRxOF 0\nMalfTLP 0\nECRC 0\nUnsupReq 0\nACSViol 0\nUncorrIntErr 0\n"
+             "BlockedTLP 0\nAtomicOpBlocked 0\nTLPBlockedErr 0\nPoisonTLPBlocked 0\n"
+             "TOTAL_ERR_FATAL {total}\n")
+
+
+def _sysfs_with_gpu(tmp_path, bdf="0000:01:00.0", bad_tlp=0, fatal_tlp=0):
+    """A sysfs tree whose GPU sits under a root port, as /sys lays it out."""
+    root = tmp_path / "sys"
+    port = root / "devices" / "pci0000:00" / "0000:00:01.0"
+    gpu = port / bdf
+    gpu.mkdir(parents=True)
+    (gpu / "aer_dev_correctable").write_text(AER_CORRECTABLE.format(rx=0, tlp=bad_tlp, total=bad_tlp))
+    (gpu / "aer_dev_nonfatal").write_text(AER_FATAL.format(dlp=0, tlp=0, total=0))
+    (gpu / "aer_dev_fatal").write_text(AER_FATAL.format(dlp=0, tlp=fatal_tlp, total=fatal_tlp))
+    (port / "aer_rootport_total_err_cor").write_text("0\n")
+    devices = root / "bus" / "pci" / "devices"
+    devices.mkdir(parents=True)
+    (devices / bdf).symlink_to(gpu)
+    return root
+
+
+def _nvidia_smi_prints(monkeypatch, bus_id):
+    """nvidia-smi pads the PCI domain to eight digits; so does this stand-in."""
+    class Done:
+        returncode = 0
+        stdout = bus_id + "\n"
+        stderr = ""
+    monkeypatch.setattr(pantheon.subprocess, "run", lambda *_a, **_k: Done())
+    monkeypatch.setattr(pantheon.platform, "system", lambda: "Linux")
+
+
+def _aer_delta(monkeypatch, tmp_path, **after_counters):
+    before_root = _sysfs_with_gpu(tmp_path / "before")
+    after_root = _sysfs_with_gpu(tmp_path / "after", **after_counters)
+    _nvidia_smi_prints(monkeypatch, "00000000:01:00.0")
+    snapshots = []
+    for sysfs in (before_root, after_root):
+        source = pantheon.linux_aer_snapshot("CUDA", 0, sysfs_root=str(sysfs))
+        snapshots.append({"sources": {"linux_pcie_aer": source}})
+    delta = pantheon.diff_ras_snapshots(*snapshots)
+    return delta, pantheon.summarize_ras_delta(delta, *snapshots)
+
+
+def test_aer_snapshot_finds_a_device_nvidia_smi_names_with_an_eight_digit_domain(monkeypatch, tmp_path):
+    _nvidia_smi_prints(monkeypatch, "00000000:01:00.0")
+    source = pantheon.linux_aer_snapshot("CUDA", 0, sysfs_root=str(_sysfs_with_gpu(tmp_path)))
+    assert source["status"] == "supported"
+    assert source["detail"] == "PCI BDF 0000:01:00.0"
+    assert source["metrics"]["0000:01:00.0/aer_dev_fatal/TLP"] == {"status": "supported", "value": 0, "unit": "count"}
+
+
+def test_aer_snapshot_reads_each_counter_of_a_multi_line_file_as_a_number(monkeypatch, tmp_path):
+    _nvidia_smi_prints(monkeypatch, "00000000:01:00.0")
+    root = _sysfs_with_gpu(tmp_path, bad_tlp=3)
+    metrics = pantheon.linux_aer_snapshot("CUDA", 0, sysfs_root=str(root))["metrics"]
+    assert metrics["0000:01:00.0/aer_dev_correctable/BadTLP"]["value"] == 3
+    assert metrics["0000:01:00.0/aer_dev_correctable/TOTAL_ERR_COR"]["value"] == 3
+    # A single-number file keeps its own name, and no value is left as a string.
+    assert metrics["0000:00:01.0/aer_rootport_total_err_cor"]["value"] == 0
+    assert all(isinstance(m["value"], int) for m in metrics.values())
+
+
+def test_a_rise_in_a_fatal_aer_counter_reaches_the_ras_summary(monkeypatch, tmp_path):
+    delta, summary = _aer_delta(monkeypatch, tmp_path, fatal_tlp=2)
+    rows = {r["metric"]: r["delta"] for r in delta["metrics"]}
+    assert rows["0000:01:00.0/aer_dev_fatal/TLP"] == 2
+    assert summary["status"] == "ERROR"
+    assert any("aer_dev_fatal/TLP +2" in d for d in summary["details"])
+
+
+def test_a_rise_in_a_correctable_aer_counter_is_a_warning(monkeypatch, tmp_path):
+    _delta, summary = _aer_delta(monkeypatch, tmp_path, bad_tlp=5)
+    assert summary["status"] == "WARNING"
+    assert any("aer_dev_correctable/BadTLP +5" in d for d in summary["details"])
+
+
+def test_unchanged_aer_counters_stay_clean(monkeypatch, tmp_path):
+    _delta, summary = _aer_delta(monkeypatch, tmp_path)
+    assert summary["status"] == "CLEAN"
+    assert summary["details"] == []
+
+
+def test_parse_aer_counters_accepts_only_name_count_lines():
+    assert pantheon.parse_aer_counters("RxErr 0\nBadTLP 4") == {"RxErr": 0, "BadTLP": 4}
+    assert pantheon.parse_aer_counters("0") is None
+    assert pantheon.parse_aer_counters("") is None
+    assert pantheon.parse_aer_counters("not supported") is None
+
+
 # --- skipped, failed and non-finite runs ---------------------------------------
 
 def test_a_skip_line_on_stdout_or_stderr_is_a_skip_with_its_reason():
