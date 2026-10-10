@@ -424,4 +424,44 @@ __device__ __host__ __forceinline__ uint4 load_nt(void* addr) {
     return ret;
 }
 
+// True if ANY of the four 32-bit lanes of `got` differs from `want`. Verifiers
+// must compare the whole 128-bit element: checking only `.x` leaves 96 of every
+// 128 bits unexamined, so a stuck or flipped bit in y, z or w passes unseen.
+__device__ __host__ __forceinline__ bool pantheon_uint4_differs(uint4 got, uint4 want) {
+    return got.x != want.x || got.y != want.y || got.z != want.z || got.w != want.w;
+}
+
+// The first lane of `got` that differs from `want` (x, y, z, w in that order), or
+// `fallback` when none does. Lets a fault log record a representative bad word.
+__device__ __host__ __forceinline__ unsigned int pantheon_uint4_first_bad_lane(uint4 got, uint4 want, unsigned int fallback) {
+    if (got.x != want.x) return got.x;
+    if (got.y != want.y) return got.y;
+    if (got.z != want.z) return got.z;
+    if (got.w != want.w) return got.w;
+    return fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Exit contract with pantheon.py
+//
+//   deliberate skip (platform, hardware or library the workload cannot use):
+//       a line "Skipping: <reason>" on STDOUT, no "Throughput:" line, exit 0.
+//   failure (the workload should have run and could not):
+//       the reason on STDERR, non-zero exit.
+//
+// A workload that printed "Throughput: 0.0" and exited 0 for either case was
+// recorded as a clean PASS, so a broken runtime looked like a slow card. The
+// "[PANTHEON] ... Skipping" line is kept for runners that predate the plain one.
+// ---------------------------------------------------------------------------
+inline int pantheon_skip(int gpu_id, const std::string& workload, const std::string& reason) {
+    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping " << workload << " (" << reason << ")." << std::endl;
+    std::cout << "Skipping: " << reason << std::endl;
+    return 0;
+}
+
+inline int pantheon_fail(const std::string& reason) {
+    std::cerr << "[PANTHEON ERROR] " << reason << std::endl;
+    return 1;
+}
+
 #endif // PANTHEON_COMMON_H

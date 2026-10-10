@@ -48,15 +48,6 @@ def decode_throttle_mask(mask):
     return "|".join(labels) if labels else "None"
 
 
-def limit_reason_is_thermal(label):
-    """True if a decode_throttle_mask label names a thermal reason.
-
-    The label joins every active reason with "|" ("Power|Thermal"), so it is
-    matched by token and never compared whole.
-    """
-    return "thermal" in (token.strip().lower() for token in str(label or "").split("|"))
-
-
 def _nvml_field_number(field):
     """The numeric value of one NVML field reading, by its declared value type."""
     return getattr(field.value, _NVML_VALUE_MEMBERS.get(getattr(field, "valueType", 1), "uiVal"))
@@ -190,7 +181,9 @@ class HardwareMonitor:
                 h = self.history[gid]
                 
                 # Safe retrieval with defaults
-                def get_last(key, default=0):
+                # A series nothing was read into is written as N/A, not 0: the
+                # time series must not claim a measurement that was never taken.
+                def get_last(key, default="N/A"):
                     return h[key][-1] if h[key] else default
 
                 t_c = get_last('temp_core')
@@ -222,14 +215,11 @@ class HardwareMonitor:
 
     # --- NVIDIA POLLING (Crash-Proof Version) ---
     def _poll_nvidia(self, gpu_ids):
-        # Helper to safely parse floats/ints from "N/A" strings
-        def safe_parse(val, type_func):
-            try:
-                val = val.strip()
-                if val == "N/A" or val == "[Not Supported]": return 0
-                if type_func == int and val.startswith("0x"): return int(val, 16)
-                return type_func(val)
-            except: return 0
+        # The GPU index is the only CLI field that must parse; sensor readings
+        # go through _smi_number, which returns None for an absent one.
+        def parse_index(val):
+            try: return int(val.strip())
+            except Exception: return None
 
         if self.nvml_active:
             # NVML Library Mode (Best)
@@ -273,22 +263,22 @@ class HardwareMonitor:
                         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
                         h['mem_used'].append(mem.used / (1024.0 * 1024.0))
                         h['mem_total'].append(mem.total / (1024.0 * 1024.0))
-                    except:
-                        h['mem_used'].append(0)
-                        h['mem_total'].append(0)
+                    except Exception: pass
 
+                    # Fan, PCIe link and voltage follow the same rule as every
+                    # sensor above: an unreadable one is skipped, never stored as
+                    # 0. Passively cooled datacenter cards have no fan, and a
+                    # report of "0 % fan" or "PCIe x0" is a reading nobody took.
+                    # Voltage is not exposed by NVML at all, so those series stay
+                    # empty and the report says N/A.
                     try: h['fan_pct'].append(pynvml.nvmlDeviceGetFanSpeed(handle))
-                    except: h['fan_pct'].append(0)
-
-                    # Voltage (Rarely supported on Linux Consumer)
-                    h['volts_core'].append(0)
-                    h['volts_soc'].append(0)
+                    except Exception: pass
 
                     try: h['pcie_gen'].append(pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle))
-                    except: h['pcie_gen'].append(0)
+                    except Exception: pass
 
                     try: h['pcie_width'].append(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))
-                    except: h['pcie_width'].append(0)
+                    except Exception: pass
 
                     # Throttle Reason
                     try:
@@ -312,37 +302,53 @@ class HardwareMonitor:
                     parts = line.split(',')
                     if len(parts) < 12: continue # Skip malformed lines
 
-                    idx = safe_parse(parts[0], int)
+                    idx = parse_index(parts[0])
                     if idx in self.history:
                         h = self.history[idx]
                         
                         # Absent sensors are skipped rather than recorded as 0, the
                         # rule the NVML path already follows. nvidia-smi prints
                         # "[N/A]", which safe_parse turned into 0 C and 0 W.
+                        # The same goes for fan, PCIe link and memory. Voltage is
+                        # not queried, so its series stay empty (N/A in the report).
                         for key, raw in (('temp_core', parts[1]), ('temp_mem', parts[2]),
                                          ('pwr', parts[3]), ('clk_core', parts[4]),
-                                         ('gpu_util', parts[9])):
+                                         ('fan_pct', parts[5]), ('pcie_gen', parts[6]),
+                                         ('pcie_width', parts[7]), ('gpu_util', parts[9]),
+                                         ('mem_used', parts[10]), ('mem_total', parts[11])):
                             reading = self._smi_number(raw)
                             if reading is not None:
                                 h[key].append(reading)
-                        h['fan_pct'].append(safe_parse(parts[5], float))
-                        h['volts_core'].append(0)
-                        h['volts_soc'].append(0)
-                        h['pcie_gen'].append(safe_parse(parts[6], int))
-                        h['pcie_width'].append(safe_parse(parts[7], int))
-                        
+
                         h['throttle'].append(decode_throttle_mask(self._smi_mask(parts[8])))
-                        h['mem_used'].append(safe_parse(parts[10], float))
-                        h['mem_total'].append(safe_parse(parts[11], float))
 
             except Exception as e:
                 self._warn_once("nvidia_poll", f"[MONITOR] nvidia-smi polling failed: {e}.")
 
 
-    def _poll_amd(self, gpu_ids):
+    # Without --showuse and --showmeminfo rocm-smi never prints utilization or
+    # memory use, so those columns used to be 0.0 on every AMD row.
+    _ROCM_BASE = ["rocm-smi", "-v", "-P", "-t", "-c", "-f"]
+    _ROCM_USAGE = ["--showuse", "--showmeminfo", "vram"]
+
+    def _rocm_json(self):
+        """rocm-smi's JSON for the sensors we read; the extra usage flags are
+        dropped if this rocm-smi release rejects them, so a missing option costs
+        only utilization and memory, never the temperature and power readings."""
         try:
-            out = subprocess.check_output(["rocm-smi", "-v", "-P", "-t", "-c", "-f", "--json"]).decode()
-            data = json.loads(out)
+            return json.loads(subprocess.check_output(
+                self._ROCM_BASE + self._ROCM_USAGE + ["--json"]).decode())
+        except Exception:
+            return json.loads(subprocess.check_output(self._ROCM_BASE + ["--json"]).decode())
+
+    def _poll_amd(self, gpu_ids):
+        # Every reading below is appended only when rocm-smi printed a number. A
+        # sensor the card lacks (or an option this rocm-smi does not know) leaves
+        # its series empty, which the aggregate reports as N/A. It used to append
+        # 0, which published "0.0 C" memory temperatures and zero memory size.
+        parse = lambda v: self._parse_metric(v, default=None)
+        try:
+            data = self._rocm_json()
 
             for gid in gpu_ids:
                 card_key = f"card{gid}"
@@ -356,72 +362,82 @@ class HardwareMonitor:
                     for key in ('gpu_util', 'mem_used', 'mem_total', 'elapsed'):
                         h.setdefault(key, [])
 
-                    t_junction = 0
-                    t_edge = 0
-                    t_memory = 0
-
+                    t_junction = t_edge = t_memory = None
                     for k, v in c.items():
                         kl = k.lower()
                         if "temperature" in kl:
-                            try:
-                                val = self._parse_metric(v)
-                                # New drivers use "junction" as the primary hotspot
-                                if "junction" in kl:
-                                    t_junction = val
-                                elif "edge" in kl:
-                                    t_edge = val
-                                # Capture dedicated memory sensor
-                                if "memory" in kl:
-                                    t_memory = val
-                            except: pass
+                            val = parse(v)
+                            if val is None:
+                                continue
+                            # New drivers use "junction" as the primary hotspot
+                            if "junction" in kl:
+                                t_junction = val
+                            elif "edge" in kl:
+                                t_edge = val
+                            # Capture dedicated memory sensor
+                            if "memory" in kl:
+                                t_memory = val
 
-                    h['temp_core'].append(t_junction or t_edge)
-                    h['temp_mem'].append(t_memory)
+                    t_core = t_junction if t_junction is not None else t_edge
+                    if t_core is not None:
+                        h['temp_core'].append(t_core)
+                    if t_memory is not None:
+                        h['temp_mem'].append(t_memory)
 
                     # --- 2. POWER (Fuzzy Search) ---
-                    p_val = 0
+                    p_val = None
                     for k, v in c.items():
                         kl = k.lower()
                         # Matches "Average Graphics Package Power" OR "Current Socket Graphics Package Power"
                         if "power" in kl and ("average" in kl or "socket" in kl):
-                            try: p_val = self._parse_metric(v)
-                            except: pass
-                    h['pwr'].append(p_val)
+                            val = parse(v)
+                            if val is not None:
+                                p_val = val
+                    if p_val is not None:
+                        h['pwr'].append(p_val)
 
                     # --- 3. CLOCK (Standard Search) ---
-                    clk_val = 0
+                    clk_val = None
                     for k, v in c.items():
                         if "sclk" in k.lower() and "(" in str(v):
-                            try:
-                                # Extracts 800 from (800Mhz)
-                                clk_val = self._parse_metric(v)
-                            except: pass
-                    h['clk_core'].append(clk_val)
+                            # Extracts 800 from (800Mhz)
+                            val = parse(v)
+                            if val is not None:
+                                clk_val = val
+                    if clk_val is not None:
+                        h['clk_core'].append(clk_val)
 
-                    util_val = 0
-                    mem_used = 0
-                    mem_total = 0
+                    # --- 4. UTILIZATION AND VRAM (--showuse, --showmeminfo vram) ---
+                    # "GPU use (%)", "VRAM Total Memory (B)", "VRAM Total Used
+                    # Memory (B)". The memory figures are bytes; the report is MiB.
+                    util_val = mem_used = mem_total = None
                     for k, v in c.items():
                         kl = k.lower()
-                        try:
-                            if "utilization" in kl or "gpu use" in kl:
-                                util_val = self._parse_metric(v)
-                            elif "memory" in kl and "use" in kl:
-                                mem_used = self._parse_metric(v)
-                            elif "memory" in kl and ("total" in kl or "capacity" in kl):
-                                mem_total = self._parse_metric(v)
-                        except: pass
-                    h['gpu_util'].append(util_val)
-                    h['mem_used'].append(mem_used)
-                    h['mem_total'].append(mem_total)
+                        val = parse(v)
+                        if val is None:
+                            continue
+                        if kl.startswith("gpu use"):
+                            util_val = val
+                        elif "vram" in kl and "used" in kl:
+                            mem_used = val / (1024.0 * 1024.0)
+                        elif "vram" in kl and "total" in kl:
+                            mem_total = val / (1024.0 * 1024.0)
+                    if util_val is not None:
+                        h['gpu_util'].append(util_val)
+                    if mem_used is not None:
+                        h['mem_used'].append(mem_used)
+                    if mem_total is not None:
+                        h['mem_total'].append(mem_total)
 
-                    # --- 4. FAN ---
-                    f_pct = 0
+                    # --- 5. FAN ---
+                    f_pct = None
                     for k, v in c.items():
                         if "fan" in k.lower() and "%" in str(v):
-                            try: f_pct = self._parse_metric(v)
-                            except: pass
-                    h['fan_pct'].append(f_pct)
+                            val = parse(v)
+                            if val is not None:
+                                f_pct = val
+                    if f_pct is not None:
+                        h['fan_pct'].append(f_pct)
 
         except Exception as e:
             self._warn_once("amd_poll", f"[MONITOR] rocm-smi polling failed: {e}.")
@@ -474,7 +490,8 @@ class HardwareMonitor:
                 "peak_mem_used": safe_max(samples.get('mem_used', [])),
                 "mem_total": safe_max(samples.get('mem_total', [])),
                 "energy_wh": energy_wh,
-                "thermal_rise": float(round((max(samples['temp_core']) - samples['temp_core'][0]), 1)) if len(samples['temp_core']) > 1 else 0,
+                "thermal_rise": (float(round((max(samples['temp_core']) - samples['temp_core'][0]), 1))
+                                 if len(samples['temp_core']) > 1 else (0 if samples['temp_core'] else "N/A")),
                 "throttle_time": float(round(throttle_samples * sample_interval, 1)),
                 "max_fan": safe_max(samples['fan_pct']),
                 "max_volts_core": safe_max(samples['volts_core']),

@@ -78,7 +78,8 @@ jobs:
           # the injected case proves the check is wired up.
           fail=0
           for w in memory_read memory_write march_test galpat memory_hammer \
-                   atomic_virus llm_decode moe_router allocation_fragmentation; do
+                   atomic_virus llm_decode llm_prefill graph_replay kv_cache_churn \
+                   memory_thermal_asym moe_router allocation_fragmentation; do
             if ! ./build/"$w" 0 2 5 --verify >/tmp/clean.log 2>&1; then
               echo "::error::${w} failed a clean verification"; fail=1; continue
             fi

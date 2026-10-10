@@ -50,7 +50,9 @@ __global__ void verify_decode_kv(const uint4* kv, size_t count, unsigned int* er
     size_t stride = blockDim.x * gridDim.x;
     for (; idx < count; idx += stride) {
         unsigned int value = decode_hash(static_cast<unsigned int>(idx));
-        if (kv[idx].x != (value | 1u)) atomicAdd(errors, 1);
+        // All four lanes, matching initialize_decode_kv; `.x` alone misses 96 of 128 bits.
+        uint4 want = make_uint4(value | 1u, value ^ 0xA5A5A5A5u, value + 17u, value ^ 0x5A5A5A5Au);
+        if (pantheon_uint4_differs(kv[idx], want)) atomicAdd(errors, 1);
     }
 }
 
