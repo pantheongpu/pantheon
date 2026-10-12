@@ -6,7 +6,7 @@ why** — using structured patterns from memory-test literature rather than
 whichever access order happens to run fastest.
 
 ```bash
-python3 pantheon.py --suite diagnostics --duration 300 --gpu 0 --mem 90
+python3 pantheon.py --test diagnostics --duration 300 --gpu 0 --mem 90
 ```
 
 | Workload | Fault class | Cost |
