@@ -395,15 +395,17 @@ a march test, a retention check and one power-limited compute load.
 
 The summary report (`results/<timestamp>/summary.xlsx`) contains detailed "Pro" metrics. Here is how to interpret them:
 
-* **Efficiency (MB/J):** Calculated as `Throughput / Watts`.
+* **Efficiency:** Throughput per watt of average board power. Bandwidth workloads report `GB/s × 1024 / W` (MB/J), compute workloads `TFLOPS × 1000 / W` (GFLOP/J), and every other workload its raw unit per watt, so compare it only between runs of the same workload.
     * **Healthy:** Stays relatively constant throughout the run.
     * **Degraded:** If this drops significantly during a 1-hour burn-in, your silicon is "leaking" current (thermal runaway) or the VRMs are becoming inefficient due to heat.
 * **PCIe Link:** Verifies the physical connection speed (e.g., `Gen4 x16`).
     * **Red Flag:** If it drops to `x8` or `Gen3` under load, check your riser cable, motherboard slot, or GPU mounting pressure.
 * **Throttle Reason:** Tells you *why* performance is limited.
-    * `[POWER]`: **Normal.** The card hit its TDP limit (expected for viruses).
-    * `[THERMAL]`: **Critical.** The core is overheating (typically >83°C Edge or >110°C Junction). Check thermal paste.
-    * `[VOLTAGE]`: The VRMs cannot supply enough stable voltage to maintain the clock.
+    * `Power`: **Normal.** The card hit its TDP limit (expected for viruses).
+    * `Thermal`: **Critical.** The core is overheating (typically >83°C Edge or >110°C Junction). Check thermal paste.
+    * `Power Brake`: The platform asserted its power-brake signal and forced the clock down.
+    * `Idle`: The card was idle during the sample. `None` means no limit was reported and `N/A` that the driver could not say.
+    * Several reasons can be reported together, joined with `|` (for example `Power|Thermal`).
 * **Junction (Hotspot) vs. Edge:** * On newer AMD drivers, the primary temperature reported is the **Junction**. This is the absolute hottest single point on the silicon die. 
     * It is normal for Junction to be 15-25°C hotter than the traditional "Edge" average.
 * **Max Mem Temp:** The hottest point on your VRAM (Memory/GDDR6X). Keep this under 100°C to avoid permanent damage.
