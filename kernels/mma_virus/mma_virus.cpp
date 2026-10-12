@@ -251,9 +251,8 @@ int main(int argc, char* argv[]) {
     CHECK(hipSetDevice(gpu_id));
 
 #if !WMMA_SUPPORTED
-    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping MMA VIRUS (Hardware Matrix Cores or headers not available)." << std::endl;
-    std::cout << "Throughput: 0.0 TFLOPS" << std::endl;
-    return 0;
+    if (verify_mode) std::cout << "Verification: SKIPPED (no matrix-core support)" << std::endl;
+    return pantheon_skip(gpu_id, "MMA VIRUS", "Hardware Matrix Cores or headers not available");
 #else
 
     hipDeviceProp_t prop; 

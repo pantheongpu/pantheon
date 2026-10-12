@@ -68,16 +68,16 @@ int main(int argc, char* argv[]) {
     CHECK(hipSetDevice(gpu_id));
 
 #if !NVENC_SUPPORTED
-    std::cerr << "[PANTHEON] GPU " << gpu_id << ": Skipping MEDIA_ENC_VIRUS (Requires NVIDIA CUDA)." << std::endl;
-    std::cout << "Throughput: 0.0 FPS" << std::endl;
-    return 0;
+    // Deliberate skip: NVENC exists only on NVIDIA. Stated on stdout, exit 0.
+    if (verify_mode) std::cout << "Verification: SKIPPED (NVENC requires NVIDIA CUDA)" << std::endl;
+    return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", "requires NVIDIA CUDA");
 #else
 
     // 1. Initialize CUDA Driver and Hook Primary Context
-    if (cuInit(0) != CUDA_SUCCESS) {
-        std::cerr << "[PANTHEON ERROR] cuInit(0) failed." << std::endl;
-        std::cout << "Throughput: 0.0 FPS" << std::endl;
-        return 0;
+    // A failed driver init is a failure, not a 0.0 FPS measurement.
+    CUresult cu_init_result = cuInit(0);
+    if (cu_init_result != CUDA_SUCCESS) {
+        return pantheon_fail("cuInit(0) failed with CUresult " + std::to_string((int)cu_init_result) + ".");
     }
 
     CUdevice cuDev = 0;
@@ -89,12 +89,16 @@ int main(int argc, char* argv[]) {
     // 2. Dynamically Load the NVIDIA Encode Driver
     void* encode_lib = dlopen("libnvidia-encode.so.1", RTLD_LAZY);
     if (!encode_lib) {
-        std::cerr << "[PANTHEON ERROR] libnvidia-encode.so.1 not found! Is the driver installed?" << std::endl;
-        std::cout << "Throughput: 0.0 FPS" << std::endl;
-        return 0;
+        // The NVENC library ships with the driver but not with every container
+        // image. Deliberate skip, with the reason on stdout.
+        if (verify_mode) std::cout << "Verification: SKIPPED (libnvidia-encode.so.1 not found)" << std::endl;
+        return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", "libnvidia-encode.so.1 not found; install the NVIDIA driver's video encode library, and in a container expose the video capability (NVIDIA_DRIVER_CAPABILITIES=all)");
     }
 
     auto NvEncCreate = (PNVENCODEAPICREATEINSTANCE)dlsym(encode_lib, "NvEncodeAPICreateInstance");
+    if (!NvEncCreate) {
+        return pantheon_fail("libnvidia-encode.so.1 does not export NvEncodeAPICreateInstance.");
+    }
     
     NV_ENCODE_API_FUNCTION_LIST nvenc = { NV_ENCODE_API_FUNCTION_LIST_VER };
     NVENC_CHECK(NvEncCreate(&nvenc));
@@ -105,7 +109,13 @@ int main(int argc, char* argv[]) {
     sessionParams.device = cuCtx;
     sessionParams.apiVersion = NVENCAPI_VERSION;
     void* encoder = nullptr;
-    NVENC_CHECK(nvenc.nvEncOpenEncodeSessionEx(&sessionParams, &encoder));
+    NVENCSTATUS open_status = nvenc.nvEncOpenEncodeSessionEx(&sessionParams, &encoder);
+    if (open_status == NV_ENC_ERR_NO_ENCODE_DEVICE || open_status == NV_ENC_ERR_UNSUPPORTED_DEVICE) {
+        // Data-center parts such as the A100 and H100 have no NVENC engine.
+        if (verify_mode) std::cout << "Verification: SKIPPED (this GPU has no NVENC engine)" << std::endl;
+        return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", "this GPU has no NVENC engine (NVENCSTATUS " + std::to_string((int)open_status) + ")");
+    }
+    NVENC_CHECK(open_status);
 
     // 4. Initialize 4K HEVC Constant Quality Preset (P7)
     NV_ENC_INITIALIZE_PARAMS initParams = { NV_ENC_INITIALIZE_PARAMS_VER };

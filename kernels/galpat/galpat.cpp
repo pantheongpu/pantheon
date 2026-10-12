@@ -63,17 +63,23 @@ __global__ void galpat_kernel(uint4* data, size_t region_begin, size_t region_co
 
             // Read the other cell: it must still hold its background. A change
             // here means writing b disturbed i, or the decoder aliased them.
+            // All four 32-bit lanes are compared: a stuck bit in y, z or w is
+            // as real a coupling fault as one in x.
             uint4 other = load_nt(&data[i]);
             unsigned int other_expected = galpat_expected(i, init_pattern);
-            if (other.x != other_expected) {
-                pantheon_fault_log_append(fault_log, (unsigned long long)i, other_expected, other.x);
+            uint4 other_want = make_uint4(other_expected, other_expected, other_expected, other_expected);
+            if (pantheon_uint4_differs(other, other_want)) {
+                pantheon_fault_log_append(fault_log, (unsigned long long)i, other_expected,
+                                          pantheon_uint4_first_bad_lane(other, other_want, other.x));
                 atomicAdd(err_count, 1u);
             }
 
             // Read the galloping cell back: it must still hold the inversion.
             uint4 gallop = load_nt(&data[b]);
-            if (gallop.x != inverted) {
-                pantheon_fault_log_append(fault_log, (unsigned long long)b, inverted, gallop.x);
+            uint4 gallop_want = make_uint4(inverted, inverted, inverted, inverted);
+            if (pantheon_uint4_differs(gallop, gallop_want)) {
+                pantheon_fault_log_append(fault_log, (unsigned long long)b, inverted,
+                                          pantheon_uint4_first_bad_lane(gallop, gallop_want, gallop.x));
                 atomicAdd(err_count, 1u);
             }
         }
@@ -85,9 +91,10 @@ __global__ void galpat_kernel(uint4* data, size_t region_begin, size_t region_co
 
 __global__ void inject_galpat_error(uint4* data, size_t region_begin, size_t region_count) {
     // Corrupt a cell that the gallop will read as a neighbour before it ever
-    // becomes the galloping cell itself.
+    // becomes the galloping cell itself. The flip is in the .w lane on purpose:
+    // it proves the check covers all 128 bits, not just the first 32.
     if (blockIdx.x == 0 && threadIdx.x == 0 && region_count > 2) {
-        data[region_begin + 1].x ^= 0xBADBEEF;
+        data[region_begin + 1].w ^= 0xBADBEEF;
     }
 }
 

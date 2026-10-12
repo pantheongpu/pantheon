@@ -43,9 +43,8 @@ int main(int argc, char** argv) {
     int devices = 0;
     CHECK(hipGetDeviceCount(&devices));
     if (devices < 2) {
-        std::cout << "[PANTHEON] Skipping ALL_REDUCE: fewer than two GPUs." << std::endl;
-        std::cout << "Throughput: 0.0 GB/s" << std::endl;
-        return 0;
+        if (verify) std::cout << "Verification: SKIPPED (fewer than two GPUs)" << std::endl;
+        return pantheon_skip(primary, "ALL_REDUCE", "fewer than two GPUs");
     }
 
     int peer = (primary + 1) % devices;

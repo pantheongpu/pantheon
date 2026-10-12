@@ -49,7 +49,9 @@ __global__ void graph_verify_input(const uint4* data, size_t count, unsigned int
     size_t stride = blockDim.x * gridDim.x;
     for (; idx < count; idx += stride) {
         unsigned int value = graph_hash(static_cast<unsigned int>(idx));
-        if (data[idx].x != (value | 1u)) atomicAdd(errors, 1);
+        // All four lanes, matching graph_initialize; `.x` alone misses 96 of 128 bits.
+        uint4 want = make_uint4(value | 1u, value ^ 0x9E3779B9u, value + 17u, value ^ 0xC2B2AE35u);
+        if (pantheon_uint4_differs(data[idx], want)) atomicAdd(errors, 1);
     }
 }
 

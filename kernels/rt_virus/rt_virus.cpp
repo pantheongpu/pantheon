@@ -199,9 +199,8 @@ int main(int argc, char* argv[]) {
     std::string arch(prop.gcnArchName);
     if (arch.find("gfx9") != std::string::npos) {
         std::cout << "[PANTHEON] GPU " << gpu_id << " Architecture (" << arch << ") is CDNA." << std::endl;
-        std::cout << "[PANTHEON] Skipping RT_VIRUS: CDNA silicon physically lacks Hardware Ray Accelerators." << std::endl;
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0; // Exit cleanly without failing the suite
+        if (verify_mode) std::cout << "Verification: SKIPPED (CDNA has no ray accelerators)" << std::endl;
+        return pantheon_skip(gpu_id, "RT_VIRUS", "CDNA silicon physically lacks Hardware Ray Accelerators");
     }
 #endif
 
@@ -218,15 +217,20 @@ int main(int argc, char* argv[]) {
     // ---------------------------------------------------------
     // NVIDIA OPTIX IMPLEMENTATION
     // ---------------------------------------------------------
-    if (cuInit(0) != CUDA_SUCCESS) {
-        std::cerr << "[PANTHEON ERROR] cuInit(0) failed." << std::endl;
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0;
+    // A broken runtime is a failure, not a 0.0 measurement: exit non-zero with
+    // the reason on stderr. Only a missing OptiX library is a deliberate skip.
+    CUresult cu_init_result = cuInit(0);
+    if (cu_init_result != CUDA_SUCCESS) {
+        return pantheon_fail("cuInit(0) failed with CUresult " + std::to_string((int)cu_init_result) + ".");
     }
 
-    if (optixInit() != OPTIX_SUCCESS) {
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0;
+    OptixResult optix_init_result = optixInit();
+    if (optix_init_result == OPTIX_ERROR_LIBRARY_NOT_FOUND) {
+        if (verify_mode) std::cout << "Verification: SKIPPED (OptiX runtime library not found)" << std::endl;
+        return pantheon_skip(gpu_id, "RT_VIRUS", "OptiX runtime library (libnvoptix.so.1) not found; install a driver that ships OptiX, and in a container expose the graphics capability (NVIDIA_DRIVER_CAPABILITIES=all)");
+    }
+    if (optix_init_result != OPTIX_SUCCESS) {
+        return pantheon_fail("optixInit() failed with OptixResult " + std::to_string((int)optix_init_result) + ".");
     }
 
     OptixDeviceContextOptions options = {};
@@ -392,9 +396,7 @@ int main(int argc, char* argv[]) {
     hiprtContext rtContext = nullptr;
     
     if (hiprtCreateContext(HIPRT_API_VERSION, ctxInput, rtContext) != hiprtSuccess) {
-        std::cerr << "[PANTHEON ERROR] hiprtCreateContext failed! Ensure libhiprt64.so is installed." << std::endl;
-        std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-        return 0;
+        return pantheon_fail("hiprtCreateContext failed. Ensure libhiprt64.so is installed and matches this GPU's ROCm release.");
     }
 
     const int num_triangles = 1000000;
@@ -555,13 +557,11 @@ int main(int argc, char* argv[]) {
     // ---------------------------------------------------------
     // FALLBACK
     // ---------------------------------------------------------
-    std::cout << "[PANTHEON] GPU " << gpu_id << ": Skipping RT VIRUS (no ray tracing backend compiled in; set OPTIX_PATH to an NVIDIA OptiX SDK include directory, or ENABLE_HIPRT=1 on AMD, and rerun -- see README)." << std::endl;
     if (verify_mode) {
         // State this explicitly: a requested verification that cannot run
         // must never look like one that ran and passed.
         std::cout << "Verification: SKIPPED (no ray tracing backend available)" << std::endl;
     }
-    std::cout << "Throughput: 0.0 GRays/s" << std::endl;
-    return 0;
+    return pantheon_skip(gpu_id, "RT VIRUS", "no ray tracing backend compiled in; set OPTIX_PATH to an NVIDIA OptiX SDK include directory, or ENABLE_HIPRT=1 on AMD, and rerun -- see README");
 #endif
 }

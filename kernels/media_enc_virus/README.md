@@ -31,7 +31,7 @@ pantheon --test media_enc_virus --gpu 0 --duration 30 --verify
 
 ## Output And Interpretation
 
-`Throughput` is reported in `FPS`. A skip with `0.0 FPS` means the platform is not NVIDIA CUDA or the NVENC driver library is unavailable.
+`Throughput` is reported in `FPS`. When the platform is not NVIDIA CUDA, `libnvidia-encode.so.1` is missing, or the GPU has no NVENC engine, the workload prints `Skipping: <reason>` and exits 0 without a throughput line, and the run is recorded as a skip. A CUDA driver initialization failure or an NVENC call that fails exits non-zero with the reason on stderr and is recorded as a failure.
 
 ## Source
 
