@@ -97,7 +97,7 @@ On one B200, 15 s, default shape, with the other streams running: BF16 907 TFLOP
 
 ### Choosing the format
 
-The default is BF16: the tensor path every Ampere and later part has, and the same format on every card, so scores from different GPUs compare. A part or library with no BF16 algorithm (Turing and earlier) keeps the WMMA stream and prints why.
+The default is BF16: the tensor path every Ampere and later part has, and the same format on every card, so scores from different GPUs compare. A part without BF16 tensor cores (Volta and Turing, before Ampere) keeps the WMMA stream and prints why. The test checks the compute capability itself, because cuBLASLt will run BF16 on those parts, far more slowly, instead of refusing it. `--gemm_type bf16` on such a part is honoured, with a warning; `--gemm_type fp16` uses the FP16 vendor GEMM there.
 
 `--gemm_type auto` is opt-in. It tries the formats in a fixed order, BF16, FP16, TF32, FP8, FP32, runs each accepted one alone for `--gemm_probe_ms`, reads the board power from NVML (matched by PCI bus ID), and replaces BF16 only by a format that draws at least `--gemm_margin` percent more. Without NVML, or with `--gemm_probe_ms 0`, it stays on BF16.
 
@@ -139,7 +139,7 @@ build/omni_virus 0 60 90 --mma_pct 75 --launch_ms 400
 | `mma_groups` | `4` | Operand reloads per iteration. |
 | `mma_reuse` | `1` | MMA passes per operand reload. |
 | `gemm` | `1` | Use the vendor GEMM when it can be loaded. `0` forces WMMA. |
-| `gemm_type` | `bf16` | `bf16`, `fp16`, `tf32`, `fp32`, `fp8` or `auto` (pick by measured power). |
+| `gemm_type` | `bf16` (the WMMA stream on parts without BF16 tensor cores) | `bf16`, `fp16`, `tf32`, `fp32`, `fp8` or `auto` (pick by measured power). |
 | `gemm_size` | `8192` | Sets `gemm_m`, `gemm_n` and `gemm_k` together. |
 | `gemm_m`, `gemm_n`, `gemm_k` | `8192` | GEMM shape, each rounded down to a multiple of 16. |
 | `gemm_probe_ms` | `1500` | Per-format power probe used by `auto`. `0` skips it. |
