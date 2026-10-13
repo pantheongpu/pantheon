@@ -143,3 +143,40 @@ jobs:
             echo "::error::Expected at least 40 binaries, compiled ${count}"
             exit 1
           fi
+
+  hip-compile:
+    name: HIP compile (ROCm ${{ matrix.rocm }}, ${{ matrix.gfx }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 6.4 is what the ROCm container image ships, 7.x is current. The
+          # two disagree about warp intrinsics, which is how fused_attention
+          # went unbuilt on every ROCm release without any test noticing.
+          # gfx942 takes the MFMA path, gfx1100 the WMMA path.
+          - rocm: "6.4.4"
+            gfx: gfx942
+          - rocm: "7.2.4"
+            gfx: gfx942
+          - rocm: "7.2.4"
+            gfx: gfx1100
+    container:
+      image: rocm/dev-ubuntu-24.04:${{ matrix.rocm }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # No GPU here, and none needed: hipcc cross-compiles for the named
+      # target, and HIP-RT is absent so rt_virus builds its dummy kernel. A
+      # plain make stops at the first kernel that fails, so one workload that
+      # does not build is a red job instead of a quiet "unavailable" on AMD.
+      - name: Compile every kernel for HIP
+        run: |
+          make PLATFORM=HIP TARGET_GFX=${{ matrix.gfx }} -j"$(nproc)"
+          count="$(ls build | grep -vc '^\.')"
+          echo "Compiled ${count} binaries"
+          if [ "${count}" -lt 40 ]; then
+            echo "::error::Expected at least 40 binaries, compiled ${count}"
+            exit 1
+          fi
