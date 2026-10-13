@@ -21,7 +21,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pantheon
-          image: ghcr.io/pantheongpu/pantheon:1.2.2
+          image: ghcr.io/pantheongpu/pantheon:1.2.3
           args: ["--test", "march_test", "--duration", "120", "--gpu", "all"]
           workingDir: /reports
           resources:
