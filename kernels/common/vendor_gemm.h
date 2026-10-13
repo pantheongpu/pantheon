@@ -32,7 +32,7 @@
 // ---------------------------------------------------------------------------
 struct PantheonGemmOptions {
     int enabled = 1;                  // --gemm 0 forces the portable path
-    std::string type = "bf16";        // bf16 | fp16 | tf32 | fp32 | fp8 | auto (opt-in: picks by measured power)
+    std::string type;                 // empty = the default (bf16, see pantheon_gemm_default_has_bf16) | bf16 | fp16 | tf32 | fp32 | fp8 | auto (opt-in: picks by measured power)
     int probe_ms = 1500;              // per-format power probe for auto; 0 = skip
     int margin_pct = 15;              // auto keeps the default format unless another beats it by this much
     int m = 8192, n = 8192, k = 8192; // C is m x n, contracted over k
@@ -52,6 +52,19 @@ struct PantheonGemmOptions {
         return false;
     }
 };
+
+// Whether the format used when none is named should be BF16 on this part.
+//
+// BF16 tensor cores start at NVIDIA Ampere (compute capability 8.0). The
+// library cannot be relied on to say no below that: on a Tesla T4 (compute
+// capability 7.5) the BF16 default scored 2.79 TFLOPS where the WMMA stream
+// reaches about 121, so cuBLASLt does not refuse BF16 there. The answer comes
+// from the part. Pass the NVIDIA compute capability's major number, or -1 when
+// the part is not NVIDIA or the number is unknown; AMD parts are left to
+// hipBLASLt, which refuses what it has no kernels for.
+static inline bool pantheon_gemm_default_has_bf16(int nvidia_cc_major) {
+    return nvidia_cc_major < 0 || nvidia_cc_major >= 8;
+}
 
 // Operand formats, the way gpu-fryer offers them. Each one exercises a
 // different datapath at a different rate, so the choice is a workload choice:
@@ -497,8 +510,19 @@ static inline bool pantheon_gemm_pick(int device, int probe_ms, int margin_pct, 
 static inline int pantheon_gemm_setup(PantheonGemm& g, PantheonGemmOptions& o, int device) {
     if (!o.enabled) return 0;
     PantheonGemmType type = GEMM_BF16;
+    bool named = !o.type.empty();
     bool auto_type = (o.type == "auto");
-    if (!auto_type && !PantheonGemm::parse_type(o.type.c_str(), &type)) {
+    int cc_major = -1;
+#if PANTHEON_GEMM_CUDA
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device) == hipSuccess) cc_major = prop.major;
+#endif
+    if (!named && !pantheon_gemm_default_has_bf16(cc_major)) {
+        std::cout << "[PANTHEON] This part has no BF16 tensor cores (they start at Ampere, compute capability 8.0); "
+                  << "using the portable WMMA tensor stream. --gemm_type fp16 selects the FP16 vendor GEMM." << std::endl;
+        return 0;
+    }
+    if (!auto_type && named && !PantheonGemm::parse_type(o.type.c_str(), &type)) {
         std::cerr << "[PANTHEON] Unknown --gemm_type '" << o.type
                   << "'. Use auto, bf16, fp16, tf32, fp32 or fp8." << std::endl;
         return -1;
@@ -506,6 +530,10 @@ static inline int pantheon_gemm_setup(PantheonGemm& g, PantheonGemmOptions& o, i
     if (o.m < 16 || o.n < 16 || o.k < 16) {
         std::cerr << "[PANTHEON] --gemm_m/n/k must each be at least 16." << std::endl;
         return -1;
+    }
+    if (named && type == GEMM_BF16 && !auto_type && !pantheon_gemm_default_has_bf16(cc_major)) {
+        std::cout << "[PANTHEON] BF16 was requested on a part without BF16 tensor cores; expect a far lower rate."
+                  << std::endl;
     }
     // Round to 16: every format's tensor path wants it, FP8 requires it.
     o.m &= ~15; o.n &= ~15; o.k &= ~15;
