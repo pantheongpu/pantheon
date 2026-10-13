@@ -69,6 +69,19 @@ __device__ __forceinline__ unsigned int ai_hash(unsigned int value) {
     value *= 0x846ca68bu; return value ^ (value >> 16);
 }
 
+// Exchange a float with the lane whose id differs by lane_mask. The reduction
+// below only ever combines lanes inside one group of 32, so a plain xor shuffle
+// is enough on AMD. The masked __shfl_xor_sync is not: ROCm 6.x does not
+// declare it, and ROCm 7 declares it but rejects a 32-bit mask. The unmasked
+// __shfl_xor exists in every ROCm release.
+__device__ __forceinline__ float ai_shfl_xor(float value, int lane_mask) {
+#ifdef __HIP_PLATFORM_AMD__
+    return __shfl_xor(value, lane_mask);
+#else
+    return __shfl_xor_sync(0xffffffffu, value, lane_mask);
+#endif
+}
+
 __global__ void ai_initialize(uint4* data, size_t count, int inject_error) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
@@ -117,7 +130,7 @@ __global__ void ai_workload_kernel(const uint4* data, size_t count, unsigned int
         }
         // Reduce across the warp, as an attention tile does.
         for (int shift = 16; shift > 0; shift >>= 1) {
-            denom += __shfl_xor_sync(0xffffffffu, denom, shift);
+            denom += ai_shfl_xor(denom, shift);
         }
         acc = fmaf(acc, 0.999f, denom * 1.0e-6f);
     }
