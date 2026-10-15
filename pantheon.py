@@ -2245,7 +2245,8 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
     procs = []
     
     for gpu in gpu_ids:
-        workload_cmd = [binary, str(device_ordinal(gpu)), str(duration), str(mem_pct)] + config["args"]
+        ordinal, workload_env = workload_launch(test_name, gpu, platform)
+        workload_cmd = [binary, str(ordinal), str(duration), str(mem_pct)] + config["args"]
         cmd = list(workload_cmd)
        
         if verify:
@@ -2281,17 +2282,18 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
             cmd = build_counter_command(platform, profile_tools, profile_metrics, artifact_dir, workload_cmd)
             trace_cmd = build_trace_command(platform, profile_tools, artifact_dir, workload_cmd)
 
-        device_note = "" if device_ordinal(gpu) == gpu else f", device {device_ordinal(gpu)} to the workload"
+        device_note = "" if ordinal == gpu else f", device {ordinal} to the workload"
         log(f"Launching {test_name} on GPU {gpu}{device_note} (Alloc: {mem_pct}% VRAM)...")
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 universal_newlines=True, start_new_session=True)
+                                 universal_newlines=True, start_new_session=True, env=workload_env)
         except OSError as exc:
             message = f"Could not launch {test_name} on GPU {gpu}: {exc}"
             tprint(f"[ERROR] {message}")
             procs.append({
                 "gpu": gpu,
                 "process": None,
+                "workload_env": workload_env,
                 "test_name": test_name,
                 "workload_cmd": shell_join(workload_cmd),
                 "workload_argv": list(workload_cmd),
@@ -2313,6 +2315,7 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
         proc_info = {
             "gpu": gpu,
             "process": p,
+            "workload_env": workload_env,
             "test_name": test_name,
             "workload_cmd": shell_join(workload_cmd),
             "workload_argv": list(workload_cmd),
@@ -2450,6 +2453,35 @@ def resolve_visible_devices(platform_name, gpu_count, gpu_uuids=None, environ=No
 def device_ordinal(gpu):
     """The device number a workload must be given to run on this GPU."""
     return DEVICE_ORDINALS.get(gpu, gpu)
+
+
+def workload_launch(test_name, gpu, platform_name, environ=None):
+    """The device number and environment a workload is started with.
+
+    A CUDA program told to use device 2 still opens a context on device 0 first,
+    about 400 MiB, before it switches. Workloads started together, one per card
+    and each taking 99% of its card's memory, then take each other's headroom on
+    GPU 0, and a small allocation there fails with "out of memory". So each
+    workload is started with only its own card visible, as device 0.
+
+    Returns (device number, environment). The environment is None, meaning the
+    workload inherits ours and gets the translated number, when it must see more
+    than its own card:
+      * the platform is not CUDA (the AMD variables are not translated yet);
+      * the workload needs peers or a collective (MIN_GPUS_FOR_TEST);
+      * CUDA_VISIBLE_DEVICES names a MIG device, which Pantheon cannot match to a card.
+    """
+    environ = os.environ if environ is None else environ
+    if (platform_name != "CUDA"
+            or MIN_GPUS_FOR_TEST.get(test_name, 1) > 1
+            or "MIG-" in (environ.get("CUDA_VISIBLE_DEVICES") or "").upper()):
+        return device_ordinal(gpu), None
+    isolated = dict(environ)
+    # Pantheon numbers cards as nvidia-smi does, and main() sets this order so
+    # CUDA's numbers are the same.
+    isolated["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    isolated["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    return 0, isolated
 
 
 def visible_gpu_static_info(gpu_info):
@@ -3158,6 +3190,8 @@ def run_profile_telemetry_pass(test_name, proc_infos, gpu_ids, duration, monitor
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
                     start_new_session=True,
+                    # The argv carries the device number that environment gives.
+                    env=proc_info.get("workload_env"),
                 )
                 # It runs in a session of its own, so an interrupt that does
                 # not reach it would leave it loading the GPU.
