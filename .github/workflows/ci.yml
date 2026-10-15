@@ -155,13 +155,17 @@ jobs:
           # 6.4 is what the ROCm container image ships, 7.x is current. The
           # two disagree about warp intrinsics, which is how fused_attention
           # went unbuilt on every ROCm release without any test noticing.
-          # gfx942 takes the MFMA path, gfx1100 the WMMA path.
+          # gfx942 takes the MFMA path, gfx1100 the WMMA path. gfx1030 has no
+          # matrix instructions at all: mma_virus and transformer_virus build
+          # as deliberate skips and omni_virus builds without its tensor stream.
           - rocm: "6.4.4"
             gfx: gfx942
           - rocm: "7.2.4"
             gfx: gfx942
           - rocm: "7.2.4"
             gfx: gfx1100
+          - rocm: "7.2.4"
+            gfx: gfx1030
     container:
       image: rocm/dev-ubuntu-24.04:${{ matrix.rocm }}
     steps:

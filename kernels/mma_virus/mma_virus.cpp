@@ -13,8 +13,12 @@
     #define WMMA_SUPPORTED 1
 #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
     // If the server has the rocwmma headers installed, compile the payload.
-    // This bypasses the need for a brittle architecture whitelist.
-    #if __has_include(<rocwmma/rocwmma.hpp>)
+    // This bypasses the need for a brittle architecture whitelist, except for
+    // the parts the build system flags as having no matrix instructions at
+    // all: rocWMMA stops the compile on those with a static assertion.
+    #if defined(PANTHEON_AMD_NO_MATRIX)
+        #define WMMA_SUPPORTED 0
+    #elif __has_include(<rocwmma/rocwmma.hpp>)
         #include <rocwmma/rocwmma.hpp>
         namespace wmma = rocwmma; // Map NVIDIA's namespace to AMD's
         #define WMMA_SUPPORTED 1
@@ -252,7 +256,11 @@ int main(int argc, char* argv[]) {
 
 #if !WMMA_SUPPORTED
     if (verify_mode) std::cout << "Verification: SKIPPED (no matrix-core support)" << std::endl;
+#if defined(PANTHEON_AMD_NO_MATRIX)
+    return pantheon_skip(gpu_id, "MMA VIRUS", "this AMD GPU has no matrix cores (needs CDNA MFMA or RDNA3 and later WMMA)");
+#else
     return pantheon_skip(gpu_id, "MMA VIRUS", "Hardware Matrix Cores or headers not available");
+#endif
 #else
 
     hipDeviceProp_t prop; 

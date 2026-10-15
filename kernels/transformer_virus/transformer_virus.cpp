@@ -14,7 +14,14 @@
         // The build system sets PANTHEON_AMD_WMMA_TARGET from the detected
         // architecture *family*, so no individual model number is hardcoded
         // here and a new member of either family needs no source change.
-        #if defined(PANTHEON_AMD_WMMA_TARGET)
+        // Parts with no matrix instructions at all (RDNA1/RDNA2, pre-MFMA
+        // Vega) are flagged PANTHEON_AMD_NO_MATRIX: the MFMA builtin and
+        // rocWMMA both fail to compile there, so the kernel is built from the
+        // portable fallback and main() skips before launching it.
+        #if defined(PANTHEON_AMD_NO_MATRIX)
+          #define PLATFORM_AMD_CDNA 0
+          #define PLATFORM_AMD_WMMA 0
+        #elif defined(PANTHEON_AMD_WMMA_TARGET)
           #define PLATFORM_AMD_CDNA 0
           #if defined(PANTHEON_ENABLE_EXPERIMENTAL_WMMA) && __has_include(<rocwmma/rocwmma.hpp>)
             #include <rocwmma/rocwmma.hpp>
@@ -279,6 +286,14 @@ int main(int argc, char* argv[]) {
 #endif
 
     CHECK(hipSetDevice(gpu_id));
+
+#if defined(PANTHEON_AMD_NO_MATRIX)
+    // The portable fallback kernel issues plain FMAs, so its rate would not be
+    // the matrix throughput this test counts. Skip rather than report it.
+    if (verify_mode) std::cout << "Verification: SKIPPED (no matrix-core support)" << std::endl;
+    return pantheon_skip(gpu_id, "TRANSFORMER VIRUS", "this AMD GPU has no matrix cores (needs CDNA MFMA or RDNA3 and later WMMA)");
+#endif
+
     hipDeviceProp_t prop; CHECK(hipGetDeviceProperties(&prop, gpu_id));
 
     // --- 2. EXPLICIT OCCUPANCY ---
