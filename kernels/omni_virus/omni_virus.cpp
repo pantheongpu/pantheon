@@ -17,7 +17,13 @@
     using namespace nvcuda;
     #define OMNI_WMMA 1
 #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
-    #if __has_include(<rocwmma/rocwmma.hpp>)
+    // The build system flags the parts with no matrix instructions at all
+    // (RDNA1/RDNA2, pre-MFMA Vega). rocWMMA stops the compile on those with a
+    // static assertion, so they build without the tensor stream, like a machine
+    // without the rocWMMA headers.
+    #if defined(PANTHEON_AMD_NO_MATRIX)
+        #define OMNI_WMMA 0
+    #elif __has_include(<rocwmma/rocwmma.hpp>)
         #include <rocwmma/rocwmma.hpp>
         namespace wmma = rocwmma;
         #define OMNI_WMMA 1

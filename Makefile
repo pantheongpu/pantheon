@@ -104,7 +104,19 @@ else
         CXXFLAGS += -DPANTHEON_AMD_WMMA_TARGET=1
         $(info [DEBUG] WMMA-capable family detected ($(GFX_FAMILY)); enabling WMMA path.)
     endif
-  
+
+    # Parts with no matrix instructions at all: RDNA1 and RDNA2 (gfx10xx) and
+    # the Vega-era gfx9 parts that predate MFMA (gfx908 is the first with it).
+    # rocWMMA stops the build on them with a static assertion and the MFMA
+    # builtins need the mai-insts feature, so the matrix workloads failed to
+    # compile and were recorded as FAIL. With this flag they build as a
+    # deliberate skip (mma_virus, transformer_virus) or without their tensor
+    # stream (omni_virus) instead.
+    ifneq ($(filter gfx10,$(GFX_FAMILY))$(filter gfx900 gfx902 gfx904 gfx906 gfx909 gfx90c,$(DETECTED_GFX)),)
+        CXXFLAGS += -DPANTHEON_AMD_NO_MATRIX=1
+        $(info [DEBUG] No matrix instructions on $(DETECTED_GFX); matrix workloads will skip.)
+    endif
+
     # 3. FIX: Force Native Compilation for Pantheon Kernels
     # If a specific cross-compile target wasn't requested, trust the compiler to 
     # generate machine code for the exact silicon it is currently sitting on.

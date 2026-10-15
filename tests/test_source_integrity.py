@@ -28,6 +28,32 @@ def test_transformer_build_target_is_portable_by_default():
     assert "#pragna" not in transformer
 
 
+def test_amd_parts_without_matrix_instructions_skip_instead_of_failing_to_build():
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+
+    # RDNA1/RDNA2 by family, plus the Vega-era gfx9 parts that predate MFMA.
+    # Without the flag rocWMMA stops the compile on gfx1030 and the matrix
+    # workloads were recorded as FAIL instead of SKIP.
+    assert "-DPANTHEON_AMD_NO_MATRIX=1" in makefile
+    condition = next(line for line in makefile.splitlines() if "filter gfx10," in line)
+    for gfx in ("gfx900", "gfx902", "gfx904", "gfx906", "gfx909", "gfx90c"):
+        assert gfx in condition
+    # gfx908 is the first MFMA part, gfx11 and gfx12 have WMMA: flagging any of
+    # them would skip a part that can run the workloads.
+    for capable in ("gfx908", "gfx90a", "gfx94", "gfx95", "gfx11", "gfx12"):
+        assert capable not in condition
+
+    mma = Path("kernels/mma_virus/mma_virus.cpp").read_text(encoding="utf-8")
+    omni = Path("kernels/omni_virus/omni_virus.cpp").read_text(encoding="utf-8")
+    transformer = Path("kernels/transformer_virus/transformer_virus.cpp").read_text(encoding="utf-8")
+    assert "PANTHEON_AMD_NO_MATRIX" in mma and "PANTHEON_AMD_NO_MATRIX" in omni
+    assert "PANTHEON_AMD_NO_MATRIX" in transformer
+    # The two matrix-only workloads must skip, not run a fallback whose
+    # throughput would not be matrix throughput.
+    assert 'pantheon_skip(gpu_id, "MMA VIRUS", "this AMD GPU has no matrix cores' in mma
+    assert 'pantheon_skip(gpu_id, "TRANSFORMER VIRUS", "this AMD GPU has no matrix cores' in transformer
+
+
 def test_no_unreleased_hardware_identifiers_ship():
     """Unannounced parts must not be named anywhere in the tree.
 
