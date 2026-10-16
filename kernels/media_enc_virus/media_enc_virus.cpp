@@ -100,8 +100,22 @@ int main(int argc, char* argv[]) {
         return pantheon_fail("libnvidia-encode.so.1 does not export NvEncodeAPICreateInstance.");
     }
     
+    // A driver older than this build's NVENC API answers INVALID_VERSION before it looks at the
+    // card, so that status says nothing about whether the GPU has an encoder. The library cannot
+    // be used here, which makes it a skip with the way out, not a failure.
+    auto driver_too_old = [&](NVENCSTATUS status) {
+        if (status != NV_ENC_ERR_INVALID_VERSION) return false;
+        if (verify_mode) std::cout << "Verification: SKIPPED (the driver's NVENC API is older than this build's)" << std::endl;
+        return true;
+    };
+    const std::string too_old_reason = "the driver's NVENC API is older than the one this build uses (NVENC API " +
+        std::to_string(NVENCAPI_MAJOR_VERSION) + "." + std::to_string(NVENCAPI_MINOR_VERSION) +
+        ", NVENCSTATUS " + std::to_string((int)NV_ENC_ERR_INVALID_VERSION) + "); update the NVIDIA driver";
+
     NV_ENCODE_API_FUNCTION_LIST nvenc = { NV_ENCODE_API_FUNCTION_LIST_VER };
-    NVENC_CHECK(NvEncCreate(&nvenc));
+    NVENCSTATUS create_status = NvEncCreate(&nvenc);
+    if (driver_too_old(create_status)) return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", too_old_reason);
+    NVENC_CHECK(create_status);
 
     // 3. Open Encode Session
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessionParams = { NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER };
@@ -115,6 +129,7 @@ int main(int argc, char* argv[]) {
         if (verify_mode) std::cout << "Verification: SKIPPED (this GPU has no NVENC engine)" << std::endl;
         return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", "this GPU has no NVENC engine (NVENCSTATUS " + std::to_string((int)open_status) + ")");
     }
+    if (driver_too_old(open_status)) return pantheon_skip(gpu_id, "MEDIA_ENC_VIRUS", too_old_reason);
     NVENC_CHECK(open_status);
 
     // 4. Initialize 4K HEVC Constant Quality Preset (P7)

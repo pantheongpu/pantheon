@@ -54,6 +54,20 @@ def test_amd_parts_without_matrix_instructions_skip_instead_of_failing_to_build(
     assert 'pantheon_skip(gpu_id, "TRANSFORMER VIRUS", "this AMD GPU has no matrix cores' in transformer
 
 
+def test_media_enc_virus_skips_when_the_driver_nvenc_api_is_older_than_the_build():
+    source = Path("kernels/media_enc_virus/media_enc_virus.cpp").read_text(encoding="utf-8")
+
+    # A driver that speaks an older NVENC API answers NV_ENC_ERR_INVALID_VERSION
+    # before it looks at the card (a V100 on a 550 driver did, and the run was
+    # recorded as a failure with a score of 0). That is a library the workload
+    # cannot use, so it is a skip that says what to update.
+    assert "NV_ENC_ERR_INVALID_VERSION" in source
+    assert "older than the one this build uses" in source
+    # Both calls that can return it are tested before the generic failure path.
+    for status in ("create_status", "open_status"):
+        assert source.index(f"driver_too_old({status})") < source.index(f"NVENC_CHECK({status})")
+
+
 def test_no_unreleased_hardware_identifiers_ship():
     """Unannounced parts must not be named anywhere in the tree.
 
