@@ -2114,20 +2114,46 @@ def test_no_visible_card_is_an_error_and_not_an_empty_run():
         pantheon.parse_gpu_selection("all", 4, visible("9"))
 
 
-def test_workload_is_started_with_the_number_cuda_gives_the_card(tmp_path, monkeypatch):
+def _echo_device_workload(tmp_path, monkeypatch, registry_name):
+    """A workload that reports the device number it was given and the cards it can see."""
     executable = tmp_path / "echo_device"
     executable.write_text(
         "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "print('device', sys.argv[1])\n"
+        "import os, sys\n"
+        "print('device', sys.argv[1], 'sees', os.environ.get('CUDA_VISIBLE_DEVICES'))\n"
         "print('Throughput: 1.0 GB/s')\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
     monkeypatch.setattr(pantheon, "BUILD_DIR", str(tmp_path))
     monkeypatch.setattr(pantheon, "TEST_REGISTRY", {
-        "echo_device": {"bin": "echo_device", "args": [], "desc": "Echo"},
+        registry_name: {"bin": "echo_device", "args": [], "desc": "Echo"},
     })
+
+
+def test_workload_that_needs_peers_is_started_with_the_number_cuda_gives_the_card(tmp_path, monkeypatch):
+    # all_reduce talks to the other cards, so it has to see them: it is not isolated.
+    _echo_device_workload(tmp_path, monkeypatch, "all_reduce")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {3: 0, 1: 1})
+
+    processes = pantheon.run_test("all_reduce", [1, 3], 0, 1, "CUDA", str(tmp_path))
+    assert not pantheon.wait_for_processes(processes, 10)
+    seen = {}
+    for info in processes:
+        info["output_thread"].join(timeout=5)
+        seen[info["gpu"]] = info["stdout"].splitlines()[0]
+        # The row is still about the card as nvidia-smi numbers it.
+        assert info["workload_argv"][1] == str(pantheon.device_ordinal(info["gpu"]))
+    assert seen == {1: "device 1 sees 3,1", 3: "device 0 sees 3,1"}
+
+
+def test_each_workload_sees_only_its_own_card(tmp_path, monkeypatch):
+    # Told only "device 2", a CUDA program still opens a context on device 0, which
+    # fails the 99% allocation there while another workload holds it. So each one is
+    # started with just its card visible, whatever the job's own selection was.
+    _echo_device_workload(tmp_path, monkeypatch, "echo_device")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
     monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {3: 0, 1: 1})
 
     processes = pantheon.run_test("echo_device", [1, 3], 0, 1, "CUDA", str(tmp_path))
@@ -2136,9 +2162,56 @@ def test_workload_is_started_with_the_number_cuda_gives_the_card(tmp_path, monke
     for info in processes:
         info["output_thread"].join(timeout=5)
         seen[info["gpu"]] = info["stdout"].splitlines()[0]
-        # The row is still about the card as nvidia-smi numbers it.
-        assert info["workload_argv"][1] == str(pantheon.device_ordinal(info["gpu"]))
-    assert seen == {1: "device 1", 3: "device 0"}
+        assert info["workload_argv"][1] == "0"
+        assert info["workload_env"]["CUDA_VISIBLE_DEVICES"] == str(info["gpu"])
+    assert seen == {1: "device 0 sees 1", 3: "device 0 sees 3"}
+
+
+def test_workload_launch_isolates_one_card_and_leaves_the_rest_of_the_environment(monkeypatch):
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {})
+    ordinal, env = pantheon.workload_launch(
+        "int_virus", 2, "CUDA", {"PATH": "/bin", "CUDA_VISIBLE_DEVICES": "0,2", "CUDA_DEVICE_ORDER": "FASTEST_FIRST"},
+    )
+    assert ordinal == 0
+    # Pantheon's numbers are nvidia-smi's, which is PCI bus order.
+    assert env == {"PATH": "/bin", "CUDA_VISIBLE_DEVICES": "2", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+
+
+@pytest.mark.parametrize("test_name", ["all_reduce", "p2p_thrasher"])
+def test_workloads_that_need_peers_keep_every_card_visible(monkeypatch, test_name):
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {})
+    assert pantheon.workload_launch(test_name, 2, "CUDA", {}) == (2, None)
+
+
+def test_workload_launch_does_not_isolate_where_it_cannot(monkeypatch):
+    monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {})
+    # The AMD variables are not translated, and the mock backend has no cards.
+    assert pantheon.workload_launch("int_virus", 2, "HIP", {}) == (2, None)
+    assert pantheon.workload_launch("int_virus", 2, "MOCK", {}) == (2, None)
+    # A MIG device cannot be matched to a card, so the selection is left as it is.
+    assert pantheon.workload_launch("int_virus", 2, "CUDA", {"CUDA_VISIBLE_DEVICES": "MIG-abc"}) == (2, None)
+
+
+def test_the_profile_clean_pass_runs_in_the_environment_of_the_first_launch(monkeypatch):
+    seen = {}
+
+    def fake_popen(argv, **kwargs):
+        seen["env"] = kwargs.get("env")
+        raise OSError("not launched")
+
+    class Monitor:
+        def start_collection(self, *args):
+            pass
+
+        def stop_collection(self):
+            return {}
+
+    monkeypatch.setattr(pantheon.subprocess, "Popen", fake_popen)
+    env = {"CUDA_VISIBLE_DEVICES": "2"}
+    pantheon.run_profile_telemetry_pass(
+        "int_virus", [{"gpu": 2, "workload_argv": ["x", "0"], "workload_env": env}], [2], 1, Monitor(), "/tmp",
+    )
+    assert seen["env"] == env
 
 
 def test_device_numbers_are_unchanged_when_nothing_is_hidden(monkeypatch):
