@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/pantheongpu/pantheon
-  tag: "1.2.3"
+  tag: "1.2.4"
   pullPolicy: IfNotPresent
 
 # The nodes to test, by name. Each one gets a Job that asks for all of its GPUs.

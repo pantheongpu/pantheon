@@ -14,7 +14,7 @@ the first run into `$HOME/.cache/pantheongpu/builds`, which Apptainer binds
 from the host, so the compiled workloads survive between runs. Reports land in
 `./database` of the directory you run from.
 
-For AMD nodes, change the `From:` line to the `1.2.3-rocm6.4` tag and run
+For AMD nodes, change the `From:` line to the `1.2.4-rocm6.4` tag and run
 with `--rocm`.
 
 The image is about 5 GB, because it carries the compiler.
