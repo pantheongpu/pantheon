@@ -9,11 +9,11 @@
 # that the compiled workloads survive between runs. Reports are written to the
 # working directory.
 #
-# For AMD nodes, build from ghcr.io/pantheongpu/pantheon:1.2.3-rocm6.4 and run
+# For AMD nodes, build from ghcr.io/pantheongpu/pantheon:1.2.4-rocm6.4 and run
 # with --rocm instead of --nv.
 
 Bootstrap: docker
-From: ghcr.io/pantheongpu/pantheon:1.2.3-cuda12.8
+From: ghcr.io/pantheongpu/pantheon:1.2.4-cuda12.8
 
 %environment
     export PANTHEON_BUILD_CACHE_DIR=${PANTHEON_BUILD_CACHE_DIR:-$HOME/.cache/pantheongpu/builds}
