@@ -1,6 +1,27 @@
 # Pantheon: Universal GPU Stress & Diagnostics Suite
 
+[![CI](https://github.com/pantheongpu/pantheon/actions/workflows/ci.yml/badge.svg)](https://github.com/pantheongpu/pantheon/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pantheongpu/pantheon)](https://github.com/pantheongpu/pantheon/releases)
+[![PyPI](https://img.shields.io/pypi/v/pantheon-gpu)](https://pypi.org/project/pantheon-gpu/)
+[![License](https://img.shields.io/github/license/pantheongpu/pantheon)](LICENSE)
+
 Pantheon is a cross-platform (CUDA/ROCm) stress testing tool designed to isolate and hammer specific GPU subsystems. Unlike generic benchmarks (Furmark, 3DMark), Pantheon allows you to test specific silicon limits.
+
+## What it is, and what it isn't
+
+- **It is** a set of stress workloads for NVIDIA (CUDA) and AMD (ROCm/HIP) GPUs that each target one subsystem (power draw, memory, caches, inference paths), and every run ends with a verdict per GPU (HEALTHY, WATCH, FAULT or INCOMPLETE) with the evidence behind it. See [Verdict](#verdict).
+- **It isn't** a benchmark for ranking cards, and it does not replace vendor diagnostics. A passing run is evidence the GPU held up under that load for that long, not a guarantee.
+- **It needs** a GPU with its driver and a compiler toolchain (the kernels are compiled on first use), or the CPU `MOCK` backend for development without a GPU.
+
+## Try it
+
+```bash
+pipx install pantheon-gpu
+pantheon --version
+pantheon --test baseline_metrics --duration 10   # first run compiles the kernels, which can take a minute
+```
+
+Results are written to `results/` and `database/` in the current directory.
 
 ## Install
 
