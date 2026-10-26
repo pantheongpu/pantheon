@@ -400,8 +400,9 @@ VERDICT GPU 0, NVIDIA H100 80GB HBM3: WATCH  (thermally throttled on 2; correcta
 * **HEALTHY**: every workload completed, no error counter that matters moved,
   and nothing ran hot.
 * **WATCH**: something deserves a second look: a thermal limit, a GPU at 90 C or
-  memory at 95 C, correctable ECC or PCIe errors, or a workload that did not
-  complete. One line per kind, worst first.
+  memory at 95 C, correctable ECC or PCIe errors, an NVLink link that is down
+  (see [NVLink](#nvlink)), or a workload that did not complete. One line per
+  kind, worst first.
 * **FAULT**: a memory diagnostic (`march_test`, `galpat`, `memory_hammer`,
   `memory_retention`, `memory_retention_bake`, `ras_validator`) failed, or an
   uncorrectable error was counted. Read the workload's log in `results/`.
@@ -410,6 +411,30 @@ VERDICT GPU 0, NVIDIA H100 80GB HBM3: WATCH  (thermally throttled on 2; correcta
 PCIe link recovery counts are reported as a note, never held against the
 card: they tick on every run on some healthy platforms. The verdict is also
 written into the report under `verdicts`, with a structured `findings` block.
+
+### NVLink
+
+On a multi-GPU NVIDIA node Pantheon also reads, through NVML, how many NVLink
+links each GPU has and how many are up, and on a node run by a fabric manager
+whether the fabric finished starting. It prints one line at the start
+(`NVLink: GPU 0,1,2,3,4,5,6,7: 18 of 18 links active`) and records both
+snapshots under `interconnect` in the report. A card passes every test on its
+own with a link down, so these are the cases that make the verdict WATCH, listed
+as `interconnect`:
+
+* a GPU has fewer links up than the other GPUs of the node that have the same
+  number of links (17 of 18 beside seven with 18);
+* a GPU has no link up, where the others are joined through an NVSwitch;
+* a link went down during the run;
+* the fabric has not completed, reports an error, or the driver reports
+  degraded NVLink bandwidth.
+
+These never make a FAULT: they have not yet been checked against a node with a
+degraded link. The error counters of the links (CRC, replay, recovery) are
+recorded with the RAS snapshot of each workload and are not judged. Without
+`nvidia-ml-py`, or on a node without NVLink, none of this is available, and
+`interconnect` in the report says which. Nothing here loads the links:
+`p2p_thrasher` and `all_reduce` still exercise one pair of cards each.
 
 `--test quick` is the ten-minute version of this: idle baseline, memory read,
 a march test, a retention check and one power-limited compute load.
