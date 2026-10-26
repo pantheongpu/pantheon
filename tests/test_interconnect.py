@@ -212,12 +212,8 @@ def test_a_card_that_ran_nothing_stays_incomplete_whatever_the_links_say():
 # --- the error counters -------------------------------------------------------
 
 def _counter_nvml(has_nvlink, values):
-    """pynvml stand-in for nvidia_ras_snapshot: PCIe and NVLink fields answered from `values`."""
-    names = {**{f"NVML_FI_DEV_PCIE_{n}": i for i, n in enumerate((
-        "REPLAY_COUNTER", "COUNT_CORRECTABLE_ERRORS", "COUNT_BAD_TLP", "COUNT_BAD_DLLP", "COUNT_NON_FATAL_ERROR",
-        "COUNT_FATAL_ERROR", "COUNT_LCRC_ERROR", "COUNT_LANE_ERROR", "COUNT_NAKS_RECEIVED", "COUNT_NAKS_SENT",
-        "L0_TO_RECOVERY_COUNTER", "REPLAY_ROLLOVER_COUNTER"))},
-             **{constant: 100 + i for i, constant in enumerate(pantheon.NVLINK_ERROR_FIELDS.values())}}
+    """pynvml stand-in for nvidia_nvlink_counters: the NVLink fields answered from `values`."""
+    names = {constant: 100 + i for i, constant in enumerate(pantheon.NVLINK_ERROR_FIELDS.values())}
     ids_by_value = {v: k for k, v in names.items()}
 
     def field_values(handle, field_ids):
@@ -237,27 +233,59 @@ def _counter_nvml(has_nvlink, values):
         nvmlDeviceGetNvLinkState=link_state, NVML_SUCCESS=0, **names)
 
 
-def _no_smi(monkeypatch):
-    monkeypatch.setattr(pantheon.subprocess, "run", lambda command, **_kw: types.SimpleNamespace(
-        returncode=0, stdout=", ".join(["0"] * len(command[3].split("=", 1)[1].split(","))) + "\n", stderr=""))
-
-
 def test_nvlink_counters_are_recorded_only_on_a_gpu_that_has_nvlink(monkeypatch):
-    _no_smi(monkeypatch)
     monkeypatch.setattr(pantheon, "pynvml", _counter_nvml(True, {"NVML_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL": 4}))
-    with_links = pantheon.nvidia_ras_snapshot(0)["metrics"]
-    assert with_links["nvlink.replay"]["value"] == 4 and with_links["nvlink.crc_flit"]["value"] == 0
+    with_links = pantheon.nvidia_nvlink_counters(0)
+    assert with_links["status"] == "supported"
+    assert with_links["metrics"]["nvlink.replay"]["value"] == 4 and with_links["metrics"]["nvlink.crc_flit"]["value"] == 0
 
     monkeypatch.setattr(pantheon, "pynvml", _counter_nvml(False, {}))
-    without = pantheon.nvidia_ras_snapshot(0)["metrics"]
-    assert not [name for name in without if name.startswith("nvlink.")]
+    without = pantheon.nvidia_nvlink_counters(0)
+    assert without["status"] == "unsupported" and without["metrics"] == {}
+
+    monkeypatch.setattr(pantheon, "pynvml", None)
+    assert pantheon.nvidia_nvlink_counters(0)["status"] == "unavailable"
+
+
+def test_a_field_the_gpu_does_not_report_is_unsupported_and_does_not_hide_the_others(monkeypatch):
+    """On a V100, NVML answers NOT_SUPPORTED for every NVLink field of a call that includes ecc_data."""
+    stand_in = _counter_nvml(True, {"NVML_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL": 7})
+    real = stand_in.nvmlDeviceGetFieldValues
+    ecc_id = 100 + list(pantheon.NVLINK_ERROR_FIELDS).index("nvlink.ecc_data")
+
+    def all_or_nothing(handle, field_ids):
+        out = real(handle, field_ids)
+        if ecc_id in field_ids:
+            for field in out:
+                field.nvmlReturn = 3          # NVML_ERROR_NOT_SUPPORTED
+        return out
+
+    stand_in.nvmlDeviceGetFieldValues = all_or_nothing
+    monkeypatch.setattr(pantheon, "pynvml", stand_in)
+    metrics = pantheon.nvidia_nvlink_counters(0)["metrics"]
+    assert metrics["nvlink.ecc_data"]["status"] == "unsupported" and metrics["nvlink.ecc_data"]["value"] is None
+    assert metrics["nvlink.replay"]["status"] == "supported" and metrics["nvlink.replay"]["value"] == 7
+
+
+def test_the_nvlink_source_joins_the_ras_snapshot_on_cuda_only(monkeypatch):
+    monkeypatch.setattr(pantheon, "nvidia_ras_snapshot", lambda gpu: pantheon.ras_source("unavailable", detail="x"))
+    monkeypatch.setattr(pantheon, "nvidia_nvlink_counters", lambda gpu: pantheon.ras_source("supported", {}))
+    monkeypatch.setattr(pantheon, "linux_aer_snapshot", lambda *a, **k: pantheon.ras_source("unsupported"))
+    monkeypatch.setattr(pantheon, "linux_aer_events", lambda: ([], ""))
+    monkeypatch.setattr(pantheon, "gpu_pci_bdf", lambda *a: "")
+    assert "nvlink" in pantheon.collect_ras_snapshot("CUDA", 0)["sources"]
+    assert "nvlink" not in pantheon.collect_ras_snapshot("MOCK", 0)["sources"]
 
 
 def test_nvlink_counters_are_in_the_delta_but_do_not_change_the_ras_status():
-    before = {"sources": {"vendor_ras": {"status": "supported", "metrics": {
-        "nvlink.replay": {"status": "supported", "value": 1, "unit": "count"}}}}}
-    after = {"sources": {"vendor_ras": {"status": "supported", "metrics": {
-        "nvlink.replay": {"status": "supported", "value": 9, "unit": "count"}}}}}
+    def snap(value):
+        return {"sources": {"nvlink": {"status": "supported", "metrics": {
+            "nvlink.replay": {"status": "supported", "value": value, "unit": "count"}}}}}
+    before, after = snap(1), snap(9)
     delta = pantheon.diff_ras_snapshots(before, after)
     assert [(row["metric"], row["delta"]) for row in delta["metrics"]] == [("nvlink.replay", 8)]
-    assert pantheon.summarize_ras_delta(delta, before, after)["status"] == "CLEAN"
+    # The counters moved, and the ECC and PCIe counters could not be read at all:
+    # that is UNAVAILABLE, not a clean bill from a source that is only recorded.
+    assert pantheon.summarize_ras_delta(delta, before, after)["status"] == "UNAVAILABLE"
+    with_ecc = {"sources": {**snap(9)["sources"], "vendor_ras": {"status": "supported", "metrics": {}}}}
+    assert pantheon.summarize_ras_delta(delta, with_ecc, with_ecc)["status"] == "CLEAN"
