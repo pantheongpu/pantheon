@@ -1065,6 +1065,36 @@ def is_skipped_row(row):
     return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
 
 
+# A GPU whose slowest transfer to a peer is under this share of the median GPU's
+# slowest. A starting value, not yet checked against a real node.
+P2P_MATRIX_WATCH_RATIO = 0.75
+
+
+def p2p_matrix_finding(rows, gpu_id):
+    """Why this GPU's links to its peers look slow beside the other GPUs', or None.
+
+    p2p_matrix gives each GPU the speed of its slowest transfer to a peer, so
+    one GPU with a slow link or a lost NVLink link reads low while the rest of
+    the node reads alike. It needs three GPUs to have a median to compare with.
+    """
+    scores = {}
+    for row in rows:
+        if row.get("Test Name") != "p2p_matrix" or row.get("Failure Stage") or is_skipped_row(row):
+            continue
+        if row.get("Unit") != "GB/s" or str(row.get("Status") or "PASS").upper() == "FAIL":
+            continue
+        score = _num(row.get("Score"), None)
+        if score is not None and score > 0:
+            scores[row.get("GPU ID")] = score
+    if len(scores) < 3 or gpu_id not in scores:
+        return None
+    median = statistics.median(scores.values())
+    if scores[gpu_id] < P2P_MATRIX_WATCH_RATIO * median:
+        return (f"p2p_matrix: the slowest transfer from GPU {gpu_id} to a peer ran at {scores[gpu_id]:.0f} GB/s; "
+                f"the median GPU's slowest is {median:.0f} GB/s")
+    return None
+
+
 def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     """Turn one GPU's result rows into a verdict with its evidence.
 
@@ -1161,6 +1191,9 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     if incomplete:
         watches.append("did not complete: " + ", ".join(incomplete))
     interconnect = list(interconnect or [])
+    slow_links = p2p_matrix_finding(rows, gpu_id)
+    if slow_links:
+        interconnect.append(slow_links)
     if interconnect:
         watches.append("interconnect: " + "; ".join(interconnect))
 
@@ -1268,6 +1301,7 @@ TEST_REGISTRY = {
     # --- NEW: Specialized Hardware Blocks ---
     "p2p_thrasher":     {"bin": "p2p_thrasher",     "args": [], "desc": "P2P Thrasher (Multi-GPU Interconnect)"},
     "all_reduce":       {"bin": "all_reduce",       "args": [], "desc": "All-Reduce (Two-Rank Peer DMA Collective)"},
+    "p2p_matrix":       {"bin": "p2p_matrix",       "args": [], "desc": "P2P Matrix (All-Pairs Interconnect Bandwidth)"},
     "transformer_virus":{"bin": "transformer_virus","args": [], "desc": "Transformer Virus (FP8/FP4 Engine)"},
     "llm_decode":       {"bin": "llm_decode",       "args": [], "desc": "LLM Decode (KV-Cache Gather and Projection)"},
     "llm_prefill":      {"bin": "llm_prefill",      "args": [], "desc": "LLM Prefill (Causal Attention and Projections)"},
@@ -1311,7 +1345,7 @@ SUITES = {
     ],
     "interconnect": [
         "tlb_avalanche", "scheduler", 
-        "pcie_bandwidth", "p2p_thrasher", "all_reduce", "memory_pc_pingpong",
+        "pcie_bandwidth", "p2p_thrasher", "p2p_matrix", "all_reduce", "memory_pc_pingpong",
         "memory_tsv_thrasher"
     ],
     "diagnostics": [
@@ -1341,6 +1375,7 @@ SUITES = {
 # them with one visible GPU produces a misleading zero result.
 MIN_GPUS_FOR_TEST = {
     "p2p_thrasher": 2,
+    "p2p_matrix": 2,
     "all_reduce": 2,
 }
 

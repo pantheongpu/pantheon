@@ -150,7 +150,7 @@ Pantheon tests only the cards its job has been given. If `CUDA_VISIBLE_DEVICES` 
 
 Reports keep `nvidia-smi`'s numbers. A run with `CUDA_VISIBLE_DEVICES=2` tests one card and reports it as GPU 2, with that card's UUID, temperature and error counters, and leaves the hidden cards out of the report.
 
-On NVIDIA each workload is started with only its own card visible, as device 0. A CUDA program told to use device 2 still opens a context on device 0 first, and on a machine testing every card at once, with each workload taking 99% of its card's memory, those contexts make allocations fail with "out of memory" on GPU 0. The two workloads that need other cards, `all_reduce` and `p2p_thrasher`, keep every card the job was given visible.
+On NVIDIA each workload is started with only its own card visible, as device 0. A CUDA program told to use device 2 still opens a context on device 0 first, and on a machine testing every card at once, with each workload taking 99% of its card's memory, those contexts make allocations fail with "out of memory" on GPU 0. The three workloads that need other cards, `all_reduce`, `p2p_thrasher` and `p2p_matrix`, keep every card the job was given visible.
 
 ```bash
 # A job that was given the third card of a four-card machine
@@ -433,8 +433,10 @@ These never make a FAULT: they have not yet been checked against a node with a
 degraded link. The error counters of the links (CRC, replay, recovery) are
 recorded with the RAS snapshot of each workload and are not judged. Without
 `nvidia-ml-py`, or on a node without NVLink, none of this is available, and
-`interconnect` in the report says which. Nothing here loads the links:
-`p2p_thrasher` and `all_reduce` still exercise one pair of cards each.
+`interconnect` in the report says which. Reading the links puts no load on them.
+Of the workloads, `p2p_thrasher` and `all_reduce` exercise one pair of cards each,
+and `p2p_matrix` measures every GPU's transfers to all its peers. A GPU whose
+slowest transfer is under 75% of the median GPU's makes the verdict WATCH too.
 
 `--test quick` is the ten-minute version of this: idle baseline, memory read,
 a march test, a retention check and one power-limited compute load.
