@@ -530,6 +530,8 @@ def nvidia_ras_snapshot(gpu_id):
         "pcie.l0_to_recovery": "NVML_FI_DEV_PCIE_L0_TO_RECOVERY_COUNTER",
         "pcie.replay_rollover": "NVML_FI_DEV_PCIE_REPLAY_ROLLOVER_COUNTER",
     }
+    if pynvml and gpu_has_nvlink(gpu_id):
+        pcie_fields.update(NVLINK_ERROR_FIELDS)
     if not pynvml:
         for name in pcie_fields:
             metrics[name] = {"status": "unavailable", "value": None, "unit": "count"}
@@ -554,6 +556,198 @@ def nvidia_ras_snapshot(gpu_id):
             return ras_source("partial", metrics, f"NVML PCIe fields unavailable: {exc}")
     supported_values = [item for item in metrics.values() if item["status"] == "supported"]
     return ras_source("supported" if supported_values else "unsupported", metrics)
+
+
+# --------------------------------------------------------------------------
+# Interconnect: the NVLink links of each GPU and the state of the GPU fabric.
+#
+# A burn-in that runs on each card alone passes a node that has lost an NVLink
+# link: the card still computes, and only a transfer between two cards is
+# slower. This reads what the driver already knows: how many links each GPU
+# has, how many are up, what they connect to, and on a fabric-managed node
+# whether the fabric finished coming up. It puts no load on the links.
+#
+# Everything here is read-only and non-fatal. A finding can make a verdict
+# WATCH, never FAULT: the rules have not yet been checked against a node with
+# a real degraded link, only against recorded states.
+
+# NVML_NVLINK_MAX_LINKS is 36 in current nvidia-ml-py; the scan does not rely
+# on the constant being present.
+NVLINK_SCAN_LINKS = 36
+NVLINK_REMOTE_NAMES = {0: "gpu", 1: "ibmnpu", 2: "switch"}
+FABRIC_STATE_NAMES = {0: "not supported", 1: "not started", 2: "in progress", 3: "completed"}
+
+# Error counters of the links. They are recorded with every workload's RAS
+# delta, but they are informational: how many replays or CRC errors a healthy
+# link shows under full load has not been measured here, so they are not yet
+# held against the card (see INFORMATIONAL_RAS_PREFIXES).
+NVLINK_ERROR_FIELDS = {
+    "nvlink.crc_flit": "NVML_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL",
+    "nvlink.crc_data": "NVML_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL",
+    "nvlink.replay": "NVML_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL",
+    "nvlink.recovery": "NVML_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL",
+    "nvlink.ecc_data": "NVML_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL",
+}
+INFORMATIONAL_RAS_PREFIXES = ("nvlink.",)
+
+
+def gpu_has_nvlink(gpu_id):
+    """True when NVML reports an NVLink link 0 on this GPU."""
+    try:
+        pynvml.nvmlInit()
+        pynvml.nvmlDeviceGetNvLinkState(pynvml.nvmlDeviceGetHandleByIndex(gpu_id), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _nvml_fabric_info(handle):
+    """State, status and degraded-bandwidth flag of the GPU fabric, or None."""
+    for struct_name, function_name in (("c_nvmlGpuFabricInfoV_t", "nvmlDeviceGetGpuFabricInfoV"),
+                                       ("c_nvmlGpuFabricInfo_t", "nvmlDeviceGetGpuFabricInfo")):
+        struct = getattr(pynvml, struct_name, None)
+        function = getattr(pynvml, function_name, None)
+        if struct is None or function is None:
+            continue
+        try:
+            info = struct()
+            function(handle, ctypes.byref(info))
+        except Exception:
+            continue
+        result = {"state": int(info.state), "status": int(info.status), "degraded_bandwidth": None}
+        mask = getattr(info, "healthMask", None)
+        if mask is not None:
+            shift = getattr(pynvml, "NVML_GPU_FABRIC_HEALTH_MASK_SHIFT_DEGRADED_BW", 0)
+            width = getattr(pynvml, "NVML_GPU_FABRIC_HEALTH_MASK_WIDTH_DEGRADED_BW", 0x3)
+            true_value = getattr(pynvml, "NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_TRUE", 1)
+            false_value = getattr(pynvml, "NVML_GPU_FABRIC_HEALTH_MASK_DEGRADED_BW_FALSE", 2)
+            value = (int(mask) >> shift) & width
+            if value in (true_value, false_value):
+                result["degraded_bandwidth"] = value == true_value
+        return result
+    return None
+
+
+def nvidia_interconnect_snapshot():
+    """The NVLink links and fabric state of every NVIDIA GPU, read through NVML. Never raises."""
+    snapshot = {"status": "unavailable", "detail": "", "gpus": []}
+    if not pynvml:
+        snapshot["detail"] = "nvidia-ml-py (pynvml) is not installed"
+        return snapshot
+    try:
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+    except Exception as exc:
+        snapshot["detail"] = f"NVML is not available: {exc}"
+        return snapshot
+    enabled = getattr(pynvml, "NVML_FEATURE_ENABLED", 1)
+    for index in range(count):
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception:
+            continue
+        links = []
+        for link in range(NVLINK_SCAN_LINKS):
+            try:
+                state = pynvml.nvmlDeviceGetNvLinkState(handle, link)
+            except Exception:
+                continue  # not a link of this GPU, or the GPU has no NVLink
+            active = state == enabled
+            remote = "unknown"
+            if active:
+                try:
+                    remote = NVLINK_REMOTE_NAMES.get(
+                        pynvml.nvmlDeviceGetNvLinkRemoteDeviceType(handle, link), "unknown")
+                except Exception:
+                    pass
+            links.append({"link": link, "active": active, "remote": remote})
+        entry = {
+            "gpu": index,
+            "links_total": len(links),
+            "links_active": sum(1 for item in links if item["active"]),
+            "links": links,
+            "fabric": _nvml_fabric_info(handle) if links else None,
+        }
+        snapshot["gpus"].append(entry)
+    if any(entry["links_total"] for entry in snapshot["gpus"]):
+        snapshot["status"] = "supported"
+    else:
+        snapshot["status"] = "unsupported"
+        snapshot["detail"] = "NVML reports no NVLink links on these GPUs"
+    return snapshot
+
+
+def describe_interconnect(snapshot):
+    """One line saying how many links are up, or None when there is nothing to say."""
+    if not snapshot or snapshot.get("status") != "supported":
+        return None
+    groups = {}
+    for entry in snapshot["gpus"]:
+        if entry["links_total"]:
+            groups.setdefault((entry["links_active"], entry["links_total"]), []).append(str(entry["gpu"]))
+    return "NVLink: " + "; ".join(
+        f"GPU {','.join(ids)}: {active} of {total} links active"
+        for (active, total), ids in sorted(groups.items(), key=lambda item: item[0], reverse=True))
+
+
+def interconnect_findings(before, after=None):
+    """What is wrong with the interconnect, per GPU: {gpu_index: [reason, ...]}.
+
+    GPUs are compared with the other GPUs of the node that have the same number
+    of links, so no table of cards is needed: a GPU with 17 of 18 links up beside
+    seven with 18 is the finding. A GPU with no link up is a finding only where
+    the others are joined through an NVSwitch, which every GPU must be: a node
+    with two NVLink bridges and two unbridged cards is not a fault.
+    """
+    findings = {}
+
+    def add(gpu, text):
+        findings.setdefault(gpu, []).append(text)
+
+    def with_links(snapshot):
+        return {e["gpu"]: e for e in (snapshot or {}).get("gpus", []) if e.get("links_total")}
+
+    start = with_links(before)
+    end = with_links(after) if after is not None else start
+    groups = {}
+    for gpu, entry in end.items():
+        groups.setdefault(entry["links_total"], []).append(gpu)
+    for total, members in sorted(groups.items()):
+        if len(members) < 2:
+            continue
+        most = max(end[gpu]["links_active"] for gpu in members)
+        if most == 0:
+            continue
+        through_switch = any(
+            link["active"] and link["remote"] == "switch" for gpu in members for link in end[gpu]["links"])
+        for gpu in sorted(members):
+            active = end[gpu]["links_active"]
+            if active == most:
+                continue
+            if active == 0:
+                if through_switch:
+                    add(gpu, f"NVLink: none of its {total} links is active; the other GPUs of this node "
+                             f"have {most}, through an NVSwitch")
+            else:
+                add(gpu, f"NVLink: {active} of {total} links active; the other GPUs of this node have {most}")
+
+    if after is not None:
+        for gpu, was in sorted(start.items()):
+            now = end.get(gpu)
+            if now and now["links_active"] < was["links_active"]:
+                add(gpu, f"NVLink: {was['links_active'] - now['links_active']} link(s) went down during the run "
+                         f"({was['links_active']} active before, {now['links_active']} after)")
+
+    for gpu, entry in sorted(end.items()):
+        fabric = entry.get("fabric") or {}
+        state = fabric.get("state")
+        if state in (1, 2):
+            add(gpu, f"GPU fabric {FABRIC_STATE_NAMES[state]}, not completed")
+        elif state == 3 and fabric.get("status") not in (None, 0):
+            add(gpu, f"GPU fabric reports an error (status {fabric['status']})")
+        if state and fabric.get("degraded_bandwidth"):
+            add(gpu, "the driver reports degraded NVLink bandwidth for this GPU")
+    return findings
 
 
 def amd_ras_snapshot(gpu_id):
@@ -783,6 +977,8 @@ def summarize_ras_delta(delta, before=None, after=None):
     for item in delta.get("metrics", []):
         if item.get("status") != "supported":
             continue
+        if str(item.get("metric", "")).startswith(INFORMATIONAL_RAS_PREFIXES):
+            continue  # recorded in the report, not yet judged
         value = item.get("delta")
         if not isinstance(value, (int, float)) or value <= 0:
             continue
@@ -869,7 +1065,7 @@ def is_skipped_row(row):
     return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
 
 
-def assess_gpu(rows, gpu_id, gpu_name):
+def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     """Turn one GPU's result rows into a verdict with its evidence.
 
     Findings are grouped by kind, so a card that is hot on five workloads and
@@ -964,6 +1160,9 @@ def assess_gpu(rows, gpu_id, gpu_name):
         watches.append(f"correctable errors on {len(ras_serious)} workload(s): " + ", ".join(parts))
     if incomplete:
         watches.append("did not complete: " + ", ".join(incomplete))
+    interconnect = list(interconnect or [])
+    if interconnect:
+        watches.append("interconnect: " + "; ".join(interconnect))
 
     if benign_ras:
         notes.append(f"PCIe link recovery events on {len(benign_ras)} workload(s): "
@@ -992,6 +1191,8 @@ def assess_gpu(rows, gpu_id, gpu_name):
         summary_bits.append(f"correctable errors on {len(ras_serious)}")
     if incomplete:
         summary_bits.append(f"{len(incomplete)} incomplete")
+    if interconnect:
+        summary_bits.append("interconnect issue" if len(interconnect) == 1 else f"{len(interconnect)} interconnect issues")
     if skipped and verdict != "INCOMPLETE":
         summary_bits.append(f"{len(skipped)} skipped")
     if verdict == "INCOMPLETE" and skipped:
@@ -1011,6 +1212,7 @@ def assess_gpu(rows, gpu_id, gpu_name):
             "correctable_errors": ras_serious,
             "incomplete": incomplete,
             "skipped": skipped,
+            "interconnect": interconnect,
         },
         "workloads_completed": ran,
     }
@@ -3618,6 +3820,10 @@ def main():
     log(f"Run ID: {timestamp_str}")
     incremental_snapshot = get_system_snapshot(platform)
     incremental_sequence = 0
+    interconnect_before = nvidia_interconnect_snapshot() if platform == "CUDA" else None
+    interconnect_line = describe_interconnect(interconnect_before)
+    if interconnect_line:
+        log(interconnect_line)
 
     if args.test in SUITES:
         log(f"Running test suite: {args.test.upper()} ({len(queue)} tests)")
@@ -3722,10 +3928,12 @@ def main():
     print("="*80)
 
     # The verdict: one word per GPU and the evidence.
+    interconnect_after = nvidia_interconnect_snapshot() if platform == "CUDA" else None
+    interconnect_found = interconnect_findings(interconnect_before, interconnect_after) if interconnect_before else {}
     verdicts = []
     for gid in target_gpus:
         name = next((g.get("name") for g in (gpu_info or []) if g.get("id") == gid), None) or f"GPU {gid}"
-        assessment = assess_gpu(final_results, gid, name)
+        assessment = assess_gpu(final_results, gid, name, interconnect=interconnect_found.get(gid))
         verdicts.append(assessment)
         print(format_verdict(assessment))
     print("="*80)
@@ -3753,6 +3961,12 @@ def main():
     full_snapshot = get_system_snapshot(platform)
     full_snapshot["test_results"] = final_results
     full_snapshot["verdicts"] = verdicts
+    if interconnect_before is not None:
+        full_snapshot["interconnect"] = {
+            "before": interconnect_before,
+            "after": interconnect_after,
+            "findings": {str(gpu): reasons for gpu, reasons in sorted(interconnect_found.items())},
+        }
     
     db_file = os.path.join(DATABASE_DIR, f"pantheon_report_{timestamp_str}.json")
     
