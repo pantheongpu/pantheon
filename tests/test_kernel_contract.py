@@ -51,7 +51,7 @@ def _run(binary, *args, timeout=120):
 
 # On the MOCK backend each of these has nothing to run on: no ray tracing
 # backend, no NVENC, one GPU, no matrix cores.
-SKIPPING = ["rt_virus", "media_enc_virus", "all_reduce", "p2p_thrasher", "mma_virus"]
+SKIPPING = ["rt_virus", "media_enc_virus", "all_reduce", "p2p_thrasher", "p2p_matrix", "mma_virus"]
 
 
 @pytest.mark.parametrize("name", SKIPPING)
