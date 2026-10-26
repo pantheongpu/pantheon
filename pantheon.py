@@ -530,8 +530,6 @@ def nvidia_ras_snapshot(gpu_id):
         "pcie.l0_to_recovery": "NVML_FI_DEV_PCIE_L0_TO_RECOVERY_COUNTER",
         "pcie.replay_rollover": "NVML_FI_DEV_PCIE_REPLAY_ROLLOVER_COUNTER",
     }
-    if pynvml and gpu_has_nvlink(gpu_id):
-        pcie_fields.update(NVLINK_ERROR_FIELDS)
     if not pynvml:
         for name in pcie_fields:
             metrics[name] = {"status": "unavailable", "value": None, "unit": "count"}
@@ -589,6 +587,9 @@ NVLINK_ERROR_FIELDS = {
     "nvlink.ecc_data": "NVML_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL",
 }
 INFORMATIONAL_RAS_PREFIXES = ("nvlink.",)
+# A source that is only recorded does not make a snapshot count as available: a
+# GPU whose ECC and PCIe counters could not be read is UNAVAILABLE, not CLEAN.
+INFORMATIONAL_RAS_SOURCES = ("nvlink",)
 
 
 def gpu_has_nvlink(gpu_id):
@@ -675,6 +676,38 @@ def nvidia_interconnect_snapshot():
         snapshot["status"] = "unsupported"
         snapshot["detail"] = "NVML reports no NVLink links on these GPUs"
     return snapshot
+
+
+def nvidia_nvlink_counters(gpu_id):
+    """The error counters of this GPU's NVLink links, read through NVML fields.
+
+    A source of their own, because the ECC and PCIe snapshot is one nvidia-smi
+    query that an older driver refuses whole when it does not know one field
+    (a V100 on driver 550 did), and these counters do not depend on it.
+    """
+    if not pynvml:
+        return ras_source("unavailable", detail="nvidia-ml-py (pynvml) is not installed")
+    if not gpu_has_nvlink(gpu_id):
+        return ras_source("unsupported", detail="this GPU has no NVLink links")
+    metrics = {}
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+        # One field per call. NVML answers NOT_SUPPORTED for every NVLink field of a
+        # call that includes one the GPU does not have (a V100 has no ecc_data, and
+        # asking for it beside the others turned all five into "unsupported").
+        for name, constant in NVLINK_ERROR_FIELDS.items():
+            field_id = getattr(pynvml, constant, None)
+            metrics[name] = {"status": "unsupported", "value": None, "unit": "count"}
+            if field_id is None:
+                continue
+            field = pynvml.nvmlDeviceGetFieldValues(handle, [field_id])[0]
+            if field.nvmlReturn == pynvml.NVML_SUCCESS:
+                metrics[name] = ras_value(field.value.ullVal)
+    except Exception as exc:
+        return ras_source("unavailable", detail=f"NVML NVLink fields unavailable: {exc}")
+    supported_values = [item for item in metrics.values() if item["status"] == "supported"]
+    return ras_source("supported" if supported_values else "unsupported", metrics)
 
 
 def describe_interconnect(snapshot):
@@ -925,6 +958,8 @@ def collect_ras_snapshot(platform_name, gpu_id):
         # is unknown (HIP) nothing can be attributed, and all of it is system-level.
         aer["events"], aer["system_events"] = split_events_by_gpu(events, bdf)
     sources = {"vendor_ras": vendor, "linux_pcie_aer": aer}
+    if platform_name == "CUDA":
+        sources["nvlink"] = nvidia_nvlink_counters(gpu_id)
     if platform_name == "HIP":
         sources["amd_cper"] = amd_cper_snapshot(gpu_id)
     return {
@@ -1009,7 +1044,8 @@ def summarize_ras_delta(delta, before=None, after=None):
     available = any(
         source.get("status") in ("supported", "partial")
         for snapshot in snapshots
-        for source in snapshot.get("sources", {}).values()
+        for name, source in snapshot.get("sources", {}).items()
+        if name not in INFORMATIONAL_RAS_SOURCES
     )
     if not available:
         return {"status": "UNAVAILABLE", "details": ["RAS/AER telemetry is not exposed by this system"],
