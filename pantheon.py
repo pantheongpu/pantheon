@@ -530,8 +530,6 @@ def nvidia_ras_snapshot(gpu_id):
         "pcie.l0_to_recovery": "NVML_FI_DEV_PCIE_L0_TO_RECOVERY_COUNTER",
         "pcie.replay_rollover": "NVML_FI_DEV_PCIE_REPLAY_ROLLOVER_COUNTER",
     }
-    if pynvml and gpu_has_nvlink(gpu_id):
-        pcie_fields.update(NVLINK_ERROR_FIELDS)
     if not pynvml:
         for name in pcie_fields:
             metrics[name] = {"status": "unavailable", "value": None, "unit": "count"}
@@ -589,6 +587,9 @@ NVLINK_ERROR_FIELDS = {
     "nvlink.ecc_data": "NVML_FI_DEV_NVLINK_ECC_DATA_ERROR_COUNT_TOTAL",
 }
 INFORMATIONAL_RAS_PREFIXES = ("nvlink.",)
+# A source that is only recorded does not make a snapshot count as available: a
+# GPU whose ECC and PCIe counters could not be read is UNAVAILABLE, not CLEAN.
+INFORMATIONAL_RAS_SOURCES = ("nvlink",)
 
 
 def gpu_has_nvlink(gpu_id):
@@ -675,6 +676,38 @@ def nvidia_interconnect_snapshot():
         snapshot["status"] = "unsupported"
         snapshot["detail"] = "NVML reports no NVLink links on these GPUs"
     return snapshot
+
+
+def nvidia_nvlink_counters(gpu_id):
+    """The error counters of this GPU's NVLink links, read through NVML fields.
+
+    A source of their own, because the ECC and PCIe snapshot is one nvidia-smi
+    query that an older driver refuses whole when it does not know one field
+    (a V100 on driver 550 did), and these counters do not depend on it.
+    """
+    if not pynvml:
+        return ras_source("unavailable", detail="nvidia-ml-py (pynvml) is not installed")
+    if not gpu_has_nvlink(gpu_id):
+        return ras_source("unsupported", detail="this GPU has no NVLink links")
+    metrics = {}
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+        # One field per call. NVML answers NOT_SUPPORTED for every NVLink field of a
+        # call that includes one the GPU does not have (a V100 has no ecc_data, and
+        # asking for it beside the others turned all five into "unsupported").
+        for name, constant in NVLINK_ERROR_FIELDS.items():
+            field_id = getattr(pynvml, constant, None)
+            metrics[name] = {"status": "unsupported", "value": None, "unit": "count"}
+            if field_id is None:
+                continue
+            field = pynvml.nvmlDeviceGetFieldValues(handle, [field_id])[0]
+            if field.nvmlReturn == pynvml.NVML_SUCCESS:
+                metrics[name] = ras_value(field.value.ullVal)
+    except Exception as exc:
+        return ras_source("unavailable", detail=f"NVML NVLink fields unavailable: {exc}")
+    supported_values = [item for item in metrics.values() if item["status"] == "supported"]
+    return ras_source("supported" if supported_values else "unsupported", metrics)
 
 
 def describe_interconnect(snapshot):
@@ -925,6 +958,8 @@ def collect_ras_snapshot(platform_name, gpu_id):
         # is unknown (HIP) nothing can be attributed, and all of it is system-level.
         aer["events"], aer["system_events"] = split_events_by_gpu(events, bdf)
     sources = {"vendor_ras": vendor, "linux_pcie_aer": aer}
+    if platform_name == "CUDA":
+        sources["nvlink"] = nvidia_nvlink_counters(gpu_id)
     if platform_name == "HIP":
         sources["amd_cper"] = amd_cper_snapshot(gpu_id)
     return {
@@ -1009,7 +1044,8 @@ def summarize_ras_delta(delta, before=None, after=None):
     available = any(
         source.get("status") in ("supported", "partial")
         for snapshot in snapshots
-        for source in snapshot.get("sources", {}).values()
+        for name, source in snapshot.get("sources", {}).items()
+        if name not in INFORMATIONAL_RAS_SOURCES
     )
     if not available:
         return {"status": "UNAVAILABLE", "details": ["RAS/AER telemetry is not exposed by this system"],
@@ -1063,6 +1099,39 @@ def limit_reason_set(value):
 def is_skipped_row(row):
     """True for a row of a workload that declined to run, which is not a pass."""
     return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
+
+
+# A GPU whose slowest transfer to a peer is under this share of the median GPU's
+# slowest. On an 8x V100 NVLink node, run alone and with all eight sending at
+# once, every GPU's score was within 0.1% of the others. 0.85 leaves room for a
+# noisier platform and still catches a link that has lost a sixth of its speed.
+# Not yet checked on an NVSwitch node.
+P2P_MATRIX_WATCH_RATIO = 0.85
+
+
+def p2p_matrix_finding(rows, gpu_id):
+    """Why this GPU's links to its peers look slow beside the other GPUs', or None.
+
+    p2p_matrix gives each GPU the speed of its slowest transfer to a peer, so
+    one GPU with a slow link or a lost NVLink link reads low while the rest of
+    the node reads alike. It needs three GPUs to have a median to compare with.
+    """
+    scores = {}
+    for row in rows:
+        if row.get("Test Name") != "p2p_matrix" or row.get("Failure Stage") or is_skipped_row(row):
+            continue
+        if row.get("Unit") != "GB/s" or str(row.get("Status") or "PASS").upper() == "FAIL":
+            continue
+        score = _num(row.get("Score"), None)
+        if score is not None and score > 0:
+            scores[row.get("GPU ID")] = score
+    if len(scores) < 3 or gpu_id not in scores:
+        return None
+    median = statistics.median(scores.values())
+    if scores[gpu_id] < P2P_MATRIX_WATCH_RATIO * median:
+        return (f"p2p_matrix: the slowest transfer from GPU {gpu_id} to a peer ran at {scores[gpu_id]:.0f} GB/s; "
+                f"the median GPU's slowest is {median:.0f} GB/s")
+    return None
 
 
 def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
@@ -1161,6 +1230,9 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     if incomplete:
         watches.append("did not complete: " + ", ".join(incomplete))
     interconnect = list(interconnect or [])
+    slow_links = p2p_matrix_finding(rows, gpu_id)
+    if slow_links:
+        interconnect.append(slow_links)
     if interconnect:
         watches.append("interconnect: " + "; ".join(interconnect))
 
@@ -1268,6 +1340,7 @@ TEST_REGISTRY = {
     # --- NEW: Specialized Hardware Blocks ---
     "p2p_thrasher":     {"bin": "p2p_thrasher",     "args": [], "desc": "P2P Thrasher (Multi-GPU Interconnect)"},
     "all_reduce":       {"bin": "all_reduce",       "args": [], "desc": "All-Reduce (Two-Rank Peer DMA Collective)"},
+    "p2p_matrix":       {"bin": "p2p_matrix",       "args": [], "desc": "P2P Matrix (All-Pairs Interconnect Bandwidth)"},
     "transformer_virus":{"bin": "transformer_virus","args": [], "desc": "Transformer Virus (FP8/FP4 Engine)"},
     "llm_decode":       {"bin": "llm_decode",       "args": [], "desc": "LLM Decode (KV-Cache Gather and Projection)"},
     "llm_prefill":      {"bin": "llm_prefill",      "args": [], "desc": "LLM Prefill (Causal Attention and Projections)"},
@@ -1311,7 +1384,7 @@ SUITES = {
     ],
     "interconnect": [
         "tlb_avalanche", "scheduler", 
-        "pcie_bandwidth", "p2p_thrasher", "all_reduce", "memory_pc_pingpong",
+        "pcie_bandwidth", "p2p_thrasher", "p2p_matrix", "all_reduce", "memory_pc_pingpong",
         "memory_tsv_thrasher"
     ],
     "diagnostics": [
@@ -1341,6 +1414,7 @@ SUITES = {
 # them with one visible GPU produces a misleading zero result.
 MIN_GPUS_FOR_TEST = {
     "p2p_thrasher": 2,
+    "p2p_matrix": 2,
     "all_reduce": 2,
 }
 

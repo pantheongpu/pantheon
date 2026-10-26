@@ -2177,7 +2177,7 @@ def test_workload_launch_isolates_one_card_and_leaves_the_rest_of_the_environmen
     assert env == {"PATH": "/bin", "CUDA_VISIBLE_DEVICES": "2", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
 
 
-@pytest.mark.parametrize("test_name", ["all_reduce", "p2p_thrasher"])
+@pytest.mark.parametrize("test_name", ["all_reduce", "p2p_thrasher", "p2p_matrix"])
 def test_workloads_that_need_peers_keep_every_card_visible(monkeypatch, test_name):
     monkeypatch.setattr(pantheon, "DEVICE_ORDINALS", {})
     assert pantheon.workload_launch(test_name, 2, "CUDA", {}) == (2, None)
