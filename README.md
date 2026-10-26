@@ -436,7 +436,7 @@ recorded with the RAS snapshot of each workload and are not judged. Without
 `interconnect` in the report says which. Reading the links puts no load on them.
 Of the workloads, `p2p_thrasher` and `all_reduce` exercise one pair of cards each,
 and `p2p_matrix` measures every GPU's transfers to all its peers. A GPU whose
-slowest transfer is under 75% of the median GPU's makes the verdict WATCH too.
+slowest transfer is under 85% of the median GPU's makes the verdict WATCH too.
 
 `--test quick` is the ten-minute version of this: idle baseline, memory read,
 a march test, a retention check and one power-limited compute load.

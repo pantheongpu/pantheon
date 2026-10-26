@@ -1102,8 +1102,11 @@ def is_skipped_row(row):
 
 
 # A GPU whose slowest transfer to a peer is under this share of the median GPU's
-# slowest. A starting value, not yet checked against a real node.
-P2P_MATRIX_WATCH_RATIO = 0.75
+# slowest. On an 8x V100 NVLink node, run alone and with all eight sending at
+# once, every GPU's score was within 0.1% of the others. 0.85 leaves room for a
+# noisier platform and still catches a link that has lost a sixth of its speed.
+# Not yet checked on an NVSwitch node.
+P2P_MATRIX_WATCH_RATIO = 0.85
 
 
 def p2p_matrix_finding(rows, gpu_id):

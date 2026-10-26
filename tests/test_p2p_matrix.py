@@ -201,3 +201,18 @@ def test_a_slow_gpu_makes_the_verdict_a_watch_listed_as_interconnect():
     assert verdict["findings"]["interconnect"] == [pantheon.p2p_matrix_finding(rows, 2)]
     healthy = pantheon.assess_gpu(rows, 0, "NVIDIA A100-SXM4-40GB")
     assert healthy["findings"]["interconnect"] == []
+
+
+def test_the_ratio_is_the_documented_85_percent():
+    assert pantheon.P2P_MATRIX_WATCH_RATIO == 0.85
+    just_above = _node([100.0, 100.0, 100.0, 86.0])
+    just_below = _node([100.0, 100.0, 100.0, 84.0])
+    assert pantheon.p2p_matrix_finding(just_above, 3) is None
+    assert pantheon.p2p_matrix_finding(just_below, 3) is not None
+
+
+def test_a_node_like_the_v100_mesh_reads_alike():
+    """The real scores of 8 V100s on 2026-10-26, each its slowest single-link peer."""
+    scores = [24.2536, 24.2542, 24.2545, 24.2545, 24.2533, 24.2542, 24.2544, 24.2548]
+    rows = _node(scores)
+    assert [pantheon.p2p_matrix_finding(rows, gpu) for gpu in range(8)] == [None] * 8

@@ -10,8 +10,10 @@
 // Pantheon starts one copy of this workload per selected GPU. Each copy measures
 // its own row of the matrix (the transfers that start at its GPU), so together
 // the copies cover every ordered pair exactly once. They take turns, through a
-// lock file shared by the copies of one run, because two GPUs sending at once
-// would share a link and read slow for it.
+// lock file shared by the copies of one run, so that no two GPUs are timed while
+// sharing a link. On an 8x V100 NVLink mesh a control run with all eight sending
+// at once read the same as taking turns; a switched fabric, where senders can
+// meet at a receiver, has not been tried, and taking turns costs only time.
 
 // --- PAYLOAD ---
 // The value depends on the sending GPU, so data that arrives from the wrong card
