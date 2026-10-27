@@ -203,6 +203,29 @@ def test_a_slow_gpu_makes_the_verdict_a_watch_listed_as_interconnect():
     assert healthy["findings"]["interconnect"] == []
 
 
+def test_a_failed_p2p_matrix_is_an_interconnect_watch_not_a_fault_and_not_a_missing_run():
+    """On 8 H100s with NVSwitch (2026-10-27) an injected bad copy failed verification on every GPU and read "WATCH (1 incomplete)",
+    as if the test had never finished. It cannot say which GPU, link or switch is at fault, so it stays a WATCH, filed as interconnect."""
+    rows = _node([396.0, 396.0, 396.0])
+    rows.append(_row(3, 0.0, status="FAIL", unit="ERR"))
+    verdict = pantheon.assess_gpu(rows, 3, "NVIDIA H100 80GB HBM3")
+    assert verdict["verdict"] == "WATCH"
+    assert verdict["reasons"] == ["interconnect: p2p_matrix failed: a peer copy arrived with wrong data or the test aborted, see its log"]
+    assert verdict["findings"]["incomplete"] == []
+    assert verdict["findings"]["faults"] == []
+    assert verdict["findings"]["interconnect"] == ["p2p_matrix failed: a peer copy arrived with wrong data or the test aborted, see its log"]
+    assert verdict["summary"] == "interconnect issue"
+    assert pantheon.assess_gpu(rows, 0, "NVIDIA H100 80GB HBM3")["verdict"] == "HEALTHY"
+
+
+def test_other_failed_workloads_are_still_incomplete_and_failed_memory_tests_still_a_fault():
+    rows = [_row(0, 0.0, status="FAIL", unit="ERR", test="memory_read"), _row(0, 0.0, status="FAIL", unit="ERR", test="march_test")]
+    verdict = pantheon.assess_gpu(rows, 0, "NVIDIA H100 80GB HBM3")
+    assert verdict["verdict"] == "FAULT"
+    assert verdict["findings"]["incomplete"] == ["memory_read"]
+    assert verdict["findings"]["interconnect"] == []
+
+
 def test_the_ratio_is_the_documented_85_percent():
     assert pantheon.P2P_MATRIX_WATCH_RATIO == 0.85
     just_above = _node([100.0, 100.0, 100.0, 86.0])

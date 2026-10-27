@@ -1063,7 +1063,11 @@ DIAGNOSTIC_TESTS = {
     "march_test", "galpat", "memory_hammer", "memory_retention",
     "memory_retention_bake", "ras_validator",
 }
-THERMAL_WATCH_C = 90            # GPU core: within a few degrees of slowdown
+# Workloads that move data between GPUs. A failure here is a copy that arrived wrong
+# or an aborted copy, so it is filed with the interconnect findings: it cannot say which
+# end, link or switch is at fault, which a FAULT on one GPU would claim.
+PEER_COPY_TESTS = {"p2p_matrix"}
+THERMAL_WATCH_C = 90           # GPU core: within a few degrees of slowdown
 MEMORY_THERMAL_WATCH_C = 95     # HBM/GDDR6X junction: same idea
 # Counters that move on healthy hardware: the PCIe link cycling power states
 # ticks l0_to_recovery on every run of some platforms (all 26 Blackwell RTX PRO
@@ -1144,6 +1148,7 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
     faults, notes = [], []
     throttled, hot, hot_memory, incomplete = [], [], [], []
+    peer_copy_failed = []
     ras_serious, benign_ras = {}, []
     skipped = []
     throttle_seconds = {}
@@ -1158,6 +1163,8 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
         if failed:
             if test in DIAGNOSTIC_TESTS:
                 faults.append(f"{test} failed: memory errors detected or the workload aborted, see its log")
+            elif test in PEER_COPY_TESTS:
+                peer_copy_failed.append(test)
             else:
                 incomplete.append(test)
             continue
@@ -1233,6 +1240,8 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     slow_links = p2p_matrix_finding(rows, gpu_id)
     if slow_links:
         interconnect.append(slow_links)
+    interconnect.extend(f"{test} failed: a peer copy arrived with wrong data or the test aborted, see its log"
+                        for test in peer_copy_failed)
     if interconnect:
         watches.append("interconnect: " + "; ".join(interconnect))
 
