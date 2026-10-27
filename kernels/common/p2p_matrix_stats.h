@@ -65,6 +65,9 @@ inline double pantheon_pair_bandwidth(const std::vector<double>& batch_bandwidth
 // An exclusive lock on a file named for the parent process, which is the runner
 // that started every copy. Without a parent in common (a copy started by hand)
 // there is nobody to wait for.
+// Keep it. On 8 H100s behind NVSwitch, eight copies at once read 65 to 400 GB/s per
+// row where taking turns read 396 GB/s for every pair: without the lock the numbers
+// measure who else is copying. (On a V100 mesh it made no difference.)
 struct PantheonMatrixTurn {
     int fd = -1;
 

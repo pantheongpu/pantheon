@@ -436,7 +436,11 @@ recorded with the RAS snapshot of each workload and are not judged. Without
 `interconnect` in the report says which. Reading the links puts no load on them.
 Of the workloads, `p2p_thrasher` and `all_reduce` exercise one pair of cards each,
 and `p2p_matrix` measures every GPU's transfers to all its peers. A GPU whose
-slowest transfer is under 85% of the median GPU's makes the verdict WATCH too.
+slowest transfer is under 85% of the median GPU's makes the verdict WATCH too, and
+so does a `p2p_matrix` copy that arrives with wrong data or a run that aborts: the
+test cannot say which GPU, link or switch is at fault, so it is not a FAULT. The
+readings have been checked on healthy nodes only: an 8x V100 NVLink mesh and 8x H100
+behind NVSwitch. NVSwitch on A100 and B200 has not been tried.
 
 `--test quick` is the ten-minute version of this: idle baseline, memory read,
 a march test, a retention check and one power-limited compute load.
