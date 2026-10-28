@@ -150,7 +150,7 @@ Pantheon tests only the cards its job has been given. If `CUDA_VISIBLE_DEVICES` 
 
 Reports keep `nvidia-smi`'s numbers. A run with `CUDA_VISIBLE_DEVICES=2` tests one card and reports it as GPU 2, with that card's UUID, temperature and error counters, and leaves the hidden cards out of the report.
 
-On NVIDIA each workload is started with only its own card visible, as device 0. A CUDA program told to use device 2 still opens a context on device 0 first, and on a machine testing every card at once, with each workload taking 99% of its card's memory, those contexts make allocations fail with "out of memory" on GPU 0. The three workloads that need other cards, `all_reduce`, `p2p_thrasher` and `p2p_matrix`, keep every card the job was given visible.
+On NVIDIA each workload is started with only its own card visible, as device 0. A CUDA program told to use device 2 still opens a context on device 0 first, and on a machine testing every card at once, with each workload taking 99% of its card's memory, those contexts make allocations fail with "out of memory" on GPU 0. The four workloads that need other cards, `all_reduce`, `p2p_thrasher`, `p2p_matrix` and `nccl_all_reduce`, keep every card the job was given visible.
 
 ```bash
 # A job that was given the third card of a four-card machine
@@ -435,11 +435,14 @@ recorded with the RAS snapshot of each workload and are not judged. Without
 `nvidia-ml-py`, or on a node without NVLink, none of this is available, and
 `interconnect` in the report says which. Reading the links puts no load on them.
 Of the workloads, `p2p_thrasher` and `all_reduce` exercise one pair of cards each,
-and `p2p_matrix` measures every GPU's transfers to all its peers. A GPU whose
-slowest transfer is under 85% of the median GPU's makes the verdict WATCH too, and
-so does a `p2p_matrix` copy that arrives with wrong data or a run that aborts: the
-test cannot say which GPU, link or switch is at fault, so it is not a FAULT. The
-readings have been checked on healthy nodes only: an 8x V100 NVLink mesh and 8x H100
+`p2p_matrix` measures every GPU's transfers to all its peers, and `nccl_all_reduce`
+runs one all-reduce across every selected GPU through NCCL (RCCL on AMD), the call a
+training job makes. It is skipped, with the reason, where the library is not installed,
+and its score has no threshold yet. A GPU whose slowest `p2p_matrix` transfer is under
+85% of the median GPU's makes the verdict WATCH, and so does a `p2p_matrix` or
+`nccl_all_reduce` run that gets wrong data or aborts: the test cannot say which GPU,
+link or switch is at fault, so it is not a FAULT. The link and fabric readings and
+`p2p_matrix` have been checked on healthy nodes only: an 8x V100 NVLink mesh and 8x H100
 behind NVSwitch. NVSwitch on A100 and B200 has not been tried.
 
 `--test quick` is the ten-minute version of this: idle baseline, memory read,
