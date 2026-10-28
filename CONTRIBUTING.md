@@ -22,8 +22,18 @@ python3 -m pytest
 ## What CI checks, and what it cannot
 
 CI runs on GitHub-hosted runners with no GPU. It builds the mock backend,
-runs the unit tests, smoke tests the runner, compiles every kernel with `nvcc`,
-and verifies that each workload detects an injected fault.
+runs the unit tests, smoke tests the runner, compiles every kernel with `nvcc`
+and `hipcc`, and verifies that each workload detects an injected fault.
+
+When a change touches `kernels/` or the `Makefile`, it also runs every workload
+on two simulated A10s with [pantheonsim](https://github.com/pantheongpu/pantheonsim)
+(job *Workloads on pantheonsim*). That executes the real compiled CUDA code,
+including the multi-GPU and matrix-core workloads the mock backend can only skip,
+so a workload that does not run end to end is found before the merge. It checks
+that the code runs and gets the right answers, not how fast a GPU would run it.
+A workload shown as skipped there did not run (`nccl_all_reduce` does, because it
+needs the group of processes that `pantheon.py` starts), so it still needs a run
+on a real multi-GPU machine.
 
 Two things it cannot check, both of which need real hardware:
 

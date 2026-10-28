@@ -10,6 +10,13 @@ name: CI
 #     thread, so atomic ordering there is trivially deterministic. A kernel
 #     whose result depends on execution order verifies clean under mock and
 #     fails on hardware -- that class of bug is invisible here by construction.
+#
+# The pantheonsim job at the end narrows the first gap without a GPU: it runs
+# every compiled workload on simulated GPUs, so the multi-GPU, matrix-core and
+# media workloads that the mock backend can only skip are executed, and a change
+# is answered here and not by the next daily run over there. It checks function,
+# not speed, and the simulator runs threads in a fixed order, so it is no help
+# with the second gap either.
 
 on:
   push:
@@ -184,3 +191,97 @@ jobs:
             echo "::error::Expected at least 40 binaries, compiled ${count}"
             exit 1
           fi
+
+  # The workloads, compiled by their own Makefile and run on two simulated A10s.
+  #
+  # pantheonsim (https://github.com/pantheongpu/pantheonsim) already runs every
+  # workload of main on 37 simulated machines each day. This is the same runner,
+  # on one machine, for the change in front of you. Two GPUs, so the multi-GPU
+  # workloads (all_reduce, p2p_thrasher, p2p_matrix) take their peer paths;
+  # nccl_all_reduce reports a skip, as it needs the group of processes that
+  # pantheon.py starts.
+  #
+  # The Action is pinned to a commit and so is the simulator it builds; move the
+  # pin on purpose. The first run after a new pin builds the simulator (about
+  # twenty minutes); the Action caches that build under its source, and main
+  # pushes keep the cache warm for pull requests. Not a required check: a break
+  # in the simulator should not stop a merge here.
+  pantheonsim:
+    name: Workloads on pantheonsim (2 x A10)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # A pull request that touches no workload, no Makefile and not this job has
+      # nothing new to run. A push to main or a manual run always runs, which is
+      # what keeps the simulator's cache warm for the pull requests.
+      - name: Does this change touch the workloads?
+        id: relevant
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          if git diff --name-only "$BASE" HEAD | grep -qE '^(kernels/|Makefile$|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No workload, Makefile or CI change: nothing to run on the simulator." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: PantheonSim
+        if: steps.relevant.outputs.run == 'true'
+        id: sim
+        uses: pantheongpu/pantheonsim@208e80ccf0abe4b29a40a75c1da76f87b5dd3e34
+        with:
+          gpu: nvidia/a10
+          count: 2
+          # The runner builds and runs the workloads inside `vgpu shell`; putting the
+          # simulator's libraries on the job's path would only get in the way of the
+          # toolkit's own.
+          library-path: "false"
+
+      # The runner skips cleanly (and exits 0) when it cannot start, so a job that
+      # ran nothing would look green. The check after it asks for results.
+      - name: Run every workload on the simulator
+        if: steps.relevant.outputs.run == 'true'
+        env:
+          VGPU_PANTHEON_DIR: ${{ github.workspace }}
+          VGPU_BUILD_DIR: ${{ steps.sim.outputs.build-dir }}
+          VGPU_WORKLOADS: all
+          VGPU_WORKLOAD_GPU: nvidia/a10
+          VGPU_WORKLOAD_COUNT: "2"
+          # CPU-sized, the way the simulator's own daily run is: the same code over a
+          # smaller working set. A GPU retires about 10^13 operations a second and
+          # the simulator about 10^8.
+          VGPU_WORKLOAD_SECONDS: "5"
+          VGPU_WORKLOAD_ARGS: --kernel_loops 2 --warmup_iters 1 --grid_size 4
+          VGPU_WORKLOAD_TIMEOUT: "300"
+          VGPU_WORKLOAD_GEMM_SIZE: "256"
+          VGPU_WORKLOAD_REPORT: ${{ runner.temp }}/report
+        run: |
+          "${{ steps.sim.outputs.source-dir }}/tests/workloads/run_pantheon_workloads.sh"
+
+      - name: Did it run anything?
+        if: steps.relevant.outputs.run == 'true'
+        run: |
+          results="$RUNNER_TEMP/report/results.tsv"
+          if [ ! -s "$results" ] || ! grep -q "$(printf '\tPASS\t')" "$results"; then
+            echo "::error::The runner wrote no passing result, so no workload ran on the simulator"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always() && steps.relevant.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: workloads-on-pantheonsim
+          path: ${{ runner.temp }}/report
+          retention-days: 14
+          if-no-files-found: ignore
