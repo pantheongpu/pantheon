@@ -237,7 +237,7 @@ jobs:
       - name: PantheonSim
         if: steps.relevant.outputs.run == 'true'
         id: sim
-        uses: pantheongpu/pantheonsim@208e80ccf0abe4b29a40a75c1da76f87b5dd3e34
+        uses: pantheongpu/pantheonsim@7b376d5c71c9ea8ea720f3bdeee2c0338bd04db6
         with:
           gpu: nvidia/a10
           count: 2
