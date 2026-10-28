@@ -24,6 +24,8 @@ import atexit
 import builtins
 import html
 import ctypes
+import importlib.util
+import uuid
 try:
     import fcntl
 except ImportError:  # not Linux; the memory-vendor probe is Linux-only
@@ -1063,10 +1065,14 @@ DIAGNOSTIC_TESTS = {
     "march_test", "galpat", "memory_hammer", "memory_retention",
     "memory_retention_bake", "ras_validator",
 }
-# Workloads that move data between GPUs. A failure here is a copy that arrived wrong
-# or an aborted copy, so it is filed with the interconnect findings: it cannot say which
-# end, link or switch is at fault, which a FAULT on one GPU would claim.
-PEER_COPY_TESTS = {"p2p_matrix"}
+# Workloads that move data between GPUs, with what a failure of each one means. A
+# failure here is data that arrived wrong or a run that aborted, so it is filed with the
+# interconnect findings: it cannot say which end, link or switch is at fault, which a
+# FAULT on one GPU would claim.
+PEER_COPY_TESTS = {
+    "p2p_matrix": "a peer copy arrived with wrong data or the test aborted",
+    "nccl_all_reduce": "the all-reduce result was wrong or the test aborted",
+}
 THERMAL_WATCH_C = 90           # GPU core: within a few degrees of slowdown
 MEMORY_THERMAL_WATCH_C = 95     # HBM/GDDR6X junction: same idea
 # Counters that move on healthy hardware: the PCIe link cycling power states
@@ -1240,8 +1246,7 @@ def assess_gpu(rows, gpu_id, gpu_name, interconnect=None):
     slow_links = p2p_matrix_finding(rows, gpu_id)
     if slow_links:
         interconnect.append(slow_links)
-    interconnect.extend(f"{test} failed: a peer copy arrived with wrong data or the test aborted, see its log"
-                        for test in peer_copy_failed)
+    interconnect.extend(f"{test} failed: {PEER_COPY_TESTS[test]}, see its log" for test in peer_copy_failed)
     if interconnect:
         watches.append("interconnect: " + "; ".join(interconnect))
 
@@ -1350,6 +1355,7 @@ TEST_REGISTRY = {
     "p2p_thrasher":     {"bin": "p2p_thrasher",     "args": [], "desc": "P2P Thrasher (Multi-GPU Interconnect)"},
     "all_reduce":       {"bin": "all_reduce",       "args": [], "desc": "All-Reduce (Two-Rank Peer DMA Collective)"},
     "p2p_matrix":       {"bin": "p2p_matrix",       "args": [], "desc": "P2P Matrix (All-Pairs Interconnect Bandwidth)"},
+    "nccl_all_reduce":  {"bin": "nccl_all_reduce",  "args": [], "desc": "NCCL All-Reduce (All GPUs, Vendor Collective)"},
     "transformer_virus":{"bin": "transformer_virus","args": [], "desc": "Transformer Virus (FP8/FP4 Engine)"},
     "llm_decode":       {"bin": "llm_decode",       "args": [], "desc": "LLM Decode (KV-Cache Gather and Projection)"},
     "llm_prefill":      {"bin": "llm_prefill",      "args": [], "desc": "LLM Prefill (Causal Attention and Projections)"},
@@ -1393,7 +1399,7 @@ SUITES = {
     ],
     "interconnect": [
         "tlb_avalanche", "scheduler", 
-        "pcie_bandwidth", "p2p_thrasher", "p2p_matrix", "all_reduce", "memory_pc_pingpong",
+        "pcie_bandwidth", "p2p_thrasher", "p2p_matrix", "all_reduce", "nccl_all_reduce", "memory_pc_pingpong",
         "memory_tsv_thrasher"
     ],
     "diagnostics": [
@@ -1425,7 +1431,12 @@ MIN_GPUS_FOR_TEST = {
     "p2p_thrasher": 2,
     "p2p_matrix": 2,
     "all_reduce": 2,
+    "nccl_all_reduce": 2,
 }
+
+# Workloads whose copies have to agree on who takes part (a collective works only if every
+# member calls it). Each copy is told the devices of the group and the name of the run.
+COLLECTIVE_TESTS = {"nccl_all_reduce"}
 
 
 def filter_gpu_compatible_tests(queue, available_gpu_count):
@@ -2528,9 +2539,10 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
     config = TEST_REGISTRY[test_name]
     binary = os.path.join(BUILD_DIR, config["bin"])
     procs = []
+    run_token = uuid.uuid4().hex[:12]    # names this launch to the copies of a collective
     
     for gpu in gpu_ids:
-        ordinal, workload_env = workload_launch(test_name, gpu, platform)
+        ordinal, workload_env = workload_launch(test_name, gpu, platform, peers=gpu_ids, token=run_token)
         workload_cmd = [binary, str(ordinal), str(duration), str(mem_pct)] + config["args"]
         cmd = list(workload_cmd)
        
@@ -2740,7 +2752,36 @@ def device_ordinal(gpu):
     return DEVICE_ORDINALS.get(gpu, gpu)
 
 
-def workload_launch(test_name, gpu, platform_name, environ=None):
+def find_pip_nccl():
+    """The NCCL a pip install carries (nvidia-nccl-cu12, which PyTorch pulls in), or None.
+
+    The package keeps libnccl.so.2 inside itself, outside the loader's path, so a
+    workload that loads NCCL at run time is told where it is."""
+    try:
+        spec = importlib.util.find_spec("nvidia.nccl")
+    except (ImportError, ValueError):
+        return None
+    for root in (spec.submodule_search_locations or []) if spec else []:
+        candidate = os.path.join(root, "lib", "libnccl.so.2")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def collective_environment(environ, peers, token, platform_name):
+    """The environment of one copy of a collective workload: the devices that take part
+    (as the workload numbers them), what this run is called, and where NCCL is."""
+    shared = dict(environ)
+    shared["PANTHEON_PEER_GPUS"] = ",".join(str(device_ordinal(peer)) for peer in peers)
+    shared["PANTHEON_RUN_TOKEN"] = token
+    if platform_name == "CUDA" and not shared.get("PANTHEON_NCCL_LIB"):
+        found = find_pip_nccl()
+        if found:
+            shared["PANTHEON_NCCL_LIB"] = found
+    return shared
+
+
+def workload_launch(test_name, gpu, platform_name, environ=None, peers=None, token=None):
     """The device number and environment a workload is started with.
 
     A CUDA program told to use device 2 still opens a context on device 0 first,
@@ -2755,11 +2796,15 @@ def workload_launch(test_name, gpu, platform_name, environ=None):
       * the platform is not CUDA (the AMD variables are not translated yet);
       * the workload needs peers or a collective (MIN_GPUS_FOR_TEST);
       * CUDA_VISIBLE_DEVICES names a MIG device, which Pantheon cannot match to a card.
+    A collective (COLLECTIVE_TESTS) given the cards that take part (`peers`) and the name
+    of the run (`token`) gets its own environment that says so.
     """
     environ = os.environ if environ is None else environ
     if (platform_name != "CUDA"
             or MIN_GPUS_FOR_TEST.get(test_name, 1) > 1
             or "MIG-" in (environ.get("CUDA_VISIBLE_DEVICES") or "").upper()):
+        if test_name in COLLECTIVE_TESTS and peers and token:
+            return device_ordinal(gpu), collective_environment(environ, peers, token, platform_name)
         return device_ordinal(gpu), None
     isolated = dict(environ)
     # Pantheon numbers cards as nvidia-smi does, and main() sets this order so
