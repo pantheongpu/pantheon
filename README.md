@@ -508,6 +508,23 @@ summary you found interesting. Reproducible bugs go to Issues. Results that
 come with a report file can be submitted to the public database through the
 [website repository](https://github.com/pantheongpu/pantheongpu_website/issues/new?template=benchmark-submission.yml).
 
+## License
+
+Pantheon is licensed under the [GNU Affero General Public License, version 3](LICENSE)
+(AGPL-3.0-only). Using it is free, including at a company and for commercial
+work: run it on your own, rented or customers' GPUs and publish or sell the
+results. If you modify Pantheon and distribute it, or let other people use your
+modified version over a network, the AGPL requires you to offer them the source
+under the same license. To build Pantheon into a product, or to offer it as a
+service, without publishing your source, buy a commercial license: see
+[COMMERCIAL.md](COMMERCIAL.md).
+
+Releases up to and including v1.2.4 were published under the Apache License 2.0
+and remain available under it ([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)).
+Contributions are accepted under the [Contributor License Agreement](CLA.md). The
+names and logos are not covered by the license; see the
+[trademark policy](TRADEMARK.md).
+
 ## Disclaimer
 
 Pantheon is an independent project. It is not generated, verified, or endorsed
