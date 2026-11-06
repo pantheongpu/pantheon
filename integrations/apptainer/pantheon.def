@@ -27,7 +27,7 @@ From: ghcr.io/pantheongpu/pantheon:1.2.4-cuda12.8
 %labels
     org.opencontainers.image.title Pantheon
     org.opencontainers.image.source https://github.com/pantheongpu/pantheon
-    org.opencontainers.image.licenses Apache-2.0
+    org.opencontainers.image.licenses AGPL-3.0-only
 
 %help
     GPU diagnostics with Pantheon. Run with --nv on NVIDIA nodes:

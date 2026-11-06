@@ -2,7 +2,7 @@
 #
 #   reframe -c pantheon_check.py -r
 #
-# Part of Pantheon (https://github.com/pantheongpu/pantheon), Apache-2.0.
+# Part of Pantheon (https://github.com/pantheongpu/pantheon), AGPL-3.0-only.
 #
 # flake8: noqa: F821
 # (parameter, variable and the decorators are names that ReFrame provides)
