@@ -1,16 +1,7 @@
 Pantheon GPU
 Copyright (c) Pantheon GPU contributors
 
-This product is licensed under the GNU Affero General Public License, version 3
-(AGPL-3.0-only). See LICENSE. A commercial license is also available; see
-COMMERCIAL.md.
-
-Code published before the change to the AGPL, including every release up to
-v1.2.4, was licensed under the Apache License, Version 2.0 and remains available
-under it. The text is in LICENSES/Apache-2.0.txt.
-
-The names and logos of the project are not licensed under the AGPL. See
-TRADEMARK.md.
+This product is licensed under the Apache License, Version 2.0. See LICENSE.
 
 ================================================================================
 Third-party components bundled in this repository

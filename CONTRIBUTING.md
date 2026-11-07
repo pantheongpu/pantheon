@@ -84,18 +84,3 @@ Do not add a file whose licence forbids redistribution. A test scans the tree
 for such terms and fails the build. NVIDIA OptiX headers are the standing
 example: they are not carried here, and `rt_virus` probes for them and builds a
 dummy kernel when absent. See `NOTICE`.
-
-## License and the CLA
-
-Pantheon is released under the AGPL-3.0-only license, and the maintainers also
-offer it under a commercial license (see `COMMERCIAL.md`). To do that, every
-contributor agrees to the [Contributor License Agreement](CLA.md). You keep the
-copyright in what you write; the CLA lets the maintainers distribute it under
-both licenses.
-
-To agree, comment on your first pull request with exactly:
-
-    I have read the Pantheon CLA and I agree to its terms.
-
-A pull request cannot be merged until its author has agreed. If you contribute
-as part of your job, read the section of the CLA on employers first.
