@@ -415,6 +415,9 @@ def _amd_monitor(monkeypatch, card, fail_usage_flags=False):
                         lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
     monkeypatch.setattr("monitor.subprocess.check_output", fake_check_output)
     mon = HardwareMonitor("HIP")
+    # These tests are about rocm-smi's output. Point sysfs at nothing so a host that
+    # has an AMD card does not add fan, voltage and link readings of its own.
+    mon.sysfs_drm_root = mon.sysfs_pci_root = "/nonexistent-sysfs"
     mon.history = {0: _history()}
     mon._poll_amd([0])
     return mon, calls
@@ -435,6 +438,7 @@ AMD_FULL = {
 def test_amd_poll_asks_for_utilization_and_vram_and_reads_them(monkeypatch):
     mon, calls = _amd_monitor(monkeypatch, AMD_FULL)
     assert "--showuse" in calls[0] and "--showmeminfo" in calls[0] and "--json" in calls[0]
+    assert "--showvoltage" in calls[0] and "--showbus" in calls[0]
     h = mon.history[0]
     assert h["gpu_util"] == [97.0]
     assert h["mem_used"] == [2048.0]      # bytes reported, MiB stored
@@ -554,21 +558,20 @@ def test_amd_device_dir_finds_the_card_by_bus_address_or_by_rank_among_amd_cards
     assert amd_device_dir(rank=2, drm_root=str(drm)) is None
 
 
-def _amd_monitor(monkeypatch, tmp_path, card, pci_root=None):
+def _amd_sysfs_monitor(monkeypatch, tmp_path, card, pci_root=None):
+    """A HIP monitor whose rocm-smi prints `card` and whose sysfs is `pci_root` (or empty)."""
     monkeypatch.setattr("monitor.shutil.which", lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
     monkeypatch.setattr("monitor.subprocess.check_output", lambda _cmd: json.dumps({"card0": card}).encode())
     monitor = HardwareMonitor("HIP")
     monitor.sysfs_pci_root = str(pci_root or tmp_path / "no-pci")
     monitor.sysfs_drm_root = str(tmp_path / "no-drm")
-    monitor.history = {0: {key: [] for key in (
-        "temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core", "volts_soc",
-        "pcie_gen", "pcie_width", "throttle", "gpu_util", "mem_used", "mem_total", "elapsed")}}
+    monitor.history = {0: _history()}
     return monitor
 
 
 def test_amd_poll_records_link_voltage_and_fan(monkeypatch, tmp_path):
     pci = _fake_amd_device(tmp_path, rails=(("in0", "vddgfx", "768"), ("in1", "vddnb", "1015")))
-    monitor = _amd_monitor(monkeypatch, tmp_path, {
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {
         "PCI Bus": "0000:03:00.0", "Voltage (mV)": "862", "Fan speed (%)": "45",
         "Temperature (Sensor edge) (C)": "60.0"}, pci_root=pci)
 
@@ -583,14 +586,14 @@ def test_amd_poll_records_link_voltage_and_fan(monkeypatch, tmp_path):
 
 def test_amd_poll_reads_a_fan_percent_printed_in_the_value(monkeypatch, tmp_path):
     for printed in ("45%", "Fan Level: 115 (45%)"):
-        monitor = _amd_monitor(monkeypatch, tmp_path, {"Fan speed": printed, "Fan Level": "115"})
+        monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {"Fan speed": printed, "Fan Level": "115"})
         monitor._poll_amd([0])
         assert monitor.history[0]["fan_pct"] == [45.0], printed
 
 
 def test_amd_poll_falls_back_to_sysfs_when_rocm_smi_prints_neither_fan_nor_voltage(monkeypatch, tmp_path):
     pci = _fake_amd_device(tmp_path)
-    monitor = _amd_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
 
     monitor._poll_amd([0])
 
@@ -600,7 +603,7 @@ def test_amd_poll_falls_back_to_sysfs_when_rocm_smi_prints_neither_fan_nor_volta
 def test_amd_card_without_these_sensors_reports_na_never_zero(monkeypatch, tmp_path):
     # A card with no fan, no readable rails and no PCIe attributes (a datacenter card,
     # a sleeping one): every series stays empty and the aggregate says N/A.
-    monitor = _amd_monitor(monkeypatch, tmp_path, {"Temperature (Sensor edge) (C)": "55.0"})
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {"Temperature (Sensor edge) (C)": "55.0"})
     monitor._poll_amd([0])
     monitor._poll_amd([0])
     for series in ("fan_pct", "volts_core", "volts_soc", "pcie_gen", "pcie_width", "throttle"):
@@ -616,7 +619,7 @@ def test_amd_card_without_these_sensors_reports_na_never_zero(monkeypatch, tmp_p
 
 def test_amd_link_downshifted_at_idle_does_not_hide_the_link_under_load(monkeypatch, tmp_path):
     pci = _fake_amd_device(tmp_path, speed="2.5 GT/s PCIe")
-    monitor = _amd_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
     monitor._poll_amd([0])                                           # idle sample: gen 1
     (pci / "0000:03:00.0" / "current_link_speed").write_text("16.0 GT/s PCIe\n")
     monitor._poll_amd([0])                                           # sample under load: gen 4
