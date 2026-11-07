@@ -1762,13 +1762,102 @@ def nvidia_memory_info(gpu_index, bus_id=None, dev_root="/dev", proc_root="/proc
                 os.close(handle)
 
 
-def amd_memory_info(card):
-    """Declared memory vendor of one AMD GPU from a rocm-smi --showmemvendor --json card entry."""
+# What an AMD tool prints for a value it does not have.
+_AMD_NO_VALUE = ("", "n/a", "unknown")
+AMD_DRIVER_PLACEHOLDER = "ROCm Driver"
+
+
+def _json_from(text):
+    """The JSON object in a tool's output, ignoring a warning line printed before it."""
+    return json.loads(text[text.index("{"):] if "{" in text else text)
+
+
+def amd_memory_info(card, vram=None):
+    """Declared memory type and vendor of one AMD GPU.
+
+    The vendor comes from a rocm-smi --showmemvendor --json card entry. rocm-smi
+    does not know the memory type, so `vram` (the matching amd-smi entry from
+    amd_smi_vram) supplies it, and the vendor when rocm-smi has none.
+    memory_vendor_source names the tool each value came from.
+    """
     raw = str(card.get("GPU memory vendor", "")).strip().lower()
-    if not raw or raw == "unknown":
+    vendor = AMD_MEMORY_VENDOR_NAMES.get(raw, raw.title()) if raw not in _AMD_NO_VALUE else None
+    sources = ["rocm-smi"] if vendor else []
+    memory_type = None
+    if vram:
+        kind = str(vram.get("type", "")).strip()
+        if kind.lower() not in _AMD_NO_VALUE:
+            memory_type = kind
+        smi_vendor = str(vram.get("vendor", "")).strip().lower()
+        if vendor is None and smi_vendor not in _AMD_NO_VALUE:
+            vendor = AMD_MEMORY_VENDOR_NAMES.get(smi_vendor, smi_vendor.title())
+        if memory_type or (vendor and not sources):
+            sources.append("amd-smi")
+    if not vendor and not memory_type:
         return dict(MEMORY_INFO_UNAVAILABLE, memory_vendor_source="unavailable: rocm-smi reports no vendor")
-    return {"memory_type": "N/A", "memory_vendor": AMD_MEMORY_VENDOR_NAMES.get(raw, raw.title()),
-            "memory_vendor_source": "rocm-smi"}
+    return {"memory_type": memory_type or "N/A", "memory_vendor": vendor or "N/A",
+            "memory_vendor_source": "+".join(sources)}
+
+
+def amd_smi_vram():
+    """Every AMD GPU's VRAM type, vendor and size from `amd-smi static --bus --vram`.
+
+    A list of {"index", "bdf", "type", "vendor", "size_mb"}; empty when amd-smi is
+    not installed or fails, so the rocm-smi path alone still answers.
+    """
+    if not find_tool("amd-smi"):
+        return []
+    try:
+        data = _json_from(subprocess.check_output(
+            ["amd-smi", "static", "--bus", "--vram", "--json"], encoding="utf-8", stderr=subprocess.DEVNULL))
+        gpus = data["gpu_data"] if isinstance(data, dict) else data
+        entries = []
+        for position, gpu in enumerate(gpus):
+            vram = gpu.get("vram") or {}
+            size = vram.get("size")
+            entries.append({
+                "index": gpu.get("gpu", position),
+                "bdf": str((gpu.get("bus") or {}).get("bdf", "")).strip().lower(),
+                "type": vram.get("type", ""),
+                "vendor": vram.get("vendor", ""),
+                "size_mb": size.get("value") if isinstance(size, dict) else None,
+            })
+        return entries
+    except Exception:
+        return []
+
+
+def match_amd_smi_vram(card, index, entries):
+    """The amd-smi entry that describes this rocm-smi card, or None.
+
+    Matched by PCI address, which both tools print. Without one, the entry at the
+    same index is used only when its VRAM size equals rocm-smi's: the two tools
+    number devices independently, and a wrong match would publish another card's
+    memory type.
+    """
+    bus = str(card.get("PCI Bus", "")).strip().lower()
+    if bus and any(entry["bdf"] for entry in entries):
+        return next((entry for entry in entries if entry["bdf"] == bus), None)
+    try:
+        total_mb = int(card.get("VRAM Total Memory (B)", "")) // (1024 * 1024)
+    except (TypeError, ValueError):
+        return None
+    return next((entry for entry in entries if entry["index"] == index and entry["size_mb"] == total_mb), None)
+
+
+def rocm_driver_version():
+    """The amdgpu driver version rocm-smi reports, or the "ROCm Driver" placeholder.
+
+    The placeholder names a stack, not a version, and the website treats it as no
+    value; it is kept only for a tool that cannot say.
+    """
+    try:
+        version = str(_json_from(subprocess.check_output(
+            ["rocm-smi", "--showdriverversion", "--json"], encoding="utf-8", stderr=subprocess.DEVNULL)
+        )["system"]["Driver version"]).strip()
+    except Exception:
+        return AMD_DRIVER_PLACEHOLDER
+    return version or AMD_DRIVER_PLACEHOLDER
 
 
 # What nvidia-smi prints instead of a value. "[N/A]" is the common one for a field
@@ -1857,9 +1946,12 @@ def get_gpu_static_info(platform_name=None):
                 "--showserial",
                 "--showuniqueid",
                 "--showmemvendor",
+                "--showbus",
                 "--json"
             ], encoding="utf-8")
             data = json.loads(out)
+            driver_version = rocm_driver_version()
+            vram_entries = amd_smi_vram()
             for key, val in data.items():
                 if not key.startswith("card"): continue
                 idx = int(key.replace("card", ""))
@@ -1890,12 +1982,12 @@ def get_gpu_static_info(platform_name=None):
                     "manufacturer": manufacturer,
                     "name": name,
                     "memory_total": vram,
-                    "driver_version": "ROCm Driver",
+                    "driver_version": driver_version,
                     "power_limit": pwr_limit,
                     "uuid": uuid,
                     "serial": serial
                 }
-                entry.update(amd_memory_info(val))
+                entry.update(amd_memory_info(val, match_amd_smi_vram(val, idx, vram_entries)))
                 gpu_list.append(entry)
         except: pass
 

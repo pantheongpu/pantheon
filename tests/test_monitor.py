@@ -1,6 +1,8 @@
 import csv
 import json
 
+import pytest
+
 from monitor import HardwareMonitor
 
 
@@ -461,3 +463,164 @@ def test_amd_poll_falls_back_when_usage_flags_are_rejected(monkeypatch):
     h = mon.history[0]
     assert h["temp_core"] == [70.0]
     assert h["pwr"] == [300.0]
+
+
+# --- AMD: PCIe link, voltage rails and fan from sysfs, rocm-smi for the rest ---------
+# The layout below is what an RX 6800 shows under /sys (read on a real host): the PCI
+# device directory holds current_link_*, and its hwmon/hwmon<N> holds the rails and fan.
+
+def _fake_amd_device(root, bus="0000:03:00.0", speed="16.0 GT/s PCIe", width="16",
+                     rails=(("in0", "vddgfx", "768"),), pwm="128", pwm_max="255", hwmon_name="amdgpu"):
+    """A fake /sys/bus/pci/devices/<bus> tree; returns the PCI root."""
+    device = root / bus
+    hwmon = device / "hwmon" / "hwmon8"
+    hwmon.mkdir(parents=True)
+    (device / "vendor").write_text("0x1002\n")
+    for name, value in (("current_link_speed", speed), ("current_link_width", width)):
+        if value is not None:
+            (device / name).write_text(value + "\n")
+    (hwmon / "name").write_text(hwmon_name + "\n")
+    for prefix, label, millivolts in rails:
+        (hwmon / f"{prefix}_label").write_text(label + "\n")
+        (hwmon / f"{prefix}_input").write_text(millivolts + "\n")
+    if pwm is not None:
+        (hwmon / "pwm1").write_text(pwm + "\n")
+        (hwmon / "pwm1_max").write_text(pwm_max + "\n")
+    return root
+
+
+def test_amd_sysfs_readings_report_link_rails_and_fan(tmp_path):
+    from monitor import amd_sysfs_readings
+
+    pci = _fake_amd_device(tmp_path, rails=(("in0", "vddgfx", "768"), ("in1", "vddnb", "1015")))
+
+    assert amd_sysfs_readings(str(pci / "0000:03:00.0")) == {
+        "pcie_gen": 4, "pcie_width": 16, "volts_core": 768.0, "volts_soc": 1015.0, "fan_pct": 50.2}
+
+
+@pytest.mark.parametrize("speed,gen", [("2.5 GT/s PCIe", 1), ("5.0 GT/s PCIe", 2), ("8.0 GT/s PCIe", 3),
+                                       ("16.0 GT/s PCIe", 4), ("32.0 GT/s PCIe", 5), ("64.0 GT/s PCIe", 6)])
+def test_amd_sysfs_link_speed_maps_to_the_pcie_generation(tmp_path, speed, gen):
+    from monitor import amd_sysfs_readings
+
+    pci = _fake_amd_device(tmp_path, speed=speed, rails=(), pwm=None)
+
+    assert amd_sysfs_readings(str(pci / "0000:03:00.0"))["pcie_gen"] == gen
+
+
+def test_amd_sysfs_leaves_out_what_is_absent_unreadable_or_zero(tmp_path):
+    from monitor import amd_sysfs_readings
+
+    # Unknown link speed, a zero width, a zero rail, no fan: nothing was measured.
+    pci = _fake_amd_device(tmp_path, speed="Unknown speed", width="0",
+                           rails=(("in0", "vddgfx", "0"),), pwm=None)
+    assert amd_sysfs_readings(str(pci / "0000:03:00.0")) == {}
+
+    # A file the kernel refuses to read (EBUSY while the card sleeps) is skipped, not fatal:
+    # a directory stands in for it, which raises an OSError the same way.
+    device = pci / "0000:03:00.0"
+    (device / "current_link_speed").unlink()
+    (device / "current_link_speed").mkdir()
+    assert "pcie_gen" not in amd_sysfs_readings(str(device))
+    assert amd_sysfs_readings(None) == {}
+    assert amd_sysfs_readings(str(tmp_path / "no-such-device")) == {}
+
+
+def test_amd_sysfs_ignores_another_drivers_hwmon(tmp_path):
+    from monitor import amd_sysfs_readings
+
+    pci = _fake_amd_device(tmp_path, hwmon_name="nvme", rails=(("in0", "vddgfx", "768"),))
+
+    readings = amd_sysfs_readings(str(pci / "0000:03:00.0"))
+    assert "volts_core" not in readings and "fan_pct" not in readings
+
+
+def test_amd_device_dir_finds_the_card_by_bus_address_or_by_rank_among_amd_cards(tmp_path):
+    from monitor import amd_device_dir
+
+    pci = _fake_amd_device(tmp_path / "pci")
+    assert amd_device_dir("0000:03:00.0", pci_root=str(pci)) == str(pci / "0000:03:00.0")
+    assert amd_device_dir("0000:99:00.0", pci_root=str(pci)) is None
+
+    # Without an address: rank among AMD cards, not the card number. card0 here is a BMC's
+    # VGA adapter, so the first AMD GPU is card1 and the connector entry is ignored.
+    drm = tmp_path / "drm"
+    for name, vendor in (("card0", "0x1a03"), ("card1", "0x1002"), ("card2", "0x1002")):
+        (drm / name / "device").mkdir(parents=True)
+        (drm / name / "device" / "vendor").write_text(vendor + "\n")
+    (drm / "card1-DP-1").mkdir()
+    assert amd_device_dir(rank=0, drm_root=str(drm)) == str(drm / "card1" / "device")
+    assert amd_device_dir(rank=1, drm_root=str(drm)) == str(drm / "card2" / "device")
+    assert amd_device_dir(rank=2, drm_root=str(drm)) is None
+
+
+def _amd_monitor(monkeypatch, tmp_path, card, pci_root=None):
+    monkeypatch.setattr("monitor.shutil.which", lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
+    monkeypatch.setattr("monitor.subprocess.check_output", lambda _cmd: json.dumps({"card0": card}).encode())
+    monitor = HardwareMonitor("HIP")
+    monitor.sysfs_pci_root = str(pci_root or tmp_path / "no-pci")
+    monitor.sysfs_drm_root = str(tmp_path / "no-drm")
+    monitor.history = {0: {key: [] for key in (
+        "temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core", "volts_soc",
+        "pcie_gen", "pcie_width", "throttle", "gpu_util", "mem_used", "mem_total", "elapsed")}}
+    return monitor
+
+
+def test_amd_poll_records_link_voltage_and_fan(monkeypatch, tmp_path):
+    pci = _fake_amd_device(tmp_path, rails=(("in0", "vddgfx", "768"), ("in1", "vddnb", "1015")))
+    monitor = _amd_monitor(monkeypatch, tmp_path, {
+        "PCI Bus": "0000:03:00.0", "Voltage (mV)": "862", "Fan speed (%)": "45",
+        "Temperature (Sensor edge) (C)": "60.0"}, pci_root=pci)
+
+    monitor._poll_amd([0])
+    history = monitor.history[0]
+
+    assert history["pcie_gen"] == [4] and history["pcie_width"] == [16]
+    assert history["volts_core"] == [862.0]        # rocm-smi answered, so sysfs does not override it
+    assert history["volts_soc"] == [1015.0]        # only sysfs has the SoC rail
+    assert history["fan_pct"] == [45.0]            # the % sits in the key, not the value
+
+
+def test_amd_poll_reads_a_fan_percent_printed_in_the_value(monkeypatch, tmp_path):
+    for printed in ("45%", "Fan Level: 115 (45%)"):
+        monitor = _amd_monitor(monkeypatch, tmp_path, {"Fan speed": printed, "Fan Level": "115"})
+        monitor._poll_amd([0])
+        assert monitor.history[0]["fan_pct"] == [45.0], printed
+
+
+def test_amd_poll_falls_back_to_sysfs_when_rocm_smi_prints_neither_fan_nor_voltage(monkeypatch, tmp_path):
+    pci = _fake_amd_device(tmp_path)
+    monitor = _amd_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
+
+    monitor._poll_amd([0])
+
+    assert monitor.history[0]["fan_pct"] == [50.2] and monitor.history[0]["volts_core"] == [768.0]
+
+
+def test_amd_card_without_these_sensors_reports_na_never_zero(monkeypatch, tmp_path):
+    # A card with no fan, no readable rails and no PCIe attributes (a datacenter card,
+    # a sleeping one): every series stays empty and the aggregate says N/A.
+    monitor = _amd_monitor(monkeypatch, tmp_path, {"Temperature (Sensor edge) (C)": "55.0"})
+    monitor._poll_amd([0])
+    monitor._poll_amd([0])
+    for series in ("fan_pct", "volts_core", "volts_soc", "pcie_gen", "pcie_width", "throttle"):
+        assert monitor.history[0][series] == [], series
+
+    monitor.history[0]["elapsed"] = [0.0, 1.0]
+    stats = monitor._aggregate()[0]
+
+    for key in ("max_fan", "max_volts_core", "max_volts_soc", "pcie_gen", "pcie_width", "throttle_reason"):
+        assert stats[key] == "N/A", key
+    assert stats["max_temp"] == 55.0
+
+
+def test_amd_link_downshifted_at_idle_does_not_hide_the_link_under_load(monkeypatch, tmp_path):
+    pci = _fake_amd_device(tmp_path, speed="2.5 GT/s PCIe")
+    monitor = _amd_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0"}, pci_root=pci)
+    monitor._poll_amd([0])                                           # idle sample: gen 1
+    (pci / "0000:03:00.0" / "current_link_speed").write_text("16.0 GT/s PCIe\n")
+    monitor._poll_amd([0])                                           # sample under load: gen 4
+    monitor.history[0]["elapsed"] = [0.0, 1.0]
+    monitor.history[0]["temp_core"] = [50.0, 51.0]
+
+    assert monitor._aggregate()[0]["pcie_gen"] == 4.0
