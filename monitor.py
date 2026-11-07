@@ -5,7 +5,9 @@ import shutil
 import threading
 import numpy as np
 import csv
+import glob
 import os
+import re
 
 # Try to import NVIDIA native bindings
 try:
@@ -52,9 +54,94 @@ def _nvml_field_number(field):
     """The numeric value of one NVML field reading, by its declared value type."""
     return getattr(field.value, _NVML_VALUE_MEMBERS.get(getattr(field, "valueType", 1), "uiVal"))
 
+# Where the amdgpu driver publishes what rocm-smi does not print for every card.
+SYSFS_DRM_ROOT = "/sys/class/drm"
+SYSFS_PCI_ROOT = "/sys/bus/pci/devices"
+# PCIe link speed in GT/s as current_link_speed prints it, by generation.
+PCIE_GENERATIONS = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
+# hwmon in*_label values that name the two rails the report carries.
+AMD_VOLTAGE_LABELS = {"vddgfx": "volts_core", "vddnb": "volts_soc"}
+
+
+def _sysfs_text(path):
+    """A sysfs file's text, or None: absent where the card has no such sensor, and
+    EBUSY while it sleeps in a low-power state. Either way the sample is skipped."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _sysfs_number(path):
+    text = _sysfs_text(path)
+    try:
+        return float(text.split()[0]) if text else None
+    except (ValueError, IndexError):
+        return None
+
+
+def amd_device_dir(bus_id=None, rank=None, drm_root=SYSFS_DRM_ROOT, pci_root=SYSFS_PCI_ROOT):
+    """The sysfs directory of one AMD GPU, or None.
+
+    Found by PCI address when rocm-smi gave one. Otherwise by rank among the AMD
+    cards in /sys/class/drm, which is how rocm-smi numbers them; a card number
+    alone would be wrong on a host where another DRM device, a BMC's VGA for
+    example, takes card0.
+    """
+    if bus_id:
+        path = os.path.join(pci_root, str(bus_id).strip().lower())
+        if os.path.isdir(path):
+            return path
+    if rank is None:
+        return None
+    cards = sorted((int(name[4:]), os.path.join(drm_root, name, "device"))
+                   for name in (os.path.basename(p) for p in glob.glob(os.path.join(drm_root, "card*")))
+                   if re.fullmatch(r"card\d+", name))
+    amd = [path for _, path in cards if _sysfs_text(os.path.join(path, "vendor")) == "0x1002"]
+    return amd[rank] if 0 <= rank < len(amd) else None
+
+
+def amd_sysfs_readings(device_dir):
+    """What an amdgpu device directory shows, as {series: value} using the monitor's
+    series names. A sensor that is absent, unreadable or reads zero is left out of
+    the dict: nothing was measured, so nothing is recorded.
+
+    pcie_gen / pcie_width: the link as negotiated right now. It downshifts at idle,
+    so only the samples taken under load carry the real link; the aggregate keeps
+    the maximum. volts_core / volts_soc: hwmon rails labelled vddgfx / vddnb, in mV
+    (vddnb exists on APUs only). fan_pct: pwm1 as a share of pwm1_max.
+    """
+    found = {}
+    if not device_dir:
+        return found
+    gen = PCIE_GENERATIONS.get(_sysfs_number(os.path.join(device_dir, "current_link_speed")))
+    if gen:
+        found["pcie_gen"] = gen
+    width = _sysfs_number(os.path.join(device_dir, "current_link_width"))
+    if width and width > 0:
+        found["pcie_width"] = int(width)
+    for hwmon in sorted(glob.glob(os.path.join(device_dir, "hwmon", "hwmon*"))):
+        if _sysfs_text(os.path.join(hwmon, "name")) not in (None, "amdgpu"):
+            continue
+        for label_file in sorted(glob.glob(os.path.join(hwmon, "in*_label"))):
+            series = AMD_VOLTAGE_LABELS.get(_sysfs_text(label_file))
+            if series and series not in found:
+                millivolts = _sysfs_number(label_file[:-len("_label")] + "_input")
+                if millivolts and millivolts > 0:
+                    found[series] = millivolts
+        pwm = _sysfs_number(os.path.join(hwmon, "pwm1"))
+        if pwm is not None:
+            found["fan_pct"] = round(100.0 * pwm / (_sysfs_number(os.path.join(hwmon, "pwm1_max")) or 255.0), 1)
+        break
+    return found
+
+
 class HardwareMonitor:
     def __init__(self, platform):
         self.platform = platform
+        self.sysfs_drm_root = SYSFS_DRM_ROOT
+        self.sysfs_pci_root = SYSFS_PCI_ROOT
         self.has_rocm_smi = shutil.which("rocm-smi") is not None
         self.has_nvidia_smi = shutil.which("nvidia-smi") is not None
         self.running = False
@@ -329,7 +416,9 @@ class HardwareMonitor:
     # Without --showuse and --showmeminfo rocm-smi never prints utilization or
     # memory use, so those columns used to be 0.0 on every AMD row.
     _ROCM_BASE = ["rocm-smi", "-v", "-P", "-t", "-c", "-f"]
-    _ROCM_USAGE = ["--showuse", "--showmeminfo", "vram"]
+    # --showvoltage ("Voltage (mV)", the graphics rail) and --showbus ("PCI Bus",
+    # which locates the card's sysfs directory) ride along with the usage flags.
+    _ROCM_USAGE = ["--showuse", "--showmeminfo", "vram", "--showvoltage", "--showbus"]
 
     def _rocm_json(self):
         """rocm-smi's JSON for the sensors we read; the extra usage flags are
@@ -429,15 +518,29 @@ class HardwareMonitor:
                     if mem_total is not None:
                         h['mem_total'].append(mem_total)
 
-                    # --- 5. FAN ---
-                    f_pct = None
+                    # --- 5. FAN, VOLTAGE (rocm-smi first) ---
+                    # The percent sign sits in the value ("45%") on some releases and
+                    # in the key ("Fan speed (%)": "45") on others.
+                    readings = {}
                     for k, v in c.items():
-                        if "fan" in k.lower() and "%" in str(v):
-                            val = parse(v)
+                        kl = k.lower()
+                        if "fan" in kl and ("%" in kl or "%" in str(v)):
+                            match = re.search(r"(-?\d+(?:\.\d+)?)\s*%", str(v))
+                            val = float(match.group(1)) if match else parse(v)
                             if val is not None:
-                                f_pct = val
-                    if f_pct is not None:
-                        h['fan_pct'].append(f_pct)
+                                readings['fan_pct'] = val
+                        elif kl.startswith("voltage"):
+                            val = parse(v)
+                            if val is not None and val > 0:
+                                readings['volts_core'] = val
+
+                    # --- 6. PCIE LINK, VOLTAGE RAILS, FAN (amdgpu sysfs for what rocm-smi omitted) ---
+                    device_dir = amd_device_dir(str(c.get("PCI Bus", "")).strip() or None, rank=gid,
+                                                drm_root=self.sysfs_drm_root, pci_root=self.sysfs_pci_root)
+                    for series, val in amd_sysfs_readings(device_dir).items():
+                        readings.setdefault(series, val)
+                    for series, val in readings.items():
+                        h.setdefault(series, []).append(val)
 
         except Exception as e:
             self._warn_once("amd_poll", f"[MONITOR] rocm-smi polling failed: {e}.")
