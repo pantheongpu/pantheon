@@ -1,3 +1,4 @@
+import ctypes
 import os
 import re
 import json
@@ -1605,12 +1606,201 @@ def test_nvidia_memory_info_degrades_to_na_without_device_nodes(tmp_path):
     assert info["memory_vendor_source"].startswith("unavailable:")
 
 
+class _FakeRmDriver:
+    """Just enough of /dev/nvidiactl to answer FB_GET_INFO_V2 like one driver branch."""
+
+    def __init__(self, list_size, status=0, ram_type=0x14, vendor=0x6):
+        self.list_size, self.status = list_size, status
+        self.ram_type, self.vendor = ram_type, vendor
+        self.sizes_seen = []
+
+    def ioctl(self, fd, request, arg):
+        nr = request & 0xFF
+        if nr == pantheon._NV_ESC_RM_ALLOC:
+            arg.hObjectNew, arg.status = 0x1000 + arg.hClass, 0
+        elif nr == pantheon._NV_ESC_RM_CONTROL:
+            self.sizes_seen.append(arg.paramsSize)
+            if arg.paramsSize != 4 + 8 * self.list_size:
+                arg.status = pantheon._NV_ERR_INVALID_ARGUMENT
+                return
+            entry_data = lambda i: ctypes.c_uint32.from_address(arg.params + 4 + 8 * i + 4)
+            entry_data(0).value, entry_data(1).value = self.ram_type, self.vendor
+            arg.status = self.status
+
+
+def _fake_device_nodes(tmp_path):
+    (tmp_path / "nvidiactl").write_text("")
+    (tmp_path / "nvidia0").write_text("")
+
+
+@pytest.mark.parametrize("list_size, driver", [
+    (0x80, "580 and newer"), (0x39, "560-575, e.g. Lambda's 570.148.08"),
+    (0x37, "545-550"), (0x36, "525-535"),
+])
+def test_nvidia_memory_info_matches_the_drivers_list_size(tmp_path, monkeypatch, list_size, driver):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(list_size)
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info == {"memory_type": "HBM3", "memory_vendor": "SK hynix", "memory_vendor_source": "nvidia-rm"}, driver
+    assert fake.sizes_seen[-1] == 4 + 8 * list_size
+    assert fake.sizes_seen[0] == 4 + 8 * 0x80        # newest layout is tried first
+
+
+def test_nvidia_memory_info_does_not_retry_a_real_refusal(tmp_path, monkeypatch):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(0x80, status=0x56)          # NV_ERR_NOT_SUPPORTED
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info["memory_vendor"] == "N/A"
+    assert info["memory_vendor_source"] == "unavailable: FB_GET_INFO_V2 returned status 0x56"
+    assert len(fake.sizes_seen) == 1
+
+
+def test_nvidia_memory_info_reports_an_unknown_list_size(tmp_path, monkeypatch):
+    _fake_device_nodes(tmp_path)
+    fake = _FakeRmDriver(0x20)                       # a layout no known driver uses
+    monkeypatch.setattr(pantheon.fcntl, "ioctl", fake.ioctl)
+
+    info = pantheon.nvidia_memory_info(0, dev_root=str(tmp_path), proc_root=str(tmp_path))
+
+    assert info["memory_vendor_source"] == "unavailable: FB_GET_INFO_V2 returned status 0x1f"
+    assert len(fake.sizes_seen) == len(pantheon._NV_FB_INFO_LIST_SIZES)
+
+
 def test_amd_memory_info_names_the_vendor_rocm_smi_reports():
     assert pantheon.amd_memory_info({"GPU memory vendor": "hynix"}) == {
         "memory_type": "N/A", "memory_vendor": "SK hynix", "memory_vendor_source": "rocm-smi"}
     assert pantheon.amd_memory_info({"GPU memory vendor": "samsung"})["memory_vendor"] == "Samsung"
     assert pantheon.amd_memory_info({})["memory_vendor"] == "N/A"
     assert pantheon.amd_memory_info({"GPU memory vendor": "unknown"})["memory_vendor_source"].startswith("unavailable")
+
+
+# --- AMD: memory type from amd-smi, the real driver version ------------------------------
+# Shapes below are what rocm-smi 7.x and amd-smi 26.2 print on a host with an RX 6800,
+# an RX 6700 XT and the CPU's integrated graphics.
+
+AMD_SMI_VRAM = {"gpu_data": [
+    {"gpu": 0, "bus": {"bdf": "0000:03:00.0"}, "vram": {"type": "GDDR6", "vendor": "SAMSUNG", "size": {"value": 16368, "unit": "MB"}}},
+    {"gpu": 1, "bus": {"bdf": "0000:07:00.0"}, "vram": {"type": "GDDR6", "vendor": "SAMSUNG", "size": {"value": 12272, "unit": "MB"}}},
+    {"gpu": 2, "bus": {"bdf": "0000:11:00.0"}, "vram": {"type": "DDR5", "vendor": "UNKNOWN", "size": {"value": 512, "unit": "MB"}}},
+]}
+ROCM_SMI_CARDS = {
+    "card0": {"Card Series": "AMD Radeon RX 6800", "VRAM Total Memory (B)": str(16368 * 1024 * 1024),
+              "GPU memory vendor": "samsung", "PCI Bus": "0000:03:00.0", "Unique ID": "0xfd3d6d912de3c917"},
+    "card1": {"Card Series": "AMD Radeon RX 6700 XT", "VRAM Total Memory (B)": str(12272 * 1024 * 1024),
+              "GPU memory vendor": "samsung", "PCI Bus": "0000:07:00.0", "Unique ID": "N/A"},
+    "card2": {"Card Series": "AMD Radeon Graphics", "VRAM Total Memory (B)": str(512 * 1024 * 1024),
+              "PCI Bus": "0000:11:00.0", "Unique ID": "N/A"},
+}
+
+
+def test_amd_memory_info_takes_the_type_from_amd_smi_and_says_which_tool_answered():
+    smi = {"type": "GDDR6", "vendor": "SAMSUNG"}
+
+    both = pantheon.amd_memory_info({"GPU memory vendor": "samsung"}, smi)
+    assert both == {"memory_type": "GDDR6", "memory_vendor": "Samsung", "memory_vendor_source": "rocm-smi+amd-smi"}
+
+    # rocm-smi has no vendor: amd-smi supplies both
+    only_smi = pantheon.amd_memory_info({}, smi)
+    assert only_smi == {"memory_type": "GDDR6", "memory_vendor": "Samsung", "memory_vendor_source": "amd-smi"}
+
+    # integrated graphics: a memory type but no vendor
+    igpu = pantheon.amd_memory_info({}, {"type": "DDR5", "vendor": "UNKNOWN"})
+    assert igpu == {"memory_type": "DDR5", "memory_vendor": "N/A", "memory_vendor_source": "amd-smi"}
+
+    # amd-smi knows nothing either: unavailable, as before
+    assert pantheon.amd_memory_info({}, {"type": "N/A", "vendor": "UNKNOWN"})["memory_vendor_source"].startswith("unavailable")
+    # amd-smi absent: the old rocm-smi-only answer, unchanged
+    assert pantheon.amd_memory_info({"GPU memory vendor": "hynix"}, None)["memory_vendor_source"] == "rocm-smi"
+
+
+def test_amd_smi_vram_matches_a_card_by_pci_address_not_by_position():
+    entries = [{"index": 0, "bdf": "0000:07:00.0", "type": "GDDR6", "vendor": "SAMSUNG", "size_mb": 12272},
+               {"index": 1, "bdf": "0000:03:00.0", "type": "GDDR6X", "vendor": "MICRON", "size_mb": 16368}]
+    card = {"PCI Bus": "0000:03:00.0"}
+
+    # amd-smi lists the cards in the other order: position 0 would be the wrong card
+    assert pantheon.match_amd_smi_vram(card, 0, entries)["type"] == "GDDR6X"
+    assert pantheon.match_amd_smi_vram({"PCI Bus": "0000:99:00.0"}, 0, entries) is None
+
+
+def test_amd_smi_vram_without_a_pci_address_matches_by_index_only_when_the_size_agrees():
+    entries = [{"index": 0, "bdf": "", "type": "GDDR6", "vendor": "SAMSUNG", "size_mb": 16368}]
+
+    assert pantheon.match_amd_smi_vram({"VRAM Total Memory (B)": str(16368 * 1024 * 1024)}, 0, entries) is not None
+    # same index, different card: refuse rather than publish another card's memory type
+    assert pantheon.match_amd_smi_vram({"VRAM Total Memory (B)": str(12272 * 1024 * 1024)}, 0, entries) is None
+    assert pantheon.match_amd_smi_vram({}, 0, entries) is None
+
+
+def test_amd_smi_vram_is_empty_when_the_tool_is_missing_or_fails(monkeypatch):
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: None)
+    assert pantheon.amd_smi_vram() == []
+
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: "/usr/bin/amd-smi")
+
+    def failing(cmd, **kwargs):
+        raise OSError("amd-smi crashed")
+
+    monkeypatch.setattr(pantheon.subprocess, "check_output", failing)
+    assert pantheon.amd_smi_vram() == []
+
+    # older amd-smi prints a bare list, and a warning line may precede the JSON
+    legacy = json.dumps(AMD_SMI_VRAM["gpu_data"])
+    monkeypatch.setattr(pantheon.subprocess, "check_output", lambda cmd, **kw: "WARNING: low-power state\n{\"gpu_data\": " + legacy + "}")
+    assert [e["bdf"] for e in pantheon.amd_smi_vram()] == ["0000:03:00.0", "0000:07:00.0", "0000:11:00.0"]
+
+
+def test_rocm_driver_version_is_the_real_version_or_the_placeholder(monkeypatch):
+    monkeypatch.setattr(pantheon.subprocess, "check_output",
+                        lambda cmd, **kw: 'WARNING: AMD GPU device(s) is/are in a low-power state.\n\n{"system": {"Driver version": "7.0.0-42-generic"}}')
+    assert pantheon.rocm_driver_version() == "7.0.0-42-generic"
+
+    for broken in ('{"system": {}}', "not json at all", ""):
+        monkeypatch.setattr(pantheon.subprocess, "check_output", lambda cmd, out=broken, **kw: out)
+        assert pantheon.rocm_driver_version() == pantheon.AMD_DRIVER_PLACEHOLDER
+
+
+def test_amd_static_info_carries_driver_version_and_memory_type_per_card(monkeypatch):
+    def fake_check_output(cmd, **_kwargs):
+        if cmd[0] == "amd-smi":
+            return json.dumps(AMD_SMI_VRAM)
+        if "--showdriverversion" in cmd:
+            return json.dumps({"system": {"Driver version": "7.0.0-42-generic"}})
+        if cmd[0] == "rocm-smi":
+            assert "--showbus" in cmd            # the PCI address is how amd-smi's answer is matched
+            return json.dumps(ROCM_SMI_CARDS)
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(pantheon.shutil, "which", lambda name: f"/usr/bin/{name}" if name in {"rocm-smi", "amd-smi"} else None)
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+
+    rx6800, rx6700, igpu = pantheon.get_gpu_static_info("HIP")
+
+    assert {g["driver_version"] for g in (rx6800, rx6700, igpu)} == {"7.0.0-42-generic"}
+    assert (rx6800["memory_type"], rx6800["memory_vendor"], rx6800["memory_vendor_source"]) == ("GDDR6", "Samsung", "rocm-smi+amd-smi")
+    assert (rx6700["memory_type"], rx6700["memory_vendor"]) == ("GDDR6", "Samsung")
+    assert (igpu["memory_type"], igpu["memory_vendor"], igpu["memory_vendor_source"]) == ("DDR5", "N/A", "amd-smi")
+
+
+def test_amd_static_info_without_amd_smi_keeps_the_rocm_smi_answer(monkeypatch):
+    def fake_check_output(cmd, **_kwargs):
+        if "--showdriverversion" in cmd:
+            raise OSError("not supported")
+        return json.dumps(ROCM_SMI_CARDS)
+
+    monkeypatch.setattr(pantheon.shutil, "which", lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+
+    rx6800 = pantheon.get_gpu_static_info("HIP")[0]
+
+    assert rx6800["driver_version"] == pantheon.AMD_DRIVER_PLACEHOLDER
+    assert (rx6800["memory_type"], rx6800["memory_vendor"], rx6800["memory_vendor_source"]) == ("N/A", "Samsung", "rocm-smi")
 
 
 def test_mock_static_info_carries_memory_fields():

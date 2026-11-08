@@ -486,13 +486,36 @@ Each GPU entry in a report carries `memory_type` (GDDR6, GDDR6X, GDDR7, HBM3,
 ...) and `memory_vendor` (Samsung, SK hynix, Micron, ...). On NVIDIA they are
 read from the driver's own memory information table through its control
 interface on `/dev/nvidiactl`, without root, the same data GPU-Z shows on
-Windows; on AMD from `rocm-smi --showmemvendor`. `memory_vendor_source` says
-which path answered, or why neither could.
+Windows. On AMD the vendor comes from `rocm-smi --showmemvendor` and the type
+from `amd-smi static --vram` (matched to the card by PCI address); integrated
+graphics report a type, such as DDR5, and no vendor. `memory_vendor_source` says
+which tool answered (`nvidia-rm`, `rocm-smi`, `amd-smi` or `rocm-smi+amd-smi`),
+or why none could. On AMD, `driver_version` is the amdgpu driver version from
+`rocm-smi --showdriverversion`; on a kernel-bundled driver that is the kernel
+release.
 
 The vendor is the one the board was configured for, one value per card. A
 repaired card fitted with another vendor's chips still reports the original,
 so treat it as the declared vendor and read the memory diagnostics for what the
 chips actually do.
+
+## Fields that read N/A, and why
+
+A field reads `N/A` when nothing was measured; Pantheon never reports a zero for
+a sensor it could not read. Some gaps are the hardware's, some are a tool that
+is not installed, and a few were Pantheon not looking:
+
+| Field | NVIDIA | AMD |
+|---|---|---|
+| Memory type and vendor | Read from the driver. Drivers older than 580 need the list-size handling in `nvidia_memory_info`; WSL has no `/dev/nvidiactl`, so it reads N/A there. | Vendor from rocm-smi, type from amd-smi. N/A when amd-smi is missing. |
+| UUID, serial | Always present on current cards. | Only cards that expose a unique ID have one: an RX 6800 does, an RX 6700 XT reports none (a UUID of `0x0`). Hardware. |
+| Driver | NVIDIA driver version. | amdgpu driver version, `ROCm Driver` only when rocm-smi cannot say. |
+| PCIe gen, width | NVML. | amdgpu sysfs (`current_link_speed`, `current_link_width`). The link downshifts at idle; the report keeps the maximum seen. |
+| Core and SoC voltage | Not available: NVML has no voltage reading. | Core from rocm-smi, or the hwmon `vddgfx` rail. SoC (`vddnb`) on APUs only. |
+| Fan | N/A on passively cooled data-center cards. | rocm-smi, or hwmon `pwm1`. N/A on a card with no fan sensor. |
+| Memory temperature | The NVML memory-temperature field exists on HBM cards (V100, A100, H100, GH200); GDDR cards do not expose it. | When rocm-smi exposes a memory sensor. |
+| Limit reason | Decoded from the clock-event reasons. | Not reported: no cheap throttle reading exists to poll. |
+| Throughput variance | N/A unless a workload prints more than one `Throughput:` line; most print one. | Same. |
 
 ## Per-workload documentation
 
