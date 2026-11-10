@@ -69,6 +69,144 @@ PCIE_GENERATIONS = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
 # hwmon in*_label values that name the two rails the report carries.
 AMD_VOLTAGE_LABELS = {"vddgfx": "volts_core", "vddnb": "volts_soc"}
 
+# NVML enums, spelled out so a pynvml release that renames one does not take the reading with it.
+NVML_CLOCK_GRAPHICS = 0
+NVML_CLOCK_MEM = 2
+NVML_TEMPERATURE_THRESHOLD_SHUTDOWN = 0
+NVML_TEMPERATURE_THRESHOLD_SLOWDOWN = 1
+NVML_PERF_POLICY_POWER = 0
+NVML_PERF_POLICY_THERMAL = 1
+_NVML_COMPUTE_MODES = {0: "Default", 1: "Exclusive_Thread", 2: "Prohibited", 3: "Exclusive_Process"}
+SYSFS_KFD_ROOT = "/sys/class/kfd/kfd/topology/nodes"
+
+# What each card is rated for, read once at start-up: the denominators that turn a measured clock, link or
+# temperature into "how close to the limit". Every key is always present; a value nothing could read is "N/A".
+DEVICE_SPEC_KEYS = (
+    "max_graphics_clock_mhz", "max_memory_clock_mhz", "memory_bus_width_bits",
+    "pcie_max_gen", "pcie_max_width", "cuda_cores", "compute_units", "vbios_version",
+    "persistence_mode", "compute_mode", "mig_mode", "power_limit_default", "power_limit_enforced",
+    "temp_slowdown_c", "temp_shutdown_c", "numa_node",
+)
+
+# The same facts from nvidia-smi, for a host where NVML cannot answer one of them.
+_SMI_SPEC_FIELDS = {
+    "max_graphics_clock_mhz": "clocks.max.gr", "max_memory_clock_mhz": "clocks.max.mem",
+    "pcie_max_gen": "pcie.link.gen.max", "pcie_max_width": "pcie.link.width.max",
+    "vbios_version": "vbios_version", "persistence_mode": "persistence_mode",
+    "compute_mode": "compute_mode", "mig_mode": "mig.mode.current",
+    "power_limit_default": "power.default_limit", "power_limit_enforced": "enforced.power.limit",
+}
+_SMI_NO_VALUE = ("", "n/a", "[n/a]", "not supported", "[not supported]", "[unknown error]")
+
+
+def _spec_number(value):
+    """A number from a tool's text ("1215", "300.00", "1215 MHz"), else the text, else None."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if text.lower() in _SMI_NO_VALUE:
+        return None
+    match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(?:\s*(?:MHz|W|C|MiB))?", text, re.I)
+    if match:
+        number = float(match.group(1))
+        return int(number) if number == int(number) else round(number, 1)
+    return text
+
+
+def _smi_spec_field(index, field):
+    """One nvidia-smi --query-gpu field for one card, or None when it printed a placeholder or failed."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-i", str(index), f"--query-gpu={field}", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL, timeout=20).decode().strip().splitlines()
+    except Exception:
+        return None
+    return _spec_number(out[0]) if out else None
+
+
+def numa_node_of(bus_id, pci_root=SYSFS_PCI_ROOT):
+    """The NUMA node a PCI device sits on, from its address (nvidia-smi's 00000000:00:1E.0 form works), or None."""
+    text = str(bus_id or "").strip().lower()
+    if not text:
+        return None
+    domain, _, rest = text.partition(":")
+    path = os.path.join(pci_root, f"{domain[-4:].rjust(4, '0')}:{rest}" if rest else text, "numa_node")
+    value = _sysfs_number(path)
+    return None if value is None or value < 0 else int(value)
+
+
+def nvidia_device_specs(index, bus_id=None, nvml=None, smi_field=None, pci_root=SYSFS_PCI_ROOT):
+    """The rated limits and settings of one NVIDIA card: NVML first, nvidia-smi for what it cannot say.
+
+    Always returns every DEVICE_SPEC_KEYS key. Reading is best-effort and never raises: a card or driver that
+    does not answer one question (MIG on a card without it, a bus width on an old driver) reads "N/A" for it.
+    """
+    lib = pynvml if nvml is None else nvml
+    smi = _smi_spec_field if smi_field is None else smi_field
+    specs = {key: "N/A" for key in DEVICE_SPEC_KEYS}
+    started, handle = False, None
+    if lib is not None:
+        try:
+            lib.nvmlInit()
+            started = True
+            handle = lib.nvmlDeviceGetHandleByIndex(index)
+        except Exception:
+            handle = None
+
+    def ask(name, *args):
+        if handle is None:
+            return None
+        try:
+            return getattr(lib, name)(handle, *args)
+        except Exception:
+            return None
+
+    def milliwatts(name):
+        value = ask(name)
+        return None if value is None else round(value / 1000.0, 1)
+
+    found = {
+        "max_graphics_clock_mhz": ask("nvmlDeviceGetMaxClockInfo", NVML_CLOCK_GRAPHICS),
+        "max_memory_clock_mhz": ask("nvmlDeviceGetMaxClockInfo", NVML_CLOCK_MEM),
+        "memory_bus_width_bits": ask("nvmlDeviceGetMemoryBusWidth"),
+        "pcie_max_gen": ask("nvmlDeviceGetMaxPcieLinkGeneration"),
+        "pcie_max_width": ask("nvmlDeviceGetMaxPcieLinkWidth"),
+        "cuda_cores": ask("nvmlDeviceGetNumGpuCores"),
+        "vbios_version": _spec_number(ask("nvmlDeviceGetVbiosVersion")),
+        "power_limit_default": milliwatts("nvmlDeviceGetPowerManagementDefaultLimit"),
+        "power_limit_enforced": milliwatts("nvmlDeviceGetEnforcedPowerLimit"),
+        "temp_slowdown_c": ask("nvmlDeviceGetTemperatureThreshold", NVML_TEMPERATURE_THRESHOLD_SLOWDOWN),
+        "temp_shutdown_c": ask("nvmlDeviceGetTemperatureThreshold", NVML_TEMPERATURE_THRESHOLD_SHUTDOWN),
+    }
+    persistence = ask("nvmlDeviceGetPersistenceMode")
+    found["persistence_mode"] = None if persistence is None else ("Enabled" if persistence else "Disabled")
+    found["compute_mode"] = _NVML_COMPUTE_MODES.get(ask("nvmlDeviceGetComputeMode"))
+    mig = ask("nvmlDeviceGetMigMode")
+    current = mig[0] if isinstance(mig, (tuple, list)) and mig else None
+    found["mig_mode"] = None if current is None else ("Enabled" if current else "Disabled")
+
+    for key, value in found.items():
+        if value is not None:
+            specs[key] = value
+    for key, field in _SMI_SPEC_FIELDS.items():
+        if specs[key] == "N/A":
+            value = smi(index, field)
+            if value is not None:
+                specs[key] = value
+    node = numa_node_of(bus_id, pci_root)
+    if node is not None:
+        specs["numa_node"] = node
+    if started:
+        try:
+            lib.nvmlShutdown()
+        except Exception:
+            pass
+    return specs
+
 
 def _sysfs_text(path):
     """A sysfs file's text, or None: absent where the card has no such sensor, and
@@ -140,6 +278,13 @@ def amd_sysfs_readings(device_dir):
         pwm = _sysfs_number(os.path.join(hwmon, "pwm1"))
         if pwm is not None:
             found["fan_pct"] = round(100.0 * pwm / (_sysfs_number(os.path.join(hwmon, "pwm1_max")) or 255.0), 1)
+        # freq2_input is the memory clock in hertz, labelled "mclk".
+        for label_file in sorted(glob.glob(os.path.join(hwmon, "freq*_label"))):
+            if _sysfs_text(label_file) == "mclk":
+                hertz = _sysfs_number(label_file[:-len("_label")] + "_input")
+                if hertz and hertz > 0:
+                    found["clk_mem"] = round(hertz / 1e6, 1)
+                break
         break
     return found
 
@@ -242,7 +387,8 @@ class HardwareMonitor:
             'pwr': [], 'clk_core': [], 
             'fan_pct': [], 'volts_core': [], 'volts_soc': [],
             'pcie_gen': [], 'pcie_width': [], 'throttle': [],
-            'gpu_util': [], 'mem_used': [], 'mem_total': [], 'elapsed': []
+            'gpu_util': [], 'mem_used': [], 'mem_total': [], 'elapsed': [],
+            'clk_mem': [], 'temp_edge': [], 'temp_hotspot': []
         } for gid in gpu_ids}
         # The host is sampled on the same ticks as the GPUs. One set for the
         # machine, not one per GPU: every GPU in the run shares the CPU.
@@ -261,9 +407,11 @@ class HardwareMonitor:
                 "Fan(%)", "Volts_Core(mV)", "Volts_SoC(mV)",
                 "PCIe_Gen", "PCIe_Width", "Throttle_Reason",
                 "GPU_Utilization(%)", "Memory_Used(MiB)", "Memory_Total(MiB)",
-                "CPU_Utilization(%)", "CPU_Busiest_Core(%)", "CPU_Clock(MHz)"
+                "CPU_Utilization(%)", "CPU_Busiest_Core(%)", "CPU_Clock(MHz)",
+                "Mem_Clock(MHz)", "Temp_Edge(C)", "Temp_Hotspot(C)"
             ])
-        
+
+        self._begin_context(gpu_ids)
         self.thread = threading.Thread(target=self._loop, args=(gpu_ids,))
         self.thread.start()
 
@@ -291,12 +439,7 @@ class HardwareMonitor:
         while self.running or first_tick:
             first_tick = False
             try:
-                if self.platform == "MOCK":
-                    pass
-                elif self.platform == "HIP" and self.has_rocm_smi:
-                    self._poll_amd(gpu_ids)
-                elif self.platform == "CUDA" and self.has_nvidia_smi:
-                    self._poll_nvidia(gpu_ids)
+                self._poll_platform(gpu_ids)
             except Exception as e:
                 # Prevent thread death if a single poll fails
                 print(f"[MONITOR DEBUG] Polling error: {e}")
@@ -332,16 +475,47 @@ class HardwareMonitor:
                 gu  = get_last('gpu_util')
                 mu  = get_last('mem_used')
                 mt  = get_last('mem_total')
+                mc  = get_last('clk_mem')
+                te  = get_last('temp_edge')
+                th  = get_last('temp_hotspot')
                 h['elapsed'].append(elapsed)
                     
                 self.csv_writer.writerow([self.test_name, elapsed, gid, t_c, t_m, p, c, f, v_c, v_s, pg, pw, tr, gu, mu, mt,
                                           *("N/A" if v is None else round(v, 1)
-                                            for v in (cpu_util, cpu_core, cpu_freq))])
+                                            for v in (cpu_util, cpu_core, cpu_freq)),
+                                          mc, te, th])
             
             self.csv_file.flush()
             time.sleep(1)
         
         self.csv_file.close()
+
+    def _poll_platform(self, gpu_ids):
+        if self.platform == "HIP" and self.has_rocm_smi:
+            self._poll_amd(gpu_ids)
+        elif self.platform == "CUDA" and self.has_nvidia_smi:
+            self._poll_nvidia(gpu_ids)
+
+    def _capture_start_state(self, gpu_ids):
+        """One reading of every card before the workload exists.
+
+        The first tick of the sampling thread is not that reading: rocm-smi alone takes a second or two to answer,
+        by which time the workload has launched, allocated its memory and started its kernels, and a "start" state
+        that already shows 99% of VRAM in use is the run, not what it started from. So the reading is taken here,
+        synchronously, into a scratch history that is thrown away, which also keeps the series the same length as
+        the elapsed-time series.
+        """
+        self._start_state = {}
+        live = self.history
+        self.history = {gid: {key: [] for key in live[gid]} for gid in gpu_ids if gid in live}
+        try:
+            self._poll_platform(gpu_ids)
+            self._start_state = {gid: {key: values[-1] for key, values in series.items() if values and key != 'elapsed'}
+                                 for gid, series in self.history.items()}
+        except Exception:
+            self._start_state = {}
+        finally:
+            self.history = live
 
     @staticmethod
     def _poll_host():
@@ -367,9 +541,68 @@ class HardwareMonitor:
             freq = None
         return util, busiest, freq
 
+    def _begin_context(self, gpu_ids):
+        """What the host and the cards were doing just before the workload starts.
+
+        Called before the workload is launched, so anything already using a GPU is somebody else's, and the
+        cumulative throttle counters are read here and again at the end to give the seconds spent held back.
+        """
+        try:
+            load = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            load = None
+        self.host_load_start = None if load is None else round(load, 2)
+        self.other_procs = {}
+        self._violation_start = {}
+        self._violation_end = {}
+        if self.platform == "CUDA" and self.nvml_active:
+            for gid in gpu_ids:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(gid)
+                except Exception:
+                    continue
+                self.other_procs[gid] = self._count_gpu_processes(handle)
+                self._violation_start[gid] = self._violation_times(handle)
+        self._capture_start_state(gpu_ids)
+
+    def _end_context(self):
+        if self.platform == "CUDA" and self.nvml_active:
+            for gid in getattr(self, "_violation_start", {}):
+                try:
+                    self._violation_end[gid] = self._violation_times(pynvml.nvmlDeviceGetHandleByIndex(gid))
+                except Exception:
+                    continue
+
+    @staticmethod
+    def _count_gpu_processes(handle):
+        """How many processes hold a context on the card, or None when the driver would not say."""
+        pids, answered = set(), False
+        for name in ("nvmlDeviceGetComputeRunningProcesses", "nvmlDeviceGetGraphicsRunningProcesses"):
+            try:
+                found = getattr(pynvml, name)(handle)
+            except Exception:
+                continue
+            answered = True
+            pids.update(getattr(process, "pid", None) for process in found)
+        pids.discard(os.getpid())
+        pids.discard(None)
+        return len(pids) if answered else None
+
+    @staticmethod
+    def _violation_times(handle):
+        """Cumulative seconds the card has been held back by power and by thermal limits, None where unsupported."""
+        seen = {}
+        for name, policy in (("power", NVML_PERF_POLICY_POWER), ("thermal", NVML_PERF_POLICY_THERMAL)):
+            try:
+                seen[name] = pynvml.nvmlDeviceGetViolationStatus(handle, policy).violationTime / 1e9
+            except Exception:
+                seen[name] = None
+        return seen
+
     def stop_collection(self, measurement_window_seconds=None):
         self.running = False
         if self.thread: self.thread.join()
+        self._end_context()
         return self._aggregate(measurement_window_seconds)
 
     # --- NVIDIA POLLING (Crash-Proof Version) ---
@@ -392,7 +625,10 @@ class HardwareMonitor:
                     # temperature sensor" indistinguishable from "VRAM at 0 C",
                     # and the latter is what got published. Skip the sample
                     # instead; the aggregate reports N/A when nothing was read.
-                    try: h['temp_core'].append(pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU))
+                    try:
+                        edge = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                        h['temp_core'].append(edge)
+                        h.setdefault('temp_edge', []).append(edge)
                     except Exception: pass
 
                     # A field value, not sensor index 2. nvmlDeviceGetTemperature
@@ -413,6 +649,9 @@ class HardwareMonitor:
                     except Exception: pass
 
                     try: h['clk_core'].append(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS))
+                    except Exception: pass
+
+                    try: h.setdefault('clk_mem', []).append(pynvml.nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM))
                     except Exception: pass
 
                     try: h['gpu_util'].append(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
@@ -452,7 +691,7 @@ class HardwareMonitor:
                 # Query: Index, Core Temp, Mem Temp, Power, Clock, Fan, Gen, Width, Throttle, Util, Memory Used, Memory Total
                 cmd = [
                     "nvidia-smi",
-                    "--query-gpu=index,temperature.gpu,temperature.memory,power.draw,clocks.gr,fan.speed,pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active,utilization.gpu,memory.used,memory.total",
+                    "--query-gpu=index,temperature.gpu,temperature.memory,power.draw,clocks.gr,fan.speed,pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active,utilization.gpu,memory.used,memory.total,clocks.mem",
                     "--format=csv,noheader,nounits"
                 ]
                 out = subprocess.check_output(cmd).decode()
@@ -470,14 +709,17 @@ class HardwareMonitor:
                         # "[N/A]", which safe_parse turned into 0 C and 0 W.
                         # The same goes for fan, PCIe link and memory. Voltage is
                         # not queried, so its series stay empty (N/A in the report).
-                        for key, raw in (('temp_core', parts[1]), ('temp_mem', parts[2]),
-                                         ('pwr', parts[3]), ('clk_core', parts[4]),
-                                         ('fan_pct', parts[5]), ('pcie_gen', parts[6]),
-                                         ('pcie_width', parts[7]), ('gpu_util', parts[9]),
-                                         ('mem_used', parts[10]), ('mem_total', parts[11])):
+                        columns = [('temp_core', parts[1]), ('temp_edge', parts[1]), ('temp_mem', parts[2]),
+                                   ('pwr', parts[3]), ('clk_core', parts[4]),
+                                   ('fan_pct', parts[5]), ('pcie_gen', parts[6]),
+                                   ('pcie_width', parts[7]), ('gpu_util', parts[9]),
+                                   ('mem_used', parts[10]), ('mem_total', parts[11])]
+                        if len(parts) > 12:
+                            columns.append(('clk_mem', parts[12]))
+                        for key, raw in columns:
                             reading = self._smi_number(raw)
                             if reading is not None:
-                                h[key].append(reading)
+                                h.setdefault(key, []).append(reading)
 
                         h['throttle'].append(decode_throttle_mask(self._smi_mask(parts[8])))
 
@@ -542,6 +784,11 @@ class HardwareMonitor:
                     t_core = t_junction if t_junction is not None else t_edge
                     if t_core is not None:
                         h['temp_core'].append(t_core)
+                    # Both sensors on their own, because "Peak Temp" is the hotspot on AMD and the edge on NVIDIA.
+                    if t_edge is not None:
+                        h.setdefault('temp_edge', []).append(t_edge)
+                    if t_junction is not None:
+                        h.setdefault('temp_hotspot', []).append(t_junction)
                     if t_memory is not None:
                         h['temp_mem'].append(t_memory)
 
@@ -605,6 +852,11 @@ class HardwareMonitor:
                             val = parse(v)
                             if val is not None and val > 0:
                                 readings['volts_core'] = val
+                        elif "mclk" in kl and "(" in str(v):
+                            # "mclk clock speed:": "(1000Mhz)"; the "clock level" key beside it has no parentheses.
+                            val = parse(v)
+                            if val is not None and val > 0:
+                                readings['clk_mem'] = val
 
                     # --- 6. PCIE LINK, VOLTAGE RAILS, FAN (amdgpu sysfs for what rocm-smi omitted) ---
                     device_dir = amd_device_dir(str(c.get("PCI Bus", "")).strip() or None, rank=gid,
@@ -637,6 +889,8 @@ class HardwareMonitor:
             "avg_cpu_busiest_core": mean(busiest),
             "max_cpu_busiest_core": peak(busiest),
             "avg_cpu_clk": mean(freq),
+            "host_load_start": ("N/A" if getattr(self, "host_load_start", None) is None
+                                else float(self.host_load_start)),
         }
 
     def _aggregate(self, measurement_window_seconds=None):
@@ -673,6 +927,43 @@ class HardwareMonitor:
                                    if reason not in ("N/A", "None", "Idle", "") and reason is not None)
             sample_interval = (elapsed[-1] - elapsed[0]) / max(1, len(elapsed) - 1) if len(elapsed) > 1 else 1
 
+            # Seconds held back by each cause, from the same samples as "Throttle Time". N/A when the series never
+            # said anything at all (no throttle reading on this card), so a card that cannot tell is not "clean".
+            throttle_series = [reason for reason in samples.get('throttle', []) if isinstance(reason, str)]
+            throttle_read = any(reason not in ("N/A", "") for reason in throttle_series)
+
+            def held_back(label):
+                if not throttle_read:
+                    return "N/A"
+                count = sum(1 for reason in throttle_series if label in reason.split("|"))
+                return float(round(count * sample_interval, 1))
+
+            def violation(name):
+                begin = getattr(self, "_violation_start", {}).get(gid, {}).get(name)
+                end = getattr(self, "_violation_end", {}).get(gid, {}).get(name)
+                if begin is None or end is None:
+                    return "N/A"
+                return float(round(max(0.0, end - begin), 2))
+
+            captured = getattr(self, "_start_state", {}).get(gid)
+
+            def first(key):
+                # The reading taken before launch when there is one (a key it could not read is N/A, not the first
+                # in-run sample); a history built by hand has no such reading and uses its first sample.
+                if captured is not None:
+                    value = captured.get(key)
+                else:
+                    values = data.get(key, [])
+                    value = values[0] if values else None
+                return "N/A" if value is None else float(round(value, 1))
+
+            # How far the hottest reading came from the card's own slowdown temperature.
+            limit = (getattr(self, "temp_limits", None) or {}).get(gid)
+            hottest = samples.get('temp_core', [])
+            margin = ("N/A" if not isinstance(limit, (int, float)) or isinstance(limit, bool) or not hottest
+                      else float(round(limit - max(hottest), 1)))
+            others = getattr(self, "other_procs", {}).get(gid)
+
             stats[gid] = {
                 "avg_temp": safe_mean(samples['temp_core']),
                 "max_temp": safe_max(samples['temp_core']),
@@ -697,6 +988,23 @@ class HardwareMonitor:
                 "pcie_gen": safe_max(samples['pcie_gen']),
                 "pcie_width": safe_max(samples['pcie_width']),
                 "throttle_reason": mode_str(samples['throttle']),
+                "avg_mem_clk": safe_mean(samples.get('clk_mem', [])),
+                "max_mem_clk": safe_max(samples.get('clk_mem', [])),
+                "max_edge_temp": safe_max(samples.get('temp_edge', [])),
+                "max_hotspot_temp": safe_max(samples.get('temp_hotspot', [])),
+                "thermal_margin": margin,
+                "throttle_power_s": held_back("Power"),
+                "throttle_thermal_s": held_back("Thermal"),
+                "throttle_brake_s": held_back("Power Brake"),
+                "power_violation_s": violation("power"),
+                "thermal_violation_s": violation("thermal"),
+                "start_temp": first('temp_core'),
+                "start_pwr": first('pwr'),
+                "start_gpu_util": first('gpu_util'),
+                "start_mem_used": first('mem_used'),
+                "start_clk": first('clk_core'),
+                "start_mem_clk": first('clk_mem'),
+                "other_gpu_processes": "N/A" if others is None else int(others),
                 **host_stats,
             }
         return stats
