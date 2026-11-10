@@ -3154,3 +3154,192 @@ def test_a_failed_rebuild_with_an_older_binary_is_not_marked_current(tmp_path, m
     assert set(unavailable) == {"demo"}
     assert "older than its source" in unavailable["demo"]
     assert not (cache_root / "9.9.9" / "hip-gfx942" / ".pantheon_build_cache.json").exists()
+
+
+# --- Rated limits, throttle seconds and start state in the report --------------------------------
+# The amd-smi shape below is what `amd-smi static --bus --vram --asic --ifwi --limit --clock SYS MEM` prints
+# for an RX 6700 XT (trimmed to the keys Pantheon reads).
+
+AMD_SMI_STATIC_6700XT = {"gpu_data": [{
+    "gpu": 1,
+    "asic": {"market_name": "AMD Radeon RX 6700 XT", "num_compute_units": 40, "target_graphics_version": "gfx1031"},
+    "bus": {"bdf": "0000:07:00.0", "max_pcie_width": 16, "max_pcie_speed": {"value": 16, "unit": "GT/s"}},
+    "ifwi": {"name": "NAVI22 XT MBA D51211 GDDR6 12GB", "part_number": "113-D5121100-101"},
+    "vram": {"type": "GDDR6", "vendor": "SAMSUNG", "size": {"value": 12272, "unit": "MB"}, "bit_width": 192},
+    "limit": {
+        "ppt0": {"max_power_limit": {"value": 186, "unit": "W"}, "socket_power_limit": {"value": 186, "unit": "W"}},
+        "ppt1": {"max_power_limit": "N/A", "socket_power_limit": "N/A"},
+        "slowdown_edge_temperature": {"value": 110, "unit": "C"},
+        "slowdown_hotspot_temperature": {"value": 105, "unit": "C"},
+        "shutdown_edge_temperature": {"value": 115, "unit": "C"},
+        "shutdown_hotspot_temperature": {"value": 115, "unit": "C"},
+    },
+    "clock": {"sys": {"frequency_levels": {"Level 0": "500 MHz", "Level 1": "2855 MHz"}},
+              "mem": {"frequency_levels": {"Level 0": "96 MHz", "Level 1": "456 MHz", "Level 2": "675 MHz",
+                                           "Level 3": "1000 MHz"}}},
+}]}
+
+
+def test_amd_smi_vram_also_reads_the_rated_limits_in_one_call(monkeypatch):
+    seen = []
+
+    def fake_check_output(cmd, **_kwargs):
+        seen.append(list(cmd))
+        return json.dumps(AMD_SMI_STATIC_6700XT)
+
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+
+    (entry,) = pantheon.amd_smi_vram()
+
+    assert len(seen) == 1 and {"--limit", "--clock", "--asic", "--ifwi", "--vram", "--bus"} <= set(seen[0])
+    assert (entry["type"], entry["vendor"], entry["size_mb"], entry["bdf"]) == ("GDDR6", "SAMSUNG", 12272, "0000:07:00.0")
+    assert entry["bit_width"] == 192 and entry["compute_units"] == 40
+    assert (entry["max_pcie_width"], entry["max_pcie_speed"]) == (16, 16)
+    assert entry["vbios_version"] == "113-D5121100-101"
+    # The hotspot limit is preferred: the hotspot is the temperature Pantheon reports on AMD.
+    assert (entry["slowdown_temp"], entry["shutdown_temp"]) == (105, 115)
+    assert entry["power_limit_enforced"] == 186
+    assert (entry["max_graphics_clock"], entry["max_memory_clock"]) == (2855, 1000)
+
+
+def test_amd_smi_vram_falls_back_to_the_short_query_when_an_older_amd_smi_rejects_the_flags(monkeypatch):
+    seen = []
+
+    def fake_check_output(cmd, **_kwargs):
+        seen.append(list(cmd))
+        if "--limit" in cmd:
+            raise pantheon.subprocess.CalledProcessError(2, cmd)
+        return json.dumps(AMD_SMI_VRAM)
+
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+
+    entries = pantheon.amd_smi_vram()
+
+    assert len(seen) == 2 and "--limit" not in seen[1]
+    assert entries[0]["type"] == "GDDR6" and entries[0]["bdf"] == "0000:03:00.0"
+    for key in ("bit_width", "compute_units", "max_graphics_clock", "slowdown_temp", "power_limit_enforced"):
+        assert entries[0][key] is None, key
+
+
+def _fake_amd_pci(root, bdf="0000:07:00.0", vbios="113-D5121100-101", numa="-1", cap_default="186000000"):
+    device = root / bdf
+    (device / "hwmon" / "hwmon9").mkdir(parents=True)
+    (device / "vendor").write_text("0x1002\n")
+    (device / "vbios_version").write_text(vbios + "\n")
+    (device / "numa_node").write_text(numa + "\n")
+    if cap_default is not None:
+        (device / "hwmon" / "hwmon9" / "power1_cap_default").write_text(cap_default + "\n")
+    return root
+
+
+def test_amd_device_specs_combine_amd_smi_with_sysfs(tmp_path):
+    assert pantheon._smi_value({"value": 186, "unit": "W"}) == 186 and pantheon._smi_value("2855 MHz") == 2855
+    assert pantheon._smi_value("N/A") is None and pantheon._smi_value(None) is None
+
+    smi = {"bdf": "0000:07:00.0", "bit_width": 192, "compute_units": 40, "max_pcie_width": 16, "max_pcie_speed": 16,
+           "vbios_version": None, "slowdown_temp": 105, "shutdown_temp": 115, "power_limit_enforced": 186,
+           "max_graphics_clock": 2855, "max_memory_clock": 1000}
+    pci = _fake_amd_pci(tmp_path, numa="1")
+
+    specs = pantheon.amd_device_specs({"PCI Bus": "0000:07:00.0"}, 1, smi, pci_root=str(pci), drm_root=str(pci))
+
+    assert set(specs) == set(pantheon.DEVICE_SPEC_KEYS)
+    assert specs["max_graphics_clock_mhz"] == 2855 and specs["max_memory_clock_mhz"] == 1000
+    assert specs["memory_bus_width_bits"] == 192 and specs["compute_units"] == 40
+    assert (specs["pcie_max_gen"], specs["pcie_max_width"]) == (4, 16)       # 16 GT/s is PCIe Gen 4
+    assert specs["vbios_version"] == "113-D5121100-101"                      # from sysfs: amd-smi gave none here
+    assert (specs["power_limit_default"], specs["power_limit_enforced"]) == (186.0, 186)
+    assert (specs["temp_slowdown_c"], specs["temp_shutdown_c"]) == (105, 115)
+    assert specs["numa_node"] == 1
+    assert specs["cuda_cores"] == specs["persistence_mode"] == specs["mig_mode"] == "N/A"   # NVIDIA-only facts
+
+
+def test_amd_device_specs_say_na_for_everything_nothing_could_read(tmp_path):
+    specs = pantheon.amd_device_specs({}, 0, None, pci_root=str(tmp_path), drm_root=str(tmp_path))
+    assert set(specs) == set(pantheon.DEVICE_SPEC_KEYS) and set(specs.values()) == {"N/A"}
+    # No NUMA node (-1) and no power cap file are N/A too, not zero.
+    pci = _fake_amd_pci(tmp_path, numa="-1", cap_default=None)
+    specs = pantheon.amd_device_specs({"PCI Bus": "0000:07:00.0"}, 0, None, pci_root=str(pci), drm_root=str(pci))
+    assert specs["numa_node"] == "N/A" and specs["power_limit_default"] == "N/A"
+    assert specs["vbios_version"] == "113-D5121100-101"
+
+
+def test_amd_static_info_carries_the_rated_limits(monkeypatch):
+    def fake_check_output(cmd, **_kwargs):
+        if cmd[0] == "amd-smi":
+            return json.dumps(AMD_SMI_STATIC_6700XT)
+        if "--showdriverversion" in cmd:
+            return json.dumps({"system": {"Driver version": "7.0.0-42-generic"}})
+        return json.dumps({"card1": ROCM_SMI_CARDS["card1"]})
+
+    monkeypatch.setattr(pantheon.shutil, "which", lambda name: f"/usr/bin/{name}" if name in {"rocm-smi", "amd-smi"} else None)
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+
+    (gpu,) = pantheon.get_gpu_static_info("HIP")
+
+    assert gpu["max_graphics_clock_mhz"] == 2855 and gpu["compute_units"] == 40 and gpu["memory_bus_width_bits"] == 192
+    assert gpu["pcie_max_gen"] == 4 and gpu["temp_slowdown_c"] == 105
+
+
+def test_nvidia_static_info_carries_the_rated_limits(monkeypatch):
+    monkeypatch.setattr(pantheon, "find_tool", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+
+    def fake_check_output(cmd, **kwargs):
+        if "--query-gpu=index,name,memory.total,driver_version,power.limit,uuid,serial,pci.bus_id" in cmd:
+            return "0, Tesla T4, 15360, 570.133.20, 70.00, GPU-abc, 1234567890, 00000000:00:1E.0\n"
+        if cmd == ["nvidia-smi", "-q"]:
+            return "    Subsystem Vendor                  : NVIDIA\n"
+        raise AssertionError(f"unexpected command {cmd}")
+
+    seen = {}
+
+    def fake_specs(index, bus_id=None, **kwargs):
+        seen["args"] = (index, bus_id)
+        return {key: "N/A" for key in pantheon.DEVICE_SPEC_KEYS} | {"cuda_cores": 2560, "pcie_max_gen": 3}
+
+    monkeypatch.setattr(pantheon.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(pantheon, "nvidia_memory_info", lambda *a, **k: {"memory_type": "GDDR6", "memory_vendor": "Samsung",
+                                                                         "memory_vendor_source": "nvidia-rm"})
+    monkeypatch.setattr(pantheon, "nvidia_device_specs", fake_specs)
+
+    (gpu,) = pantheon.get_gpu_static_info("CUDA")
+
+    assert seen["args"] == (0, "00000000:00:1E.0")
+    assert gpu["cuda_cores"] == 2560 and gpu["pcie_max_gen"] == 3
+    assert set(pantheon.DEVICE_SPEC_KEYS) <= set(gpu)
+
+
+NEW_ROW_COLUMNS = (
+    "Avg Mem Clock (MHz)", "Max Mem Clock (MHz)", "Max Edge Temp (C)", "Max Hotspot Temp (C)", "Thermal Margin (C)",
+    "Throttle Power (s)", "Throttle Thermal (s)", "Throttle Power Brake (s)", "Power Violation (s)",
+    "Thermal Violation (s)", "Start Temp (C)", "Start Power (W)", "Start GPU Util (%)", "Start Mem Used (MiB)",
+    "Start Clock (MHz)", "Start Mem Clock (MHz)", "Other GPU Processes", "Host Load 1m (start)",
+)
+
+
+def test_result_row_carries_the_new_telemetry_and_says_na_when_a_run_has_none():
+    bare = pantheon.build_result_row("memory_read", 0, 30, 99, 100.0, "GB/s", {}, throughput_variance="N/A")
+    for column in NEW_ROW_COLUMNS:
+        assert bare[column] == "N/A", column
+
+    stats = {"avg_mem_clk": 1215.0, "max_mem_clk": 1215.0, "max_edge_temp": 70.0, "max_hotspot_temp": 82.0,
+             "thermal_margin": 8.0, "throttle_power_s": 2.0, "throttle_thermal_s": 0.0, "throttle_brake_s": 0.0,
+             "power_violation_s": 1.5, "thermal_violation_s": 0.0, "start_temp": 41.0, "start_pwr": 30.0,
+             "start_gpu_util": 0.0, "start_mem_used": 500.0, "start_clk": 210.0, "start_mem_clk": 405.0,
+             "other_gpu_processes": 0, "host_load_start": 1.25}
+    row = pantheon.build_result_row("memory_read", 0, 30, 99, 100.0, "GB/s", stats, throughput_variance="N/A")
+    assert row["Avg Mem Clock (MHz)"] == 1215.0 and row["Thermal Margin (C)"] == 8.0
+    assert row["Throttle Power (s)"] == 2.0 and row["Power Violation (s)"] == 1.5
+    assert row["Start Mem Used (MiB)"] == 500.0 and row["Other GPU Processes"] == 0
+    assert row["Host Load 1m (start)"] == 1.25 and row["Max Hotspot Temp (C)"] == 82.0
+    # A real zero is a measurement and stays a zero.
+    assert row["Throttle Thermal (s)"] == 0.0 and row["Start GPU Util (%)"] == 0.0
+
+
+def test_new_columns_stay_out_of_the_console_summary_table():
+    source = (Path(pantheon.__file__).parent / "pantheon.py").read_text(encoding="utf-8")
+    hidden = source.split("cols_to_hide = [", 1)[1].split("]", 1)[0]
+    for column in NEW_ROW_COLUMNS:
+        assert f'"{column}"' in hidden, column

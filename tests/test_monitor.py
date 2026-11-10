@@ -213,7 +213,7 @@ def _history():
     return {key: [] for key in (
         "temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core",
         "volts_soc", "pcie_gen", "pcie_width", "throttle", "gpu_util",
-        "mem_used", "mem_total", "elapsed")}
+        "mem_used", "mem_total", "elapsed", "clk_mem", "temp_edge", "temp_hotspot")}
 
 
 def _fake_nvml(mask=0, memory_temp=71):
@@ -732,3 +732,362 @@ def test_host_cpu_is_primed_on_the_sampling_thread(tmp_path, monkeypatch):
 
     assert len(calls) == 2 and calls[0] == calls[1] != threading.get_ident()
     assert stats["avg_cpu_util"] == 50.0
+
+
+# --- Memory clock, both temperature sensors, and throttle seconds by reason -----------------
+
+def test_nvml_records_the_memory_clock_and_the_edge_temperature(monkeypatch):
+    h = _nvml_monitor(monkeypatch)
+    assert h["clk_mem"] == [1980]
+    assert h["temp_edge"] == [60] and h["temp_core"] == [60]
+    assert h["temp_hotspot"] == []        # NVML has no hotspot sensor: nothing was read, so N/A
+
+
+def test_nvml_skips_the_memory_clock_when_it_cannot_be_read(monkeypatch):
+    def clock(handle, which):
+        if which == 2:
+            raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+        return 1980
+
+    fake = _fake_nvml()
+    fake.nvmlDeviceGetClockInfo = clock
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", fake)
+    mon = HardwareMonitor("CUDA")
+    mon.history = {0: _history()}
+    mon._poll_nvidia([0])
+    assert mon.history[0]["clk_mem"] == [] and mon.history[0]["clk_core"] == [1980]
+
+
+def test_cli_fallback_reads_the_memory_clock_when_nvidia_smi_prints_it(monkeypatch):
+    h = _cli_monitor(monkeypatch, "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0, 99, 1024, 81559, 9501\n")
+    assert h["clk_mem"] == [9501.0] and h["temp_edge"] == [60.0]
+    h = _cli_monitor(monkeypatch, "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0, 99, 1024, 81559, [N/A]\n")
+    assert h["clk_mem"] == []
+    # A twelve-field answer (an older query) still parses.
+    h = _cli_monitor(monkeypatch, "0, 60, 71, 250.0, 1980, 40, 4, 16, 0x0, 99, 1024, 81559\n")
+    assert h["clk_mem"] == [] and h["temp_core"] == [60.0]
+
+
+def test_amd_poll_keeps_edge_and_hotspot_apart_and_reads_the_memory_clock(monkeypatch):
+    mon, _ = _amd_monitor(monkeypatch, {
+        "Temperature (Sensor edge) (C)": "61.0", "Temperature (Sensor junction) (C)": "74.0",
+        "sclk clock speed:": "(2600Mhz)", "mclk clock speed:": "(1000Mhz)", "mclk clock level:": "3",
+    })
+    h = mon.history[0]
+    assert h["temp_edge"] == [61.0] and h["temp_hotspot"] == [74.0]
+    assert h["temp_core"] == [74.0]       # unchanged: the published "Peak Temp" is still the hotspot on AMD
+    assert h["clk_mem"] == [1000.0] and h["clk_core"] == [2600.0]
+
+
+def test_amd_poll_without_a_hotspot_sensor_leaves_it_empty(monkeypatch):
+    mon, _ = _amd_monitor(monkeypatch, {"Temperature (Sensor edge) (C)": "61.0"})
+    assert mon.history[0]["temp_edge"] == [61.0] and mon.history[0]["temp_hotspot"] == []
+
+
+def test_amd_sysfs_reports_the_memory_clock_from_the_mclk_label(tmp_path):
+    from monitor import amd_sysfs_readings
+
+    pci = _fake_amd_device(tmp_path, rails=(), pwm=None)
+    hwmon = pci / "0000:03:00.0" / "hwmon" / "hwmon8"
+    (hwmon / "freq1_label").write_text("sclk\n")
+    (hwmon / "freq1_input").write_text("2600000000\n")
+    (hwmon / "freq2_label").write_text("mclk\n")
+    (hwmon / "freq2_input").write_text("1000000000\n")
+    assert amd_sysfs_readings(str(pci / "0000:03:00.0"))["clk_mem"] == 1000.0
+    (hwmon / "freq2_input").write_text("0\n")
+    assert "clk_mem" not in amd_sysfs_readings(str(pci / "0000:03:00.0"))
+
+
+def _aggregate_of(**series):
+    mon = HardwareMonitor("MOCK")
+    base = _history()
+    for key, values in series.items():
+        base[key] = values
+    if "elapsed" not in series:
+        base["elapsed"] = list(range(len(next(iter(series.values())))))
+    mon.history = {0: base}
+    return mon
+
+
+def test_throttle_seconds_are_counted_per_reason():
+    mon = _aggregate_of(throttle=["None", "Power", "Power|Thermal", "Thermal", "Power Brake"])
+    stats = mon._aggregate()[0]
+    assert stats["throttle_power_s"] == 2.0       # "Power" and "Power|Thermal"; "Power Brake" is its own reason
+    assert stats["throttle_thermal_s"] == 2.0
+    assert stats["throttle_brake_s"] == 1.0
+
+
+def test_throttle_seconds_are_na_when_the_card_never_reported_a_reason():
+    stats = _aggregate_of(throttle=["N/A", "N/A", "N/A"])._aggregate()[0]
+    assert (stats["throttle_power_s"], stats["throttle_thermal_s"], stats["throttle_brake_s"]) == ("N/A",) * 3
+    # ...but a card that did report, and was never held back, has zero seconds, not N/A.
+    stats = _aggregate_of(throttle=["None", "None"])._aggregate()[0]
+    assert stats["throttle_power_s"] == 0.0
+
+
+def test_thermal_margin_is_the_slowdown_temperature_minus_the_hottest_reading():
+    mon = _aggregate_of(temp_core=[70, 84, 80])
+    mon.temp_limits = {0: 88}
+    assert mon._aggregate()[0]["thermal_margin"] == 4.0
+    mon.temp_limits = {0: 80}
+    assert mon._aggregate()[0]["thermal_margin"] == -4.0      # past the slowdown temperature: negative, not hidden
+    for unknown in ({}, {0: "N/A"}, {0: None}, {1: 88}):
+        mon.temp_limits = unknown
+        assert mon._aggregate()[0]["thermal_margin"] == "N/A", unknown
+    quiet = _aggregate_of(temp_core=[])
+    quiet.temp_limits = {0: 88}
+    assert quiet._aggregate()[0]["thermal_margin"] == "N/A"
+
+
+def test_start_state_is_the_first_reading_not_the_run_average():
+    mon = _aggregate_of(temp_core=[41, 70, 80], pwr=[30.0, 200.0, 210.0], gpu_util=[0, 99, 100],
+                        mem_used=[500, 9000, 9100], clk_core=[210, 1700, 1700], clk_mem=[405, 1215, 1215])
+    stats = mon._aggregate()[0]
+    assert (stats["start_temp"], stats["start_pwr"], stats["start_gpu_util"]) == (41.0, 30.0, 0.0)
+    assert (stats["start_mem_used"], stats["start_clk"], stats["start_mem_clk"]) == (500.0, 210.0, 405.0)
+    assert stats["avg_mem_clk"] == 945.0 and stats["max_mem_clk"] == 1215.0
+    empty = _aggregate_of(temp_core=[])._aggregate()[0]
+    assert empty["start_temp"] == empty["start_mem_clk"] == empty["avg_mem_clk"] == "N/A"
+
+
+def test_max_edge_and_hotspot_temperatures_are_separate_columns():
+    stats = _aggregate_of(temp_core=[70, 80], temp_edge=[60, 66], temp_hotspot=[70, 80])._aggregate()[0]
+    assert stats["max_edge_temp"] == 66.0 and stats["max_hotspot_temp"] == 80.0
+    stats = _aggregate_of(temp_core=[70], temp_edge=[70])._aggregate()[0]
+    assert stats["max_edge_temp"] == 70.0 and stats["max_hotspot_temp"] == "N/A"
+
+
+def _violation_nvml(counters):
+    """A fake NVML whose violation counters step through `counters` (policy -> nanoseconds per call)."""
+    import types
+
+    fake = _fake_nvml()
+    calls = {}
+
+    def status(handle, policy):
+        values = counters.get(policy)
+        if values is None:
+            raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+        index = calls.get(policy, 0)
+        calls[policy] = index + 1
+        return types.SimpleNamespace(referenceTime=0, violationTime=values[min(index, len(values) - 1)])
+
+    fake.nvmlDeviceGetViolationStatus = status
+    fake.nvmlDeviceGetComputeRunningProcesses = lambda h: [types.SimpleNamespace(pid=10), types.SimpleNamespace(pid=11)]
+    fake.nvmlDeviceGetGraphicsRunningProcesses = lambda h: [types.SimpleNamespace(pid=11)]
+    return fake
+
+
+def _nvml_context_monitor(monkeypatch, fake):
+    monkeypatch.setattr("monitor.shutil.which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", fake)
+    mon = HardwareMonitor("CUDA")
+    mon._begin_context([0])
+    mon._end_context()
+    mon.history = {0: _history()}
+    return mon._aggregate()[0]
+
+
+def test_violation_counters_give_the_seconds_held_back_between_start_and_end(monkeypatch):
+    stats = _nvml_context_monitor(monkeypatch, _violation_nvml({0: [5_000_000_000, 6_500_000_000], 1: [0, 0]}))
+    assert stats["power_violation_s"] == 1.5
+    assert stats["thermal_violation_s"] == 0.0
+    # Two processes already held the card (pid 11 is in both lists and counts once).
+    assert stats["other_gpu_processes"] == 2
+
+
+def test_violation_counters_are_na_where_the_driver_does_not_support_them(monkeypatch):
+    stats = _nvml_context_monitor(monkeypatch, _violation_nvml({}))
+    assert stats["power_violation_s"] == stats["thermal_violation_s"] == "N/A"
+
+
+def test_other_processes_and_violations_are_na_without_nvml():
+    mon = HardwareMonitor("MOCK")
+    mon._begin_context([0])
+    mon._end_context()
+    mon.history = {0: _history()}
+    stats = mon._aggregate()[0]
+    assert stats["other_gpu_processes"] == "N/A"
+    assert stats["power_violation_s"] == stats["thermal_violation_s"] == "N/A"
+
+
+def test_host_load_at_start_is_recorded_and_na_when_the_platform_has_none(monkeypatch):
+    mon = HardwareMonitor("MOCK")
+    monkeypatch.setattr("monitor.os.getloadavg", lambda: (3.456, 2.0, 1.0))
+    mon._begin_context([0])
+    assert mon._host_stats()["host_load_start"] == 3.46
+
+    def no_loadavg():
+        raise OSError("no loadavg")
+
+    monkeypatch.setattr("monitor.os.getloadavg", no_loadavg)
+    mon._begin_context([0])
+    assert mon._host_stats()["host_load_start"] == "N/A"
+
+
+def test_time_series_csv_carries_the_new_columns_at_the_end(tmp_path, monkeypatch):
+    monitor = HardwareMonitor("MOCK")
+    monkeypatch.setattr("monitor.time.sleep", lambda _s: setattr(monitor, "running", False))
+    monitor.start_collection([0], tmp_path, "x")
+    monitor.stop_collection()
+    with (tmp_path / "time_series.csv").open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        row = next(reader)
+    assert header[-3:] == ["Mem_Clock(MHz)", "Temp_Edge(C)", "Temp_Hotspot(C)"]
+    assert row[-3:] == ["N/A", "N/A", "N/A"]          # nothing was read on the mock backend
+
+
+# --- Rated limits read once at start-up ------------------------------------------------------
+
+def _spec_nvml(**overrides):
+    import types
+
+    answers = dict(
+        nvmlDeviceGetMaxClockInfo=lambda h, clock: {0: 1590, 2: 5001}[clock],
+        nvmlDeviceGetMemoryBusWidth=lambda h: 256,
+        nvmlDeviceGetMaxPcieLinkGeneration=lambda h: 3,
+        nvmlDeviceGetMaxPcieLinkWidth=lambda h: 16,
+        nvmlDeviceGetNumGpuCores=lambda h: 2560,
+        nvmlDeviceGetVbiosVersion=lambda h: "90.04.96.00.01",
+        nvmlDeviceGetPowerManagementDefaultLimit=lambda h: 70000,
+        nvmlDeviceGetEnforcedPowerLimit=lambda h: 60000,
+        nvmlDeviceGetTemperatureThreshold=lambda h, kind: {0: 105, 1: 96}[kind],
+        nvmlDeviceGetPersistenceMode=lambda h: 1,
+        nvmlDeviceGetComputeMode=lambda h: 0,
+        nvmlDeviceGetMigMode=_raise,
+    )
+    answers.update(overrides)
+    return types.SimpleNamespace(nvmlInit=lambda: None, nvmlShutdown=lambda: None,
+                                 nvmlDeviceGetHandleByIndex=lambda i: object(), **answers)
+
+
+def test_nvidia_device_specs_reads_the_rated_limits_from_nvml(tmp_path):
+    from monitor import DEVICE_SPEC_KEYS, nvidia_device_specs
+
+    node = tmp_path / "0000:00:1e.0"
+    node.mkdir()
+    (node / "numa_node").write_text("1\n")
+    specs = nvidia_device_specs(0, "00000000:00:1E.0", nvml=_spec_nvml(), smi_field=lambda i, f: None,
+                                pci_root=str(tmp_path))
+    assert set(specs) == set(DEVICE_SPEC_KEYS)
+    assert specs["max_graphics_clock_mhz"] == 1590 and specs["max_memory_clock_mhz"] == 5001
+    assert specs["memory_bus_width_bits"] == 256 and specs["cuda_cores"] == 2560
+    assert (specs["pcie_max_gen"], specs["pcie_max_width"]) == (3, 16)
+    assert specs["vbios_version"] == "90.04.96.00.01"
+    assert (specs["power_limit_default"], specs["power_limit_enforced"]) == (70.0, 60.0)
+    assert (specs["temp_slowdown_c"], specs["temp_shutdown_c"]) == (96, 105)
+    assert (specs["persistence_mode"], specs["compute_mode"]) == ("Enabled", "Default")
+    assert specs["mig_mode"] == "N/A" and specs["compute_units"] == "N/A"     # a T4 has no MIG; compute_units is AMD's
+    assert specs["numa_node"] == 1
+
+
+def test_nvidia_device_specs_falls_back_to_nvidia_smi_per_field_and_never_raises():
+    import types
+
+    from monitor import nvidia_device_specs
+
+    asked = []
+
+    def smi(index, field):
+        asked.append(field)
+        return {"clocks.max.mem": 9501, "persistence_mode": "Disabled"}.get(field)
+
+    broken = _spec_nvml(nvmlDeviceGetMaxClockInfo=_raise, nvmlDeviceGetPersistenceMode=_raise)
+    specs = nvidia_device_specs(0, nvml=broken, smi_field=smi)
+    assert specs["max_memory_clock_mhz"] == 9501 and specs["persistence_mode"] == "Disabled"
+    assert specs["max_graphics_clock_mhz"] == "N/A"          # neither NVML nor nvidia-smi knew
+    assert "pcie.link.gen.max" not in asked                  # NVML answered it, so nvidia-smi is not asked
+
+    unusable = types.SimpleNamespace(nvmlInit=_raise, nvmlShutdown=lambda: None)
+    assert set(nvidia_device_specs(0, nvml=unusable, smi_field=lambda i, f: None).values()) == {"N/A"}
+
+
+def test_numa_node_is_na_for_no_address_or_no_numa(tmp_path):
+    from monitor import numa_node_of
+
+    (tmp_path / "0000:03:00.0").mkdir()
+    (tmp_path / "0000:03:00.0" / "numa_node").write_text("-1\n")
+    assert numa_node_of("0000:03:00.0", str(tmp_path)) is None      # -1 is the kernel's "no node"
+    assert numa_node_of("", str(tmp_path)) is None and numa_node_of(None, str(tmp_path)) is None
+    assert numa_node_of("0000:99:00.0", str(tmp_path)) is None
+
+
+def test_a_history_without_the_newer_series_still_polls(monkeypatch):
+    # A caller that builds its own history (older code, a test) must not lose the whole poll to a missing key.
+    mon, _ = _amd_monitor(monkeypatch, {"Temperature (Sensor edge) (C)": "61.0", "mclk clock speed:": "(1000Mhz)"})
+    old_style = {key: [] for key in ("temp_core", "temp_mem", "pwr", "clk_core", "fan_pct", "volts_core",
+                                     "volts_soc", "pcie_gen", "pcie_width", "throttle")}
+    mon.history = {0: old_style}
+    mon._poll_amd([0])
+    assert old_style["temp_core"] == [61.0] and old_style["temp_edge"] == [61.0] and old_style["clk_mem"] == [1000.0]
+
+
+# --- The start state is read before the workload launches --------------------------------------
+
+def test_nvml_start_state_is_read_before_launch_not_from_the_first_tick(monkeypatch, tmp_path):
+    temps, utils = iter([41, 70, 71]), iter([0, 99, 99])
+    fake = _fake_nvml()
+    fake.nvmlDeviceGetTemperature = lambda handle, sensor: next(temps)
+    fake.nvmlDeviceGetUtilizationRates = lambda handle: types.SimpleNamespace(gpu=next(utils))
+    monkeypatch.setattr("monitor.shutil.which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr("monitor.pynvml", fake)
+    mon = HardwareMonitor("CUDA")
+    monkeypatch.setattr("monitor.time.sleep", lambda _s: setattr(mon, "running", False))
+
+    mon.start_collection([0], tmp_path, "t")
+    stats = mon.stop_collection()[0]
+
+    assert stats["start_temp"] == 41.0 and stats["start_gpu_util"] == 0.0     # before launch
+    assert mon.history[0]["temp_core"] == [70] and stats["max_temp"] == 70.0   # the run's own first tick is the run
+    # The scratch reading left no extra entry behind: every series is still parallel to the elapsed times.
+    assert len(mon.history[0]["elapsed"]) == len(mon.history[0]["temp_core"]) == len(mon.history[0]["gpu_util"]) == 1
+
+
+def test_amd_start_state_is_read_before_launch_even_though_rocm_smi_is_slow(monkeypatch, tmp_path):
+    idle = {"Temperature (Sensor edge) (C)": "29.0", "Temperature (Sensor junction) (C)": "31.0", "GPU use (%)": "0",
+            "VRAM Total Memory (B)": str(12 * 1024 ** 3), "VRAM Total Used Memory (B)": str(300 * 1024 ** 2),
+            "mclk clock speed:": "(96Mhz)", "sclk clock speed:": "(500Mhz)"}
+    busy = dict(idle, **{"GPU use (%)": "97", "VRAM Total Used Memory (B)": str(12 * 1024 ** 3 - 1024 ** 2),
+                         "mclk clock speed:": "(1000Mhz)", "sclk clock speed:": "(2600Mhz)"})
+    answers = iter([idle, busy, busy])
+    monkeypatch.setattr("monitor.shutil.which", lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
+    monkeypatch.setattr("monitor.subprocess.check_output", lambda cmd: json.dumps({"card0": next(answers)}).encode())
+    mon = HardwareMonitor("HIP")
+    mon.sysfs_drm_root = mon.sysfs_pci_root = "/nonexistent-sysfs"
+    monkeypatch.setattr("monitor.time.sleep", lambda _s: setattr(mon, "running", False))
+
+    mon.start_collection([0], tmp_path, "t")
+    stats = mon.stop_collection()[0]
+
+    assert (stats["start_gpu_util"], stats["start_mem_used"]) == (0.0, 300.0)          # the idle card, not the loaded one
+    assert (stats["start_clk"], stats["start_mem_clk"], stats["start_temp"]) == (500.0, 96.0, 31.0)
+    assert stats["avg_mem_clk"] == 1000.0 and stats["max_hotspot_temp"] == 31.0
+    assert len(mon.history[0]["elapsed"]) == len(mon.history[0]["gpu_util"]) == 1
+
+
+def test_a_start_reading_that_could_not_be_taken_is_na_not_the_first_run_sample(monkeypatch, tmp_path):
+    # Nothing readable before launch (a sleeping card, an error), readable once the run is under way.
+    # rocm-smi is asked twice per poll (the full flags, then the short ones), so both of the first poll fail.
+    calls = iter([RuntimeError("busy"), RuntimeError("busy"),
+                  {"Temperature (Sensor edge) (C)": "60.0"}, {"Temperature (Sensor edge) (C)": "60.0"}])
+
+    def check_output(cmd):
+        answer = next(calls)
+        if isinstance(answer, Exception):
+            raise answer
+        return json.dumps({"card0": answer}).encode()
+
+    monkeypatch.setattr("monitor.shutil.which", lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None)
+    monkeypatch.setattr("monitor.subprocess.check_output", check_output)
+    mon = HardwareMonitor("HIP")
+    mon.sysfs_drm_root = mon.sysfs_pci_root = "/nonexistent-sysfs"
+    monkeypatch.setattr("monitor.time.sleep", lambda _s: setattr(mon, "running", False))
+
+    mon.start_collection([0], tmp_path, "t")
+    stats = mon.stop_collection()[0]
+
+    assert stats["start_temp"] == "N/A" and stats["max_temp"] == 60.0

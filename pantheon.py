@@ -30,7 +30,8 @@ try:
     import fcntl
 except ImportError:  # not Linux; the memory-vendor probe is Linux-only
     fcntl = None
-from monitor import HardwareMonitor
+from monitor import (HardwareMonitor, DEVICE_SPEC_KEYS, PCIE_GENERATIONS, amd_device_dir, nvidia_device_specs,
+                     SYSFS_DRM_ROOT, SYSFS_PCI_ROOT, numa_node_of, _sysfs_number, _sysfs_text)
 
 try:
     import pynvml
@@ -1799,32 +1800,125 @@ def amd_memory_info(card, vram=None):
             "memory_vendor_source": "+".join(sources)}
 
 
-def amd_smi_vram():
-    """Every AMD GPU's VRAM type, vendor and size from `amd-smi static --bus --vram`.
+# amd-smi answers all of this without waking a sleeping card; sysfs and rocm-smi return EBUSY for the same questions.
+AMD_SMI_STATIC_FULL = ["amd-smi", "static", "--bus", "--vram", "--asic", "--ifwi", "--limit",
+                       "--clock", "SYS", "MEM", "--json"]
+AMD_SMI_STATIC_VRAM = ["amd-smi", "static", "--bus", "--vram", "--json"]
 
-    A list of {"index", "bdf", "type", "vendor", "size_mb"}; empty when amd-smi is
-    not installed or fails, so the rocm-smi path alone still answers.
+
+def _smi_value(node):
+    """The number in an amd-smi value: 186, "2855 MHz" or {"value": 186, "unit": "W"}; None for N/A."""
+    if isinstance(node, dict):
+        node = node.get("value")
+    if isinstance(node, bool) or node is None:
+        return None
+    if isinstance(node, (int, float)):
+        return node
+    match = re.search(r"-?\d+(?:\.\d+)?", str(node))
+    if not match:
+        return None
+    number = float(match.group(0))
+    return int(number) if number == int(number) else number
+
+
+def _smi_level_max(levels):
+    """The highest frequency in an amd-smi frequency_levels table, or None."""
+    values = [_smi_value(level) for level in (levels or {}).values()] if isinstance(levels, dict) else []
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def amd_smi_vram():
+    """Every AMD GPU's VRAM and rated limits from amd-smi static, one entry per GPU.
+
+    Each entry is {"index", "bdf", "type", "vendor", "size_mb", ...} plus the rated facts a report publishes
+    (bit_width, compute_units, max_pcie_width, max_pcie_speed, vbios_version, slowdown_temp, shutdown_temp,
+    power_limit_enforced, max_graphics_clock, max_memory_clock) where this amd-smi release prints them, None
+    where it does not. Empty when amd-smi is not installed or fails, so the rocm-smi path alone still answers.
     """
     if not find_tool("amd-smi"):
         return []
+    data = None
+    for argv in (AMD_SMI_STATIC_FULL, AMD_SMI_STATIC_VRAM):   # an older amd-smi may not know every flag
+        try:
+            data = _json_from(subprocess.check_output(argv, encoding="utf-8", stderr=subprocess.DEVNULL))
+            break
+        except Exception:
+            continue
+    if data is None:
+        return []
     try:
-        data = _json_from(subprocess.check_output(
-            ["amd-smi", "static", "--bus", "--vram", "--json"], encoding="utf-8", stderr=subprocess.DEVNULL))
         gpus = data["gpu_data"] if isinstance(data, dict) else data
         entries = []
         for position, gpu in enumerate(gpus):
             vram = gpu.get("vram") or {}
             size = vram.get("size")
+            bus = gpu.get("bus") or {}
+            limit = gpu.get("limit") or {}
+            clock = gpu.get("clock") or {}
             entries.append({
                 "index": gpu.get("gpu", position),
-                "bdf": str((gpu.get("bus") or {}).get("bdf", "")).strip().lower(),
+                "bdf": str(bus.get("bdf", "")).strip().lower(),
                 "type": vram.get("type", ""),
                 "vendor": vram.get("vendor", ""),
                 "size_mb": size.get("value") if isinstance(size, dict) else None,
+                "bit_width": _smi_value(vram.get("bit_width")),
+                "compute_units": _smi_value((gpu.get("asic") or {}).get("num_compute_units")),
+                "max_pcie_width": _smi_value(bus.get("max_pcie_width")),
+                "max_pcie_speed": _smi_value(bus.get("max_pcie_speed")),
+                "vbios_version": ((gpu.get("ifwi") or {}).get("part_number") or None),
+                "slowdown_temp": next((value for value in (_smi_value(limit.get("slowdown_hotspot_temperature")),
+                                                           _smi_value(limit.get("slowdown_edge_temperature")))
+                                       if value is not None), None),
+                "shutdown_temp": next((value for value in (_smi_value(limit.get("shutdown_hotspot_temperature")),
+                                                           _smi_value(limit.get("shutdown_edge_temperature")))
+                                       if value is not None), None),
+                "power_limit_enforced": _smi_value((limit.get("ppt0") or {}).get("socket_power_limit")),
+                "max_graphics_clock": _smi_level_max((clock.get("sys") or {}).get("frequency_levels")),
+                "max_memory_clock": _smi_level_max((clock.get("mem") or {}).get("frequency_levels")),
             })
         return entries
     except Exception:
         return []
+
+
+def amd_device_specs(card, index, smi_entry=None, pci_root=SYSFS_PCI_ROOT, drm_root=SYSFS_DRM_ROOT):
+    """The rated limits and settings of one AMD card, for gpu_static_info.
+
+    `card` is the rocm-smi entry, `smi_entry` the matching amd_smi_vram entry. amd-smi supplies most of it; sysfs
+    fills the VBIOS version, the default power cap and the NUMA node. Every DEVICE_SPEC_KEYS key is present and
+    anything nothing could read is "N/A", never a guess.
+    """
+    specs = {key: "N/A" for key in DEVICE_SPEC_KEYS}
+    entry = smi_entry or {}
+    found = {
+        "max_graphics_clock_mhz": entry.get("max_graphics_clock"),
+        "max_memory_clock_mhz": entry.get("max_memory_clock"),
+        "memory_bus_width_bits": entry.get("bit_width"),
+        "pcie_max_gen": PCIE_GENERATIONS.get(float(entry["max_pcie_speed"])) if entry.get("max_pcie_speed") else None,
+        "pcie_max_width": entry.get("max_pcie_width"),
+        "compute_units": entry.get("compute_units"),
+        "vbios_version": entry.get("vbios_version"),
+        "power_limit_enforced": entry.get("power_limit_enforced"),
+        "temp_slowdown_c": entry.get("slowdown_temp"),
+        "temp_shutdown_c": entry.get("shutdown_temp"),
+    }
+    bus = str(card.get("PCI Bus", "")).strip().lower() or entry.get("bdf") or None
+    device_dir = amd_device_dir(bus, rank=index, drm_root=drm_root, pci_root=pci_root)
+    if device_dir:
+        found["vbios_version"] = found["vbios_version"] or _sysfs_text(os.path.join(device_dir, "vbios_version"))
+        hwmons = sorted(glob.glob(os.path.join(device_dir, "hwmon", "hwmon*")))
+        if hwmons:
+            microwatts = _sysfs_number(os.path.join(hwmons[0], "power1_cap_default"))
+            if microwatts:
+                found["power_limit_default"] = round(microwatts / 1e6, 1)
+    node = numa_node_of(bus, pci_root)
+    if node is not None:
+        found["numa_node"] = node
+    for key, value in found.items():
+        if value not in (None, ""):
+            specs[key] = value
+    return specs
 
 
 def match_amd_smi_vram(card, index, entries):
@@ -1928,6 +2022,7 @@ def get_gpu_static_info(platform_name=None):
                         "serial": parts[6] if smi_present(parts[6]) else "Unknown"
                     }
                     entry.update(nvidia_memory_info(int(parts[0]), parts[7] if len(parts) > 7 else None))
+                    entry.update(nvidia_device_specs(int(parts[0]), parts[7] if len(parts) > 7 else None))
                 except Exception as e:
                     print(f"[PANTHEON DEBUG] Skipping unparseable NVIDIA GPU line {line!r}: {e}")
                     continue
@@ -1987,7 +2082,9 @@ def get_gpu_static_info(platform_name=None):
                     "uuid": uuid,
                     "serial": serial
                 }
-                entry.update(amd_memory_info(val, match_amd_smi_vram(val, idx, vram_entries)))
+                smi_entry = match_amd_smi_vram(val, idx, vram_entries)
+                entry.update(amd_memory_info(val, smi_entry))
+                entry.update(amd_device_specs(val, idx, smi_entry))
                 gpu_list.append(entry)
         except: pass
 
@@ -3223,7 +3320,27 @@ def build_result_row(test_name, gpu, duration, mem_pct, throughput, unit, stats,
         "Limit Reason": stats.get("throttle_reason", "N/A"),
         "Max Fan (%)": stats.get("max_fan", 0),
         "Volts Core (mV)": stats.get("max_volts_core", 0),
-        "Volts SoC (mV)": stats.get("max_volts_soc", 0)
+        "Volts SoC (mV)": stats.get("max_volts_soc", 0),
+        # What limited the card, how close it ran to its limits, and what state it started in. All "N/A" where a
+        # card or driver does not say; none of these is ever a zero standing in for "not read".
+        "Avg Mem Clock (MHz)": stats.get("avg_mem_clk", "N/A"),
+        "Max Mem Clock (MHz)": stats.get("max_mem_clk", "N/A"),
+        "Max Edge Temp (C)": stats.get("max_edge_temp", "N/A"),
+        "Max Hotspot Temp (C)": stats.get("max_hotspot_temp", "N/A"),
+        "Thermal Margin (C)": stats.get("thermal_margin", "N/A"),
+        "Throttle Power (s)": stats.get("throttle_power_s", "N/A"),
+        "Throttle Thermal (s)": stats.get("throttle_thermal_s", "N/A"),
+        "Throttle Power Brake (s)": stats.get("throttle_brake_s", "N/A"),
+        "Power Violation (s)": stats.get("power_violation_s", "N/A"),
+        "Thermal Violation (s)": stats.get("thermal_violation_s", "N/A"),
+        "Start Temp (C)": stats.get("start_temp", "N/A"),
+        "Start Power (W)": stats.get("start_pwr", "N/A"),
+        "Start GPU Util (%)": stats.get("start_gpu_util", "N/A"),
+        "Start Mem Used (MiB)": stats.get("start_mem_used", "N/A"),
+        "Start Clock (MHz)": stats.get("start_clk", "N/A"),
+        "Start Mem Clock (MHz)": stats.get("start_mem_clk", "N/A"),
+        "Other GPU Processes": stats.get("other_gpu_processes", "N/A"),
+        "Host Load 1m (start)": stats.get("host_load_start", "N/A"),
     }
     if status != "PASS":
         row["Status"] = status
@@ -4027,6 +4144,7 @@ def main():
     global DEVICE_ORDINALS, VISIBLE_GPU_IDS
     avail_count = monitor.get_gpu_count()
     gpu_info = get_gpu_static_info(platform)
+    monitor.temp_limits = {g.get("id"): g.get("temp_slowdown_c") for g in gpu_info}
     uuids_by_id = {g.get("id"): g.get("uuid") for g in gpu_info}
     visible = resolve_visible_devices(
         platform, avail_count, [uuids_by_id.get(index) for index in range(avail_count)],
@@ -4172,6 +4290,11 @@ def main():
         "Volts Core (mV)", "Volts SoC (mV)", "Limit Reason", "Efficiency",
         "Version", "Command Lines", "Profiler Command Lines",
         "Profiler Counter Files",
+        "Avg Mem Clock (MHz)", "Max Mem Clock (MHz)", "Max Edge Temp (C)", "Max Hotspot Temp (C)",
+        "Thermal Margin (C)", "Throttle Power (s)", "Throttle Thermal (s)", "Throttle Power Brake (s)",
+        "Power Violation (s)", "Thermal Violation (s)", "Start Temp (C)", "Start Power (W)",
+        "Start GPU Util (%)", "Start Mem Used (MiB)", "Start Clock (MHz)", "Start Mem Clock (MHz)",
+        "Other GPU Processes", "Host Load 1m (start)",
     ]
     
     # CONSOLE: Abbreviate headers so the table fits horizontally

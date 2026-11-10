@@ -514,8 +514,55 @@ is not installed, and a few were Pantheon not looking:
 | Core and SoC voltage | Not available: NVML has no voltage reading. | Core from rocm-smi, or the hwmon `vddgfx` rail. SoC (`vddnb`) on APUs only. |
 | Fan | N/A on passively cooled data-center cards. | rocm-smi, or hwmon `pwm1`. N/A on a card with no fan sensor. |
 | Memory temperature | The NVML memory-temperature field exists on HBM cards (V100, A100, H100, GH200); GDDR cards do not expose it. | When rocm-smi exposes a memory sensor. |
-| Limit reason | Decoded from the clock-event reasons. | Not reported: no cheap throttle reading exists to poll. |
+| Limit reason, throttle seconds | Decoded from the clock-event reasons; seconds per cause from the samples, and the driver's violation counters where NVML supports them. | Not reported: no cheap throttle reading exists to poll. |
 | Throughput variance | N/A unless a workload prints more than one `Throughput:` line; most print one. | Same. |
+
+## Clocks, limits and the state a run started in
+
+Besides the sensors above, every workload row records how the card was limited, how close it ran to its own
+limits, and what state it started in. Each reads `N/A` where the card or driver does not say, never a zero.
+
+**Memory clock.** `Avg Mem Clock (MHz)` and `Max Mem Clock (MHz)`. Most workloads are memory-bound, so this is
+what explains a bandwidth score that is low while the graphics clock looks fine. Read it next to the card's
+`max_memory_clock_mhz` in `gpu_static_info`.
+
+**Both temperature sensors.** `Max Edge Temp (C)` and `Max Hotspot Temp (C)`. `Max Temp (C)` is the hotspot on
+AMD and the edge sensor on NVIDIA, so it does not compare across vendors; these two do. NVIDIA reports no
+hotspot, so that column reads `N/A` there. `Thermal Margin (C)` is the card's own slowdown temperature minus
+`Max Temp (C)`: how far the hottest reading came from the point where the card slows itself down. It is negative
+when the card went past it.
+
+**Seconds held back, by cause.** `Throttle Power (s)`, `Throttle Thermal (s)` and `Throttle Power Brake (s)`
+count the seconds each limit was *active*, from the per-second samples (NVIDIA only; AMD publishes no cheap
+throttle reading, so they read `N/A`). `Power Violation (s)` and `Thermal Violation (s)` are the driver's own
+cumulative counters read before and after the run: the seconds the card was actually held below the clock it
+wanted. They are different questions. A card that sits at its power limit for the whole run shows the power cap
+as active for the whole run, while the violation counter can still say it lost under a second, because the
+limit was never the thing slowing it down. On an RTX 3080 Ti, a 60 s memory-bandwidth run read 61 s of power cap
+and 0.56 s of violation. Use the cap seconds to see that a limit is in play and the violation seconds to see
+what it cost. The counters need NVML support; where it has none they read `N/A`. They are the driver's own
+bookkeeping and differ between drivers: the Windows driver under WSL also advances them while the card is idle
+(on an RTX 3060 the power counter gained 3.99 s in 4 s of idle), where the Linux drivers checked left them at
+zero for an idle card.
+
+**The state the run started in.** `Start Temp (C)`, `Start Power (W)`, `Start GPU Util (%)`,
+`Start Mem Used (MiB)`, `Start Clock (MHz)` and `Start Mem Clock (MHz)` are the reading taken just before
+the workload launches. A card that was still hot, or still clocked up, from the previous run reads that way
+here, which is the quickest way to tell a cold start from a back-to-back one. It is read before the workload
+is launched, so it is the idle card and not the run's own allocation. (An AMD card whose graphics engine is
+powered down at idle reads `Start Clock (MHz)` as 0: the clock really is gated off.) `Other GPU Processes` is how many
+processes already held a context on the card (NVIDIA; `N/A` on AMD), and `Host Load 1m (start)` is the host's
+one-minute load average, so a run that shared the machine or the card is visible in its own row.
+
+**What the card is rated for.** `gpu_static_info` carries, per card and read once at start-up:
+`max_graphics_clock_mhz`, `max_memory_clock_mhz`, `memory_bus_width_bits`, `pcie_max_gen`, `pcie_max_width`,
+`cuda_cores` (NVIDIA) or `compute_units` (AMD), `vbios_version`, `persistence_mode`, `compute_mode`, `mig_mode`
+(NVIDIA), `power_limit_default`, `power_limit_enforced`, `temp_slowdown_c`, `temp_shutdown_c` and `numa_node`.
+They are the denominators for a measured clock, link or temperature. For example, the peak memory bandwidth is
+`memory_bus_width_bits / 8 x max_memory_clock_mhz x 2` on NVIDIA (the factor is the memory's data rate, 16 for
+the GDDR6 on the Radeons here), and `pcie_max_*` against the `PCIe Gen` and `PCIe Width` of a run shows a
+downgraded link. NVIDIA is read from NVML with nvidia-smi as the fallback; AMD from one `amd-smi static` call,
+which also answers while a card sleeps, and sysfs.
 
 ## Host CPU
 
