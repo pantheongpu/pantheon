@@ -1091,3 +1091,92 @@ def test_a_start_reading_that_could_not_be_taken_is_na_not_the_first_run_sample(
     stats = mon.stop_collection()[0]
 
     assert stats["start_temp"] == "N/A" and stats["max_temp"] == 60.0
+
+
+# --- A reading rocm-smi already supplied is not read a second time from sysfs --------------------
+
+def _watch_sysfs_reads(monkeypatch):
+    """Record every sysfs file monitor.py reads, through its two reading helpers."""
+    reads = []
+    import monitor
+
+    real_text, real_number = monitor._sysfs_text, monitor._sysfs_number
+
+    def text(path):
+        reads.append(path)
+        return real_text(path)
+
+    def number(path):
+        reads.append(path)
+        return real_number(path)
+
+    monkeypatch.setattr("monitor._sysfs_text", text)
+    monkeypatch.setattr("monitor._sysfs_number", number)
+    return reads
+
+
+def _full_amd_device(tmp_path):
+    pci = _fake_amd_device(tmp_path, rails=(("in0", "vddgfx", "768"), ("in1", "vddnb", "1015")))
+    hwmon = pci / "0000:03:00.0" / "hwmon" / "hwmon8"
+    (hwmon / "freq1_label").write_text("sclk\n")
+    (hwmon / "freq1_input").write_text("2600000000\n")
+    (hwmon / "freq2_label").write_text("mclk\n")
+    (hwmon / "freq2_input").write_text("1000000000\n")
+    return pci, hwmon
+
+
+def test_sysfs_readings_skip_the_series_the_caller_already_has_and_do_not_read_their_files(monkeypatch, tmp_path):
+    from monitor import amd_sysfs_readings
+
+    pci, hwmon = _full_amd_device(tmp_path)
+    reads = _watch_sysfs_reads(monkeypatch)
+
+    got = amd_sysfs_readings(str(pci / "0000:03:00.0"), have={"volts_core", "fan_pct", "clk_mem"})
+
+    # The link is always read, and so is the SoC rail rocm-smi does not print; nothing else is.
+    assert got == {"pcie_gen": 4, "pcie_width": 16, "volts_soc": 1015.0}
+    touched = {path.split("/")[-1] for path in reads}
+    assert not touched & {"in0_input", "pwm1", "pwm1_max", "freq2_input", "freq1_input"}, touched
+    assert {"current_link_speed", "current_link_width", "in1_input"} <= touched
+
+
+def test_sysfs_readings_still_fill_what_the_caller_does_not_have(monkeypatch, tmp_path):
+    from monitor import amd_sysfs_readings
+
+    pci, _ = _full_amd_device(tmp_path)
+    everything = amd_sysfs_readings(str(pci / "0000:03:00.0"))
+    assert everything == {"pcie_gen": 4, "pcie_width": 16, "volts_core": 768.0, "volts_soc": 1015.0,
+                          "fan_pct": 50.2, "clk_mem": 1000.0}
+    # Only the fan is missing from rocm-smi: that is the only sensor file read besides the link and the SoC rail.
+    reads = _watch_sysfs_reads(monkeypatch)
+    got = amd_sysfs_readings(str(pci / "0000:03:00.0"), have={"volts_core", "clk_mem"})
+    assert got["fan_pct"] == 50.2 and "volts_core" not in got and "clk_mem" not in got
+    assert "in0_input" not in {p.split("/")[-1] for p in reads} and "pwm1" in {p.split("/")[-1] for p in reads}
+
+
+def test_poll_uses_rocm_smis_fan_voltage_and_memory_clock_without_touching_their_sysfs_files(monkeypatch, tmp_path):
+    pci, _ = _full_amd_device(tmp_path)
+    reads = _watch_sysfs_reads(monkeypatch)
+    # Values that differ from the sysfs ones, so it is clear which source answered.
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {
+        "PCI Bus": "0000:03:00.0", "Fan speed (%)": "33", "Voltage (mV)": "812", "mclk clock speed:": "(950Mhz)",
+        "Temperature (Sensor edge) (C)": "55.0"}, pci_root=pci)
+
+    monitor._poll_amd([0])
+
+    h = monitor.history[0]
+    assert h["fan_pct"] == [33.0] and h["volts_core"] == [812.0] and h["clk_mem"] == [950.0]
+    assert h["pcie_gen"] == [4] and h["volts_soc"] == [1015.0]                   # what rocm-smi lacks still comes from sysfs
+    touched = {path.split("/")[-1] for path in reads}
+    assert not touched & {"in0_input", "pwm1", "freq2_input"}, touched
+
+
+def test_poll_falls_back_to_sysfs_for_what_rocm_smi_did_not_print(monkeypatch, tmp_path):
+    pci, _ = _full_amd_device(tmp_path)
+    monitor = _amd_sysfs_monitor(monkeypatch, tmp_path, {"PCI Bus": "0000:03:00.0", "Voltage (mV)": "812"}, pci_root=pci)
+
+    monitor._poll_amd([0])
+
+    h = monitor.history[0]
+    assert h["volts_core"] == [812.0]                     # rocm-smi's
+    assert h["fan_pct"] == [50.2] and h["clk_mem"] == [1000.0]   # sysfs filled the two it did not print

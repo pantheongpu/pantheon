@@ -247,10 +247,15 @@ def amd_device_dir(bus_id=None, rank=None, drm_root=SYSFS_DRM_ROOT, pci_root=SYS
     return amd[rank] if 0 <= rank < len(amd) else None
 
 
-def amd_sysfs_readings(device_dir):
+def amd_sysfs_readings(device_dir, have=()):
     """What an amdgpu device directory shows, as {series: value} using the monitor's
     series names. A sensor that is absent, unreadable or reads zero is left out of
     the dict: nothing was measured, so nothing is recorded.
+
+    `have` names the series the caller already holds (from rocm-smi), and their files are
+    not read: a hwmon sensor read goes to the card's firmware, so asking again for a reading
+    rocm-smi has just supplied is a needless round trip every second. The PCIe link is always
+    read; rocm-smi does not print it and it is plain PCI configuration.
 
     pcie_gen / pcie_width: the link as negotiated right now. It downshifts at idle,
     so only the samples taken under load carry the real link; the aggregate keeps
@@ -271,15 +276,15 @@ def amd_sysfs_readings(device_dir):
             continue
         for label_file in sorted(glob.glob(os.path.join(hwmon, "in*_label"))):
             series = AMD_VOLTAGE_LABELS.get(_sysfs_text(label_file))
-            if series and series not in found:
+            if series and series not in found and series not in have:
                 millivolts = _sysfs_number(label_file[:-len("_label")] + "_input")
                 if millivolts and millivolts > 0:
                     found[series] = millivolts
-        pwm = _sysfs_number(os.path.join(hwmon, "pwm1"))
+        pwm = _sysfs_number(os.path.join(hwmon, "pwm1")) if "fan_pct" not in have else None
         if pwm is not None:
             found["fan_pct"] = round(100.0 * pwm / (_sysfs_number(os.path.join(hwmon, "pwm1_max")) or 255.0), 1)
         # freq2_input is the memory clock in hertz, labelled "mclk".
-        for label_file in sorted(glob.glob(os.path.join(hwmon, "freq*_label"))):
+        for label_file in (sorted(glob.glob(os.path.join(hwmon, "freq*_label"))) if "clk_mem" not in have else ()):
             if _sysfs_text(label_file) == "mclk":
                 hertz = _sysfs_number(label_file[:-len("_label")] + "_input")
                 if hertz and hertz > 0:
@@ -861,7 +866,7 @@ class HardwareMonitor:
                     # --- 6. PCIE LINK, VOLTAGE RAILS, FAN (amdgpu sysfs for what rocm-smi omitted) ---
                     device_dir = amd_device_dir(str(c.get("PCI Bus", "")).strip() or None, rank=gid,
                                                 drm_root=self.sysfs_drm_root, pci_root=self.sysfs_pci_root)
-                    for series, val in amd_sysfs_readings(device_dir).items():
+                    for series, val in amd_sysfs_readings(device_dir, have=readings).items():
                         readings.setdefault(series, val)
                     for series, val in readings.items():
                         h.setdefault(series, []).append(val)
