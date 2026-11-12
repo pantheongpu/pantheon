@@ -932,7 +932,9 @@ def test_profile_without_collectable_counters_skips_the_counter_pass_instead_of_
 
     assert counter_commands == []                                   # no rocprofv3 --pmc run
     assert procs[0]["profile_metrics"] == []
-    assert procs[0]["profile_cmd"].split()[:3] == [str(executable), "0", "1"]     # a one-second plain run instead
+    first_run = procs[0]["profile_cmd"].split()
+    assert "--pmc" not in first_run and "--runtime-trace" in first_run                # a runtime trace, no counters
+    assert first_run[first_run.index("--") + 1:][:3] == [str(executable), "0", "1"]    # of a one-second run
     manifest = json.loads(Path(procs[0]["profile_manifest"]).read_text())
     assert manifest["metric_validation"].startswith("counters unavailable on this GPU")
     assert manifest["supported_metrics"] == [] and manifest["skipped_metrics"] == pantheon.get_profile_metrics("HIP")

@@ -2937,8 +2937,9 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
                     skipped_metrics = list(requested_metrics)
                     profile_metrics = []
                     metric_validation = f"counters unavailable on this GPU: {counters_unavailable}"
-                    tprint(f"[WARNING] Hardware counters cannot be collected on GPU {gpu} with {tool_version(profile_tools['counter'])}: "
-                           f"{counters_unavailable}. --profile continues with the timeline trace and the clean telemetry pass only.")
+                    tprint(f"[WARNING] Hardware counters cannot be collected on GPU {gpu} with {os.path.basename(profile_tools['counter'])} "
+                           f"({tool_version(profile_tools['counter'])}): {counters_unavailable}. "
+                           "--profile continues with a runtime trace and the clean telemetry pass only.")
             artifact_dir, manifest_path, _ = create_profile_manifest(
                 run_dir, test_name, gpu, platform, profile_tools, requested_metrics, workload_cmd,
                 supported_metrics=profile_metrics,
@@ -2948,9 +2949,12 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
             profiler = platform
             log(f"Collecting exhaustive {platform} counters for {test_name} on GPU {gpu}...")
             if counters_unavailable and not profile_metrics:
-                # No counter pass is possible, so the first run is a one-second plain run (it only has to succeed): the trace pass and the
-                # clean telemetry pass that follow carry the profile.
-                cmd = [binary, str(ordinal), "1", str(mem_pct)] + config["args"] + (["--verify"] if verify else [])
+                # No counter pass is possible, so the first run is a one-second run under a runtime trace (kernel, HIP API and allocation
+                # trace, which rocprofv3 can do on these cards); the clean telemetry pass that follows carries the measurements.
+                trace_dir = os.path.join(artifact_dir, "rocprof")
+                ensure_dir(trace_dir)
+                cmd = [profile_tools["counter"], "--runtime-trace", "--output-format", "csv", "-d", trace_dir, "--",
+                       binary, str(ordinal), "1", str(mem_pct)] + config["args"] + (["--verify"] if verify else [])
             else:
                 cmd = build_counter_command(platform, profile_tools, profile_metrics, artifact_dir, workload_cmd)
             trace_cmd = build_trace_command(platform, profile_tools, artifact_dir, workload_cmd)
@@ -4047,6 +4051,9 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
                 csv_path = extract_profiler_data(component_name, gpu, proc_info["profile_artifact_dir"])
                 if csv_path:
                     proc_info["profile_files"].append(csv_path)
+                if not proc_info["profile_metrics"]:
+                    # No counters were collected (see probe_hip_counter_collection): the runtime trace of the short first run is the profiler output.
+                    proc_info["trace_files"] = collect_trace_artifacts(proc_info["profile_artifact_dir"])
             elif proc_info["profiler"] == "CUDA":
                 csv_path = os.path.join(
                     proc_info["profile_artifact_dir"],
