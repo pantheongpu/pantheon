@@ -387,6 +387,125 @@ def filter_supported_profile_metrics(platform_name, tools, gpu_id, requested_met
     return supported, skipped, "validated"
 
 
+HIP_COUNTER_PROBE_SOURCE = r"""
+#include <hip/hip_runtime.h>
+#include <cstdlib>
+__global__ void pantheon_probe_kernel(int *out) { out[threadIdx.x] = (int)threadIdx.x; }
+int main(int argc, char **argv) {
+    int device = argc > 1 ? atoi(argv[1]) : 0;
+    if (hipSetDevice(device) != hipSuccess) return 2;
+    int *out = nullptr;
+    if (hipMalloc(&out, 64 * sizeof(int)) != hipSuccess) return 3;
+    for (int i = 0; i < 4; ++i) hipLaunchKernelGGL(pantheon_probe_kernel, dim3(1), dim3(64), 0, 0, out);
+    if (hipDeviceSynchronize() != hipSuccess) return 4;
+    hipFree(out);
+    return 0;
+}
+"""
+
+HIP_COUNTER_PROBE_TIMEOUT_S = 40
+HIP_COUNTER_PROBE_CANDIDATES = 2
+
+
+def _hip_probe_cache_file():
+    return os.path.join(BUILD_DIR, "hip_counter_probe.json")
+
+
+def _hip_probe_cache_key(tool, gpu_id):
+    """One answer per GPU architecture and profiler version: counter support is a property of that pair."""
+    arch = ""
+    try:
+        enumerator = find_tool("amdgpu-arch")
+        if enumerator:
+            lines = subprocess.check_output([enumerator], encoding="utf-8", stderr=subprocess.DEVNULL, timeout=20).split()
+            ordinal = device_ordinal(gpu_id)
+            arch = lines[ordinal] if 0 <= ordinal < len(lines) else ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        arch = ""
+    return f"{arch}|{tool_version(tool)}"
+
+
+def _hip_probe_binary(artifact_dir):
+    """Compile the one-kernel probe next to the build cache (once per cache), or return None if hipcc cannot."""
+    hipcc = find_tool("hipcc")
+    if not hipcc:
+        return None
+    probe_dir = os.path.join(BUILD_DIR, "counter_probe")
+    ensure_dir(probe_dir)
+    binary = os.path.join(probe_dir, "probe")
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        return binary
+    source = os.path.join(probe_dir, "probe.cpp")
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write(HIP_COUNTER_PROBE_SOURCE)
+    result = subprocess.run([hipcc, "-O1", "--offload-arch=native", source, "-o", binary],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
+    return binary if result.returncode == 0 and os.path.isfile(binary) else None
+
+
+def probe_hip_counter_collection(tools, gpu_id, metrics, workload_env=None, artifact_dir=None):
+    """Can rocprofv3 collect hardware counters on this GPU at all? Returns (works, reason).
+
+    rocprofiler-sdk 1.1.0 (ROCm 7.2) aborts with std::out_of_range on the first kernel dispatch of an RDNA2 card
+    (gfx1030/gfx1031) for every counter, and the profiled workload then spins on the CPU forever: a --profile run never
+    ends and, because profile runs have no watchdog, nothing stops it. A one-kernel program run under the same
+    rocprofv3 with a hard timeout finds that out in seconds. The answer is cached per architecture and profiler version.
+    """
+    tool = tools.get("counter")
+    if not tool:
+        return False, "rocprofv3 not found"
+    cache_file = _hip_probe_cache_file()
+    key = _hip_probe_cache_key(tool, gpu_id)
+    try:
+        with open(cache_file, "r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, ValueError):
+        cache = {}
+    if isinstance(cache.get(key), dict) and "ok" in cache[key]:
+        return bool(cache[key]["ok"]), cache[key].get("reason", "")
+
+    binary = _hip_probe_binary(artifact_dir)
+    if not binary:
+        # No compiler to build the probe with: do not guess, leave the counter pass as it was.
+        return True, "counter probe could not be built (hipcc unavailable); counters not pre-checked"
+    reasons = []
+    works = False
+    for metric in list(metrics)[:HIP_COUNTER_PROBE_CANDIDATES]:
+        out_dir = tempfile.mkdtemp(prefix="pantheon-counter-probe-")
+        try:
+            command = [tool, "--pmc", metric, "--output-format", "csv", "-d", out_dir, "--", binary, str(device_ordinal(gpu_id))]
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                    start_new_session=True, env=workload_env)
+            try:
+                stdout, stderr = proc.communicate(timeout=HIP_COUNTER_PROBE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                reasons.append(f"{metric}: no result within {HIP_COUNTER_PROBE_TIMEOUT_S}s (the profiled program hung)")
+                continue
+            collected = [path for path in glob.glob(os.path.join(out_dir, "**", "*counter_collection*.csv"), recursive=True)
+                         if os.path.getsize(path) > 0]
+            if proc.returncode == 0 and collected:
+                works = True
+                break
+            detail = ((stderr or "") + (stdout or "")).strip().splitlines()
+            tail = next((line for line in reversed(detail) if "what()" in line or "error" in line.lower()), "")
+            reasons.append(f"{metric}: exit code {proc.returncode}" + (f" ({tail.strip()[:120]})" if tail else ""))
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
+    reason = "" if works else "; ".join(reasons) or "no counter could be collected"
+    cache[key] = {"ok": works, "reason": reason}
+    try:
+        with open(cache_file, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, indent=2, sort_keys=True)
+    except OSError:
+        pass
+    return works, reason
+
+
 def write_profile_manifest(path, payload):
     payload = dict(payload)
     payload["generated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -2809,6 +2928,18 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
             profile_metrics, skipped_metrics, metric_validation = filter_supported_profile_metrics(
                 platform, profile_tools, gpu, requested_metrics,
             )
+            counters_unavailable = ""
+            if platform == "HIP":
+                counters_work, counters_unavailable = probe_hip_counter_collection(
+                    profile_tools, gpu, profile_metrics, workload_env=workload_env,
+                )
+                if not counters_work:
+                    skipped_metrics = list(requested_metrics)
+                    profile_metrics = []
+                    metric_validation = f"counters unavailable on this GPU: {counters_unavailable}"
+                    tprint(f"[WARNING] Hardware counters cannot be collected on GPU {gpu} with {os.path.basename(profile_tools['counter'])} "
+                           f"({tool_version(profile_tools['counter'])}): {counters_unavailable}. "
+                           "--profile continues with a runtime trace and the clean telemetry pass only.")
             artifact_dir, manifest_path, _ = create_profile_manifest(
                 run_dir, test_name, gpu, platform, profile_tools, requested_metrics, workload_cmd,
                 supported_metrics=profile_metrics,
@@ -2817,7 +2948,15 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
             )
             profiler = platform
             log(f"Collecting exhaustive {platform} counters for {test_name} on GPU {gpu}...")
-            cmd = build_counter_command(platform, profile_tools, profile_metrics, artifact_dir, workload_cmd)
+            if counters_unavailable and not profile_metrics:
+                # No counter pass is possible, so the first run is a one-second run under a runtime trace (kernel, HIP API and allocation
+                # trace, which rocprofv3 can do on these cards); the clean telemetry pass that follows carries the measurements.
+                trace_dir = os.path.join(artifact_dir, "rocprof")
+                ensure_dir(trace_dir)
+                cmd = [profile_tools["counter"], "--runtime-trace", "--output-format", "csv", "-d", trace_dir, "--",
+                       binary, str(ordinal), "1", str(mem_pct)] + config["args"] + (["--verify"] if verify else [])
+            else:
+                cmd = build_counter_command(platform, profile_tools, profile_metrics, artifact_dir, workload_cmd)
             trace_cmd = build_trace_command(platform, profile_tools, artifact_dir, workload_cmd)
 
         device_note = "" if ordinal == gpu else f", device {ordinal} to the workload"
@@ -3912,6 +4051,9 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
                 csv_path = extract_profiler_data(component_name, gpu, proc_info["profile_artifact_dir"])
                 if csv_path:
                     proc_info["profile_files"].append(csv_path)
+                if not proc_info["profile_metrics"]:
+                    # No counters were collected (see probe_hip_counter_collection): the runtime trace of the short first run is the profiler output.
+                    proc_info["trace_files"] = collect_trace_artifacts(proc_info["profile_artifact_dir"])
             elif proc_info["profiler"] == "CUDA":
                 csv_path = os.path.join(
                     proc_info["profile_artifact_dir"],

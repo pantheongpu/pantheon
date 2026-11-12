@@ -828,6 +828,119 @@ def test_profiled_workloads_disable_the_normal_watchdog(tmp_path, monkeypatch):
     assert observed_timeouts == [None]
 
 
+def _probe_setup(tmp_path, monkeypatch, behaviour):
+    """Common stubs for probe_hip_counter_collection: a fake probe binary and a fake rocprofv3 process."""
+    import subprocess as sp
+    monkeypatch.setattr(pantheon, "BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(pantheon, "_hip_probe_binary", lambda _dir: str(tmp_path / "probe"))
+    monkeypatch.setattr(pantheon, "_hip_probe_cache_key", lambda _tool, _gpu: "gfx1030|rocprofv3 1.1.0")
+    monkeypatch.setattr(pantheon, "device_ordinal", lambda gpu: gpu)
+    launched = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command, **_kwargs):
+            launched.append(command)
+            self.out_dir = command[command.index("-d") + 1]
+
+        def communicate(self, timeout=None):
+            return behaviour(self, timeout)
+
+    monkeypatch.setattr(pantheon.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(pantheon, "terminate_process_tree", lambda _proc: None)
+    return launched, sp
+
+
+def test_hip_counter_probe_reports_working_counters(tmp_path, monkeypatch):
+    def works(proc, _timeout):
+        os.makedirs(os.path.join(proc.out_dir, "host"), exist_ok=True)
+        (Path(proc.out_dir) / "host" / "1_counter_collection.csv").write_text("Counter_Name,Counter_Value\nGRBM_COUNT,5\n")
+        return "", ""
+
+    launched, _ = _probe_setup(tmp_path, monkeypatch, works)
+    assert pantheon.probe_hip_counter_collection({"counter": "/opt/rocm/bin/rocprofv3"}, 0, ["GRBM_COUNT", "SQ_WAVES"]) == (True, "")
+    assert launched[0][:3] == ["/opt/rocm/bin/rocprofv3", "--pmc", "GRBM_COUNT"]
+
+
+def test_hip_counter_probe_catches_a_profiled_program_that_never_ends(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    def hangs(_proc, _timeout):
+        raise sp.TimeoutExpired("rocprofv3", 40)
+
+    launched, _ = _probe_setup(tmp_path, monkeypatch, hangs)
+    ok, reason = pantheon.probe_hip_counter_collection({"counter": "/opt/rocm/bin/rocprofv3"}, 0, ["GRBM_COUNT", "SQ_WAVES", "TA_BUSY_avr"])
+    assert ok is False
+    assert "GRBM_COUNT" in reason and "hung" in reason
+    # two candidates are tried, not every counter of the list
+    assert len(launched) == pantheon.HIP_COUNTER_PROBE_CANDIDATES
+
+
+def test_hip_counter_probe_reports_a_crash_with_its_message(tmp_path, monkeypatch):
+    def crashes(proc, _timeout):
+        proc.returncode = 134
+        return "", "terminate called after throwing an instance of 'std::out_of_range'\n  what():  unordered_map::at\n"
+
+    _probe_setup(tmp_path, monkeypatch, crashes)
+    ok, reason = pantheon.probe_hip_counter_collection({"counter": "/opt/rocm/bin/rocprofv3"}, 0, ["GRBM_COUNT"])
+    assert ok is False
+    assert "exit code 134" in reason and "unordered_map::at" in reason
+
+
+def test_hip_counter_probe_answer_is_cached_per_architecture_and_profiler(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    def hangs(_proc, _timeout):
+        raise sp.TimeoutExpired("rocprofv3", 40)
+
+    launched, _ = _probe_setup(tmp_path, monkeypatch, hangs)
+    tools = {"counter": "/opt/rocm/bin/rocprofv3"}
+    first = pantheon.probe_hip_counter_collection(tools, 0, ["GRBM_COUNT"])
+    second = pantheon.probe_hip_counter_collection(tools, 0, ["GRBM_COUNT"])
+    assert first == second and first[0] is False
+    assert len(launched) == 1                   # the second answer came from hip_counter_probe.json
+    # another architecture or profiler version is probed again
+    monkeypatch.setattr(pantheon, "_hip_probe_cache_key", lambda _tool, _gpu: "gfx942|rocprofv3 1.1.0")
+    pantheon.probe_hip_counter_collection(tools, 0, ["GRBM_COUNT"])
+    assert len(launched) == 2
+
+
+def test_hip_counter_probe_does_not_block_profiling_when_it_cannot_be_built(tmp_path, monkeypatch):
+    monkeypatch.setattr(pantheon, "BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(pantheon, "_hip_probe_binary", lambda _dir: None)
+    monkeypatch.setattr(pantheon, "_hip_probe_cache_key", lambda _tool, _gpu: "gfx942|rocprofv3 1.1.0")
+    ok, note = pantheon.probe_hip_counter_collection({"counter": "/opt/rocm/bin/rocprofv3"}, 0, ["GRBM_COUNT"])
+    assert ok is True and "not pre-checked" in note
+
+
+def test_profile_without_collectable_counters_skips_the_counter_pass_instead_of_hanging(tmp_path, monkeypatch, capsys):
+    executable = tmp_path / "quiet"
+    executable.write_text("#!/usr/bin/env python3\nprint('Throughput: 1.0 GB/s')\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(pantheon, "BUILD_DIR", str(tmp_path))
+    monkeypatch.setattr(pantheon, "TEST_REGISTRY", {"quiet": {"bin": "quiet", "args": [], "desc": "Quiet"}})
+    monkeypatch.setattr(pantheon, "discover_profile_tools", lambda _platform: {"counter": "/bin/true", "trace": "/bin/true"})
+    monkeypatch.setattr(pantheon, "filter_supported_profile_metrics", lambda *_args: (["SQ_WAVES"], [], "validated"))
+    monkeypatch.setattr(pantheon, "probe_hip_counter_collection", lambda *_args, **_kwargs: (False, "SQ_WAVES: exit code 134"))
+    counter_commands = []
+    monkeypatch.setattr(pantheon, "build_counter_command", lambda *args: counter_commands.append(args) or ["/bin/false"])
+    monkeypatch.setattr(pantheon, "build_trace_command", lambda *_args: [])
+    monkeypatch.setattr(pantheon, "device_ordinal", lambda gpu: gpu)
+
+    procs = pantheon.run_test("quiet", [0], 300, 45, "HIP", str(tmp_path), profile=True)
+
+    assert counter_commands == []                                   # no rocprofv3 --pmc run
+    assert procs[0]["profile_metrics"] == []
+    first_run = procs[0]["profile_cmd"].split()
+    assert "--pmc" not in first_run and "--runtime-trace" in first_run                # a runtime trace, no counters
+    assert first_run[first_run.index("--") + 1:][:3] == [str(executable), "0", "1"]    # of a one-second run
+    manifest = json.loads(Path(procs[0]["profile_manifest"]).read_text())
+    assert manifest["metric_validation"].startswith("counters unavailable on this GPU")
+    assert manifest["supported_metrics"] == [] and manifest["skipped_metrics"] == pantheon.get_profile_metrics("HIP")
+    assert "[WARNING] Hardware counters cannot be collected on GPU 0" in capsys.readouterr().out
+
+
 def test_normal_workload_writes_ras_report_without_profile(tmp_path, monkeypatch):
     executable = tmp_path / "quiet"
     executable.write_text("#!/usr/bin/env python3\nprint('Throughput: 1.0 GB/s')\n", encoding="utf-8")
