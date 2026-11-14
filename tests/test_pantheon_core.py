@@ -3531,7 +3531,7 @@ def test_clocks_are_released_when_the_counter_pass_was_stopped_by_a_signal(monke
     calls = _record_smi(monkeypatch)
     lines = pantheon.release_profiler_clocks(_stopped_profiler(returncode))
     assert calls == [["nvidia-smi", "-i", "3", "-rgc"], ["nvidia-smi", "-i", "3", "-rmc"]]
-    assert len(lines) == 1 and "released the clock lock" in lines[0] and "GPU 3" in lines[0]
+    assert len(lines) == 1 and "reset the GPU clocks" in lines[0] and "GPU 3" in lines[0]
 
 
 @pytest.mark.parametrize("returncode", [0, 1, 2, None])

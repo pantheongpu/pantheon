@@ -2886,11 +2886,12 @@ def cuda_clock_control():
 
 
 def release_profiler_clocks(proc_info):
-    """Unlock the GPU clocks that a killed Nsight Compute left locked at base. Returns the lines to show.
+    """Reset the GPU clocks after a counter pass that Nsight Compute did not get to finish. Returns the lines to show.
 
-    ncu unlocks the clocks as it exits, so a counter pass that was stopped by a signal (Ctrl-C, a timeout, a watchdog, SIGKILL) can leave
-    the card at base clock, and every later workload, and the clean telemetry pass that carries the score, then runs slower than the card
-    can go. A pass that ended by itself, even with an error, has been unlocked by ncu already. With PANTHEON_CUDA_CLOCK_CONTROL=none
+    ncu locks the clocks to base while it profiles and unlocks them as it exits, so a counter pass that was stopped by a signal (Ctrl-C, a
+    timeout, a watchdog, SIGKILL) could leave the card at base clock, and every later workload, and the clean telemetry pass that carries the
+    score, would then run slower than the card can go. The reset is a precaution: it is harmless on a card that is not locked, and a SIGKILL
+    of ncu on a Tesla T4 was not seen to leave a lock (see the pull request). A pass that ended by itself, even with an error, is left alone. With PANTHEON_CUDA_CLOCK_CONTROL=none
     ncu never locked anything, so nothing is released: the lock on the card is the user's own.
     """
     proc = proc_info.get("process")
@@ -2918,11 +2919,11 @@ def release_profiler_clocks(proc_info):
             failed.append(detail or "nvidia-smi failed")
     if failed:
         lines.append(
-            f"[WARNING] Nsight Compute was stopped on GPU {gpu} and may have left the clocks locked at base; releasing them failed "
+            f"[WARNING] Nsight Compute was stopped on GPU {gpu} and may have left the clocks locked at base; resetting them failed "
             f"({failed[0]}). Run `sudo nvidia-smi -i {gpu} -rgc` before measuring anything else on this card."
         )
     else:
-        lines.append(f"[PANTHEON] Nsight Compute was stopped on GPU {gpu}; released the clock lock it left at base.")
+        lines.append(f"[PANTHEON] Nsight Compute was stopped on GPU {gpu}; reset the GPU clocks (nvidia-smi -rgc, -rmc) in case it left them locked at base.")
     return lines
 
 
