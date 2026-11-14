@@ -60,25 +60,61 @@ except ImportError:
 # --- GLOBAL PROCESS TRACKER (For Cleanup) ---
 ACTIVE_PROCS = []
 
-def terminate_process_tree(proc):
-    """Kill a launched process and everything it spawned.
+# Seconds a process gets to exit after SIGTERM before its group is killed outright. A profiler gets longer: Nsight Compute locks the
+# GPU clocks to base for the counter pass and unlocks them as it exits, which a SIGKILL never lets it do.
+PROCESS_STOP_GRACE_S = 5
+PROFILER_STOP_GRACE_S = 20
+
+
+def terminate_process_tree(proc, grace=None):
+    """Stop a launched process and everything it spawned.
 
     Under --profile the launched process is the profiler (ncu, nsys, rocprofv3)
     and the GPU workload is its child. Killing only the profiler orphans the
-    workload, which keeps saturating the GPU with nothing left watching it.
+    workload, which keeps saturating the GPU with nothing watching it.
     Each process is started in its own session, so the whole group can go at
     once.
+
+    The group gets SIGTERM first and `grace` seconds (the process's own
+    `stop_grace`, set at launch, when not given) to exit, so a profiler can
+    undo what it changed on the GPU; whatever is left is then killed.
     """
     if proc is None or proc.poll() is not None:
         return
+    if grace is None:
+        grace = getattr(proc, "stop_grace", PROCESS_STOP_GRACE_S)
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError, OSError):
-        # No process group (or already gone) -- fall back to the direct child.
+        pgid = None
+
+    def send(sig):
         try:
-            proc.kill()
-        except OSError:
-            pass
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            elif sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
+            # Already gone, or no group to signal: fall back to the direct child.
+            if sig == signal.SIGKILL:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+    if grace and grace > 0:
+        send(signal.SIGTERM)
+        deadline = time.time() + grace
+        while proc.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+    # The leader may be gone while a child still holds the GPU.
+    send(signal.SIGKILL)
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
 
 
 def cleanup_zombies():
@@ -2793,6 +2829,31 @@ def parse_profile_metric_list(raw_value):
     return metrics
 
 
+# Workloads that cannot finish a counter pass, and why. Each reason is what was seen, not a guess at the cause.
+PROFILE_UNSUPPORTED = {
+    "CUDA": {
+        "scheduler": "scheduler does not finish under Nsight Compute (every counter pass of it on seven NVIDIA cards was killed after 720 s). "
+                     "Run it without --profile; PANTHEON_PROFILE_ALL=1 makes --profile try it anyway.",
+    },
+}
+
+
+def profile_skip_reason(test_name, platform_name):
+    """Why --profile does not run this workload on this platform, or "" when it does."""
+    if os.environ.get("PANTHEON_PROFILE_ALL", "").strip().lower() in ("1", "true", "yes"):
+        return ""
+    return PROFILE_UNSUPPORTED.get(platform_name, {}).get(test_name, "")
+
+
+def build_profile_skip_row(test_name, gpu, duration, mem_pct, reason):
+    """The report row of a workload that --profile does not run: a skip, which is not a pass and not a failure."""
+    row = build_result_row(test_name, gpu, duration, mem_pct, 0.0, "SKIP", {}, status="SKIP")
+    row["Skip Reason"] = reason
+    row["RAS Status"] = "NOT RUN"
+    row["RAS Error Delta"] = "Workload did not start"
+    return row
+
+
 def get_profile_metrics(platform_name):
     if platform_name == "CUDA":
         override = os.environ.get("PANTHEON_CUDA_METRICS", "").strip()
@@ -2811,14 +2872,70 @@ def get_profile_metrics(platform_name):
     return []
 
 
+CUDA_CLOCK_CONTROL_ENV = "PANTHEON_CUDA_CLOCK_CONTROL"
+
+
+def cuda_clock_control():
+    """How Nsight Compute treats the GPU clocks during the counter pass: "base" or "none".
+
+    "base" is ncu's own default: it locks the clocks to the base clock so counters are repeatable, and unlocks them when it exits.
+    "none" (PANTHEON_CUDA_CLOCK_CONTROL=none) leaves the clocks alone, for a GPU whose clocks were locked on purpose with
+    nvidia-smi -lgc. Any other value means "base".
+    """
+    return "none" if os.environ.get(CUDA_CLOCK_CONTROL_ENV, "").strip().lower() == "none" else "base"
+
+
+def release_profiler_clocks(proc_info):
+    """Reset the GPU clocks after a counter pass that Nsight Compute did not get to finish. Returns the lines to show.
+
+    ncu locks the clocks to base while it profiles and unlocks them as it exits, so a counter pass that was stopped by a signal (Ctrl-C, a
+    timeout, a watchdog, SIGKILL) could leave the card at base clock, and every later workload, and the clean telemetry pass that carries the
+    score, would then run slower than the card can go. The reset is a precaution: it is harmless on a card that is not locked, and a SIGKILL
+    of ncu on a Tesla T4 was not seen to leave a lock (see the pull request). A pass that ended by itself, even with an error, is left alone. With PANTHEON_CUDA_CLOCK_CONTROL=none
+    ncu never locked anything, so nothing is released: the lock on the card is the user's own.
+    """
+    proc = proc_info.get("process")
+    if proc_info.get("profiler") != "CUDA" or proc is None or cuda_clock_control() != "base":
+        return []
+    returncode = proc.poll()
+    # Killed by a signal (negative), or exited with the status a program conventionally returns after catching SIGINT or SIGTERM.
+    if returncode is None or not (returncode < 0 or returncode in (128 + int(signal.SIGINT), 128 + int(signal.SIGTERM))):
+        return []
+    gpu = proc_info["gpu"]
+    lines = []
+    failed = []
+    for flag, what in (("-rgc", "graphics"), ("-rmc", "memory")):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "-i", str(gpu), flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=30, check=False,
+            )
+            detail = " ".join(((result.stdout or "") + " " + (result.stderr or "")).split())
+            ok = result.returncode == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail, ok = str(exc), False
+        # Not every card can lock its memory clock, so only the graphics clock decides whether this worked.
+        if not ok and flag == "-rgc":
+            failed.append(detail or "nvidia-smi failed")
+    if failed:
+        lines.append(
+            f"[WARNING] Nsight Compute was stopped on GPU {gpu} and may have left the clocks locked at base; resetting them failed "
+            f"({failed[0]}). Run `sudo nvidia-smi -i {gpu} -rgc` before measuring anything else on this card."
+        )
+    else:
+        lines.append(f"[PANTHEON] Nsight Compute was stopped on GPU {gpu}; reset the GPU clocks (nvidia-smi -rgc, -rmc) in case it left them locked at base.")
+    return lines
+
+
 def build_counter_command(platform_name, tools, metrics, artifact_dir, workload_cmd):
     """Build the exhaustive counter collection pass for one workload/GPU."""
     if platform_name == "CUDA":
         # Do not limit launch count: --profile is deliberately exhaustive.
+        clock_control = ["--clock-control", "none"] if cuda_clock_control() == "none" else []
         return [
             tools["counter"], "--csv", "--set", CUDA_PROFILE_ANALYSIS_SET,
             "--metrics", ",".join(metrics),
-        ] + workload_cmd
+        ] + clock_control + workload_cmd
     if platform_name == "HIP":
         counter_dir = os.path.join(artifact_dir, "rocprof")
         ensure_dir(counter_dir)
@@ -2989,6 +3106,7 @@ def run_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, profile=F
                 "output_thread": None,
             })
             continue
+        p.stop_grace = PROFILER_STOP_GRACE_S if profiler else PROCESS_STOP_GRACE_S
         proc_info = {
             "gpu": gpu,
             "process": p,
@@ -3993,6 +4111,9 @@ def execute_test(test_name, gpu_ids, duration, mem_pct, platform, run_dir, monit
         raise
     finally:
         hw_stats = monitor.stop_collection()
+        for proc_info in procs:
+            for line in release_profiler_clocks(proc_info):
+                tprint(line)
 
     telemetry_outputs = {}
     if profile:
@@ -4385,6 +4506,18 @@ def main():
                 timestamp_str, incremental_sequence,
             )
             log(f"--- SKIPPED TEST: {test.upper()} (compile failure) ---\n")
+            continue
+
+        skip_reason = profile_skip_reason(test, platform) if args.profile else ""
+        if skip_reason:
+            tprint(f"[SKIP] {test}: {skip_reason}")
+            skip_rows = [build_profile_skip_row(test, gpu, args.duration, args.mem, skip_reason) for gpu in target_gpus]
+            final_results.extend(skip_rows)
+            incremental_sequence += 1
+            write_incremental_workload_reports(
+                incremental_snapshot, skip_rows, timestamp_str, incremental_sequence,
+            )
+            log(f"--- SKIPPED TEST: {test.upper()} (not profiled) ---\n")
             continue
 
         gpu_batches = [[gpu] for gpu in target_gpus] if args.profile else [target_gpus]
