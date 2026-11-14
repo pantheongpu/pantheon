@@ -2,6 +2,7 @@ import ctypes
 import os
 import re
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -3456,3 +3457,224 @@ def test_new_columns_stay_out_of_the_console_summary_table():
     hidden = source.split("cols_to_hide = [", 1)[1].split("]", 1)[0]
     for column in NEW_ROW_COLUMNS:
         assert f'"{column}"' in hidden, column
+
+
+# --- clocks and workloads under --profile ------------------------------------------
+
+def _stopped_profiler(returncode, profiler="CUDA", gpu=3):
+    class Proc:
+        def poll(self):
+            return returncode
+    return {"gpu": gpu, "process": Proc(), "profiler": profiler}
+
+
+def _record_smi(monkeypatch, results=None):
+    """Replace subprocess.run in pantheon with a recorder; `results` maps an nvidia-smi flag to (returncode, stderr)."""
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        code, err = (results or {}).get(cmd[-1], (0, ""))
+        return pantheon.subprocess.CompletedProcess(cmd, code, stdout="", stderr=err)
+
+    monkeypatch.setattr(pantheon.subprocess, "run", fake_run)
+    return calls
+
+
+def test_terminate_process_tree_gives_a_process_the_chance_to_clean_up_first(tmp_path):
+    """Nsight Compute unlocks the GPU clocks as it exits. SIGKILL never lets it."""
+    import signal as _signal
+    marker = tmp_path / "restored"
+    proc = pantheon.subprocess.Popen(
+        ["sh", "-c", f"trap 'echo done > {marker}; exit 0' TERM; sleep 37 & wait"], start_new_session=True)
+    try:
+        time.sleep(0.5)
+        pgid = os.getpgid(proc.pid)
+        pantheon.terminate_process_tree(proc, grace=10)
+        assert marker.exists(), "the process was killed before it could run its SIGTERM handler"
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+    finally:
+        if proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+
+
+def test_terminate_process_tree_kills_a_process_that_ignores_sigterm_once_the_grace_is_over():
+    import signal as _signal
+    proc = pantheon.subprocess.Popen(["sh", "-c", "trap '' TERM; sleep 37 & wait"], start_new_session=True)
+    # The grace comes from the process itself, which is how a launched profiler gets a longer one.
+    proc.stop_grace = 1
+    try:
+        time.sleep(0.5)
+        pgid = os.getpgid(proc.pid)
+        started = time.time()
+        pantheon.terminate_process_tree(proc)
+        assert proc.poll() is not None
+        assert 0.9 <= time.time() - started < 8
+        time.sleep(0.3)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pgid, 0)
+    finally:
+        if proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+
+
+def test_a_profiler_gets_longer_to_stop_than_a_workload():
+    assert pantheon.PROFILER_STOP_GRACE_S > pantheon.PROCESS_STOP_GRACE_S > 0
+    source = (Path(pantheon.__file__).parent / "pantheon.py").read_text(encoding="utf-8")
+    assert "p.stop_grace = PROFILER_STOP_GRACE_S if profiler else PROCESS_STOP_GRACE_S" in source
+
+
+@pytest.mark.parametrize("returncode", [-9, -15, 130, 143])
+def test_clocks_are_released_when_the_counter_pass_was_stopped_by_a_signal(monkeypatch, returncode):
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    calls = _record_smi(monkeypatch)
+    lines = pantheon.release_profiler_clocks(_stopped_profiler(returncode))
+    assert calls == [["nvidia-smi", "-i", "3", "-rgc"], ["nvidia-smi", "-i", "3", "-rmc"]]
+    assert len(lines) == 1 and "released the clock lock" in lines[0] and "GPU 3" in lines[0]
+
+
+@pytest.mark.parametrize("returncode", [0, 1, 2, None])
+def test_clocks_are_left_alone_when_the_counter_pass_ended_by_itself_or_is_still_running(monkeypatch, returncode):
+    # ncu unlocks as it exits, also when it exits with an error; a pass still running has nothing to release yet.
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    calls = _record_smi(monkeypatch)
+    assert pantheon.release_profiler_clocks(_stopped_profiler(returncode)) == []
+    assert calls == []
+
+
+def test_clocks_are_never_touched_when_the_user_locked_them_for_the_profile(monkeypatch):
+    monkeypatch.setenv("PANTHEON_CUDA_CLOCK_CONTROL", "none")
+    calls = _record_smi(monkeypatch)
+    assert pantheon.release_profiler_clocks(_stopped_profiler(-9)) == []
+    assert calls == []
+
+
+def test_clocks_are_not_released_for_a_profiler_that_never_locks_them(monkeypatch):
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    calls = _record_smi(monkeypatch)
+    assert pantheon.release_profiler_clocks(_stopped_profiler(-9, profiler="HIP")) == []
+    assert pantheon.release_profiler_clocks({"gpu": 0, "process": None, "profiler": "CUDA"}) == []
+    assert pantheon.release_profiler_clocks({"gpu": 0, "process": None, "profiler": None}) == []
+    assert calls == []
+
+
+def test_a_failed_release_tells_the_user_the_command_to_run(monkeypatch):
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    _record_smi(monkeypatch, {"-rgc": (255, "Insufficient Permissions")})
+    lines = pantheon.release_profiler_clocks(_stopped_profiler(-9, gpu=1))
+    assert len(lines) == 1
+    assert "[WARNING]" in lines[0] and "Insufficient Permissions" in lines[0] and "sudo nvidia-smi -i 1 -rgc" in lines[0]
+
+
+def test_a_card_that_cannot_lock_its_memory_clock_does_not_make_the_release_a_failure(monkeypatch):
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    _record_smi(monkeypatch, {"-rmc": (255, "Not Supported")})
+    lines = pantheon.release_profiler_clocks(_stopped_profiler(-9))
+    assert len(lines) == 1 and "[WARNING]" not in lines[0]
+
+
+def test_nvidia_smi_missing_or_hanging_does_not_break_the_run(monkeypatch):
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+
+    def broken(cmd, **_kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(pantheon.subprocess, "run", broken)
+    lines = pantheon.release_profiler_clocks(_stopped_profiler(-9))
+    assert len(lines) == 1 and "[WARNING]" in lines[0]
+
+    def hangs(cmd, **kwargs):
+        raise pantheon.subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(pantheon.subprocess, "run", hangs)
+    assert "[WARNING]" in pantheon.release_profiler_clocks(_stopped_profiler(-9))[0]
+
+
+def test_execute_test_releases_the_clocks_after_an_interrupted_counter_pass(monkeypatch, tmp_path):
+    """Ctrl-C or SIGTERM while ncu runs: the pass is stopped, and the card must not stay at base clock."""
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    killed = _stopped_profiler(-9, gpu=0)
+    killed.update({"test_name": "tensor_virus", "output_thread": None, "profile_files": [], "trace_cmd": [],
+                   "trace_files": [], "workload_cmd": "", "profile_cmd": "", "stdout": "", "stderr": ""})
+    calls = _record_smi(monkeypatch)
+
+    class Monitor:
+        def start_collection(self, *a, **k): pass
+        def stop_collection(self, *a, **k): return {}
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pantheon, "run_test", lambda *a, **k: [killed])
+    monkeypatch.setattr(pantheon, "wait_for_processes", interrupted)
+    monkeypatch.setattr(pantheon, "collect_ras_snapshot", lambda *a, **k: {})
+    monkeypatch.setattr(pantheon, "terminate_process_tree", lambda _proc: None)
+    with pytest.raises(KeyboardInterrupt):
+        pantheon.execute_test("tensor_virus", [0], 1, 10, "CUDA", str(tmp_path), Monitor(), profile=True)
+    assert ["nvidia-smi", "-i", "0", "-rgc"] in calls
+
+
+def test_ncu_gets_the_clock_control_the_user_asked_for(monkeypatch):
+    tools = {"counter": "/usr/local/cuda/bin/ncu"}
+    workload = ["/build/tensor_virus", "0", "30", "99"]
+    monkeypatch.delenv("PANTHEON_CUDA_CLOCK_CONTROL", raising=False)
+    default = pantheon.build_counter_command("CUDA", tools, ["m1"], "/tmp/x", workload)
+    assert "--clock-control" not in default and default[-4:] == workload
+
+    for value in ("none", "NONE", " none "):
+        monkeypatch.setenv("PANTHEON_CUDA_CLOCK_CONTROL", value)
+        cmd = pantheon.build_counter_command("CUDA", tools, ["m1"], "/tmp/x", workload)
+        assert cmd[cmd.index("--clock-control") + 1] == "none"
+        assert cmd[-4:] == workload, "the profiler options must come before the workload"
+
+    for value in ("base", "", "turbo"):
+        monkeypatch.setenv("PANTHEON_CUDA_CLOCK_CONTROL", value)
+        assert "--clock-control" not in pantheon.build_counter_command("CUDA", tools, ["m1"], "/tmp/x", workload)
+
+
+def test_scheduler_is_not_profiled_on_nvidia_and_says_why(monkeypatch):
+    monkeypatch.delenv("PANTHEON_PROFILE_ALL", raising=False)
+    reason = pantheon.profile_skip_reason("scheduler", "CUDA")
+    assert "Nsight Compute" in reason and "PANTHEON_PROFILE_ALL=1" in reason
+    assert pantheon.profile_skip_reason("scheduler", "HIP") == ""
+    assert pantheon.profile_skip_reason("tensor_virus", "CUDA") == ""
+    for value in ("1", "true", "YES"):
+        monkeypatch.setenv("PANTHEON_PROFILE_ALL", value)
+        assert pantheon.profile_skip_reason("scheduler", "CUDA") == ""
+
+
+def test_the_profile_skip_row_is_a_skip_and_not_a_failure():
+    row = pantheon.build_profile_skip_row("scheduler", 2, 300, 45, "does not finish")
+    assert row["Status"] == "SKIP" and row["Unit"] == "SKIP" and row["Score"] == 0.0
+    assert row["Skip Reason"] == "does not finish" and row["GPU ID"] == 2
+    assert pantheon.is_skipped_row(row)
+    assert "Failure Stage" not in row
+
+
+def test_a_profile_run_skips_a_workload_that_cannot_be_profiled_and_carries_on(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PANTHEON_PROFILE_ALL", raising=False)
+    monkeypatch.setattr(pantheon.sys, "argv", ["pantheon.py", "--test", "baseline_metrics", "--duration", "1",
+                                               "--platform", "mock", "--profile"])
+    monkeypatch.setitem(pantheon.PROFILE_UNSUPPORTED, "MOCK", {"baseline_metrics": "does not finish under the profiler"})
+    ran = []
+
+    class Monitor:
+        def __init__(self, platform): pass
+        def get_gpu_count(self): return 1
+
+    monkeypatch.setattr(pantheon, "HardwareMonitor", Monitor)
+    monkeypatch.setattr(pantheon, "build_kernels", lambda platform: {})
+    monkeypatch.setattr(pantheon, "discover_profile_tools", lambda platform: {})
+    monkeypatch.setattr(pantheon, "validate_profile_tools", lambda platform, tools: None)
+    monkeypatch.setattr(pantheon, "execute_test", lambda *a, **k: ran.append(a[0]) or ([], False))
+    try:
+        pantheon.main()
+    except SystemExit as stopped:
+        assert stopped.code in (0, None)
+    assert ran == [], "a workload that does not finish under the profiler must not be launched under it"
+    reports = sorted((tmp_path / "database").glob("pantheon_report_*_0001_baseline_metrics_gpu0.json"))
+    assert len(reports) == 1, "the skip has to leave a report of its own, like any other result"
+    text = reports[0].read_text(encoding="utf-8")
+    assert '"Status": "SKIP"' in text and "does not finish under the profiler" in text

@@ -233,6 +233,32 @@ counter values. Pantheon refuses an explicit profile request when the required
 vendor tools are unavailable, instead of silently running without profiler
 artifacts.
 
+### Clocks and workloads under `--profile`
+
+Nsight Compute locks the GPU clocks to the base clock while it collects counters
+(`--clock-control base`, its default) and unlocks them when it exits. Counters
+are repeatable that way, and the clean telemetry pass that follows, which
+carries the score, runs at the clocks the card normally sustains. If the
+profiler is stopped by a signal (Ctrl-C, a timeout in a wrapper, `kill -9`) it
+cannot unlock them. Pantheon now stops a profiler with SIGTERM first and gives
+it 20 s, and if the counter pass still ended by a signal it runs
+`nvidia-smi -i <gpu> -rgc` and `-rmc` itself (this needs the same root access
+`--profile` already needs; when it fails Pantheon prints the command to run).
+
+If you lock the clocks yourself with `nvidia-smi -lgc` and want to profile at
+that clock, set `PANTHEON_CUDA_CLOCK_CONTROL=none`. Pantheon then passes
+`--clock-control none` to `ncu` and never touches the clocks:
+
+```bash
+sudo nvidia-smi -i 0 -lgc 1200,1200
+sudo PANTHEON_CUDA_CLOCK_CONTROL=none python3 pantheon.py --test tensor_virus --duration 30 --gpu 0 --profile
+```
+
+`scheduler` is skipped under `--profile` on NVIDIA and reported as `SKIP` with
+the reason: its counter pass does not finish under Nsight Compute. Run it without
+`--profile` for its score, or set `PANTHEON_PROFILE_ALL=1` to make `--profile`
+try it anyway.
+
 ### What a counter value describes
 
 `--profile` does not limit the profiler's launch count, so one capture holds
