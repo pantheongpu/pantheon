@@ -260,6 +260,28 @@ the reason: its counter pass does not finish under Nsight Compute. Run it withou
 `--profile` for its score, or set `PANTHEON_PROFILE_ALL=1` to make `--profile`
 try it anyway.
 
+### Recording a changed setting
+
+A card that is run at a locked graphics clock, a chosen memory clock level or any
+other setting away from how it ships gives results that describe the setting, not
+the card. A lowered power limit marks itself: the report records
+`power_limit_enforced` next to `power_limit_default`. A locked clock cannot be
+read back from the card (NVML has no query for it), so say what you did with
+`PANTHEON_RUN_SETTING`, and Pantheon writes the text into every report of the run
+as `run_setting`:
+
+```bash
+sudo nvidia-smi -i 0 -lgc 1200,1200
+sudo PANTHEON_CUDA_CLOCK_CONTROL=none PANTHEON_RUN_SETTING="graphics clock locked at 1200 MHz" \
+    python3 pantheon.py --test tensor_virus --duration 30 --gpu 0 --profile
+```
+
+It is what you declared, not what Pantheon measured; the clocks the run actually
+saw are in the same report (`Min Clock`, `Avg Clock`, `Max Clock`). Whitespace is
+collapsed and the text is cut at 200 characters. The website keeps a report with a
+`run_setting` off the leaderboard and marks it in the card's history. A report
+without the key ran at the settings the card shipped with.
+
 ### What a counter value describes
 
 `--profile` does not limit the profiler's launch count, so one capture holds

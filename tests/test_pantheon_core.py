@@ -3678,3 +3678,59 @@ def test_a_profile_run_skips_a_workload_that_cannot_be_profiled_and_carries_on(m
     assert len(reports) == 1, "the skip has to leave a report of its own, like any other result"
     text = reports[0].read_text(encoding="utf-8")
     assert '"Status": "SKIP"' in text and "does not finish under the profiler" in text
+
+
+# --- a declared setting (PANTHEON_RUN_SETTING) is written into the report ---------------------------------------------
+
+def test_run_setting_is_absent_unless_declared():
+    assert pantheon.run_setting({}) is None
+    assert pantheon.run_setting({"PANTHEON_RUN_SETTING": ""}) is None
+    assert pantheon.run_setting({"PANTHEON_RUN_SETTING": "  \t\n "}) is None
+
+
+def test_run_setting_keeps_the_words_and_cleans_the_rest():
+    env = {"PANTHEON_RUN_SETTING": "  graphics clock\tlocked at\n1200 MHz \x00\x1b[31m "}
+    # whitespace collapses to single spaces; control characters (NUL, the ESC of a colour code) are dropped
+    assert pantheon.run_setting(env) == "graphics clock locked at 1200 MHz [31m"
+    assert pantheon.run_setting({"PANTHEON_RUN_SETTING": "memory clock level 2"}) == "memory clock level 2"
+
+
+def test_run_setting_is_cut_at_the_limit_without_a_trailing_space():
+    text = "a" * 199 + " " + "b" * 50
+    cut = pantheon.run_setting({"PANTHEON_RUN_SETTING": text})
+    assert cut == "a" * 199 and len(cut) <= pantheon.RUN_SETTING_MAX_CHARS
+    assert len(pantheon.run_setting({"PANTHEON_RUN_SETTING": "x" * 1000})) == pantheon.RUN_SETTING_MAX_CHARS
+
+
+def test_run_setting_is_read_from_the_process_environment(monkeypatch):
+    monkeypatch.delenv("PANTHEON_RUN_SETTING", raising=False)
+    assert pantheon.run_setting() is None
+    monkeypatch.setenv("PANTHEON_RUN_SETTING", "power limit and clock lock")
+    assert pantheon.run_setting() == "power limit and clock lock"
+
+
+def test_snapshot_carries_the_declared_setting_and_only_then(monkeypatch):
+    monkeypatch.delenv("PANTHEON_RUN_SETTING", raising=False)
+    assert "run_setting" not in pantheon.get_system_snapshot("MOCK")
+
+    monkeypatch.setenv("PANTHEON_RUN_SETTING", "graphics clock locked at 1200 MHz")
+    assert pantheon.get_system_snapshot("MOCK")["run_setting"] == "graphics clock locked at 1200 MHz"
+
+
+def test_every_report_file_of_a_run_carries_the_declared_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr(pantheon, "DATABASE_DIR", str(tmp_path / "database"))
+    monkeypatch.setenv("PANTHEON_RUN_SETTING", "memory clock level 2")
+    rows = [{"Test Name": name, "GPU ID": 0, "Version": "1.2.5", "Score": 1.0, "Unit": "GB/s"}
+            for name in ("memory_read", "memory_write")]
+
+    pantheon.write_incremental_workload_reports(pantheon.get_system_snapshot("MOCK"), rows, "20261115-120000", 1)
+
+    reports = sorted((tmp_path / "database").glob("pantheon_report_*.json"))
+    assert len(reports) == 2
+    assert {json.loads(r.read_text(encoding="utf-8"))["run_setting"] for r in reports} == {"memory clock level 2"}
+
+
+def test_the_final_report_takes_its_setting_from_the_same_snapshot():
+    # Both the per-workload files and the final report are built by get_system_snapshot, so one declaration reaches both.
+    source = (Path(pantheon.__file__).resolve().parent / "pantheon.py").read_text(encoding="utf-8")
+    assert source.count("= get_system_snapshot(platform)") == 2

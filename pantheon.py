@@ -2267,6 +2267,26 @@ def get_toolkit_version(platform_name):
         except: pass
     return version
 
+RUN_SETTING_ENV = "PANTHEON_RUN_SETTING"
+RUN_SETTING_MAX_CHARS = 200
+
+
+def run_setting(environ=None):
+    """The setting the operator says the card is run at, or None.
+
+    A locked graphics clock (nvidia-smi -lgc), a chosen memory clock level or any other change of how the card is set cannot be read back
+    from the card: NVML has no query for a locked clock. So the operator declares it, in words, with PANTHEON_RUN_SETTING, and Pantheon writes
+    the text into every report of the run as "run_setting". It is what was declared, not what was measured; the clocks the run actually saw
+    are in the report next to it. A report without the key ran at the settings the card shipped with. A lowered power limit needs no
+    declaration: the report records the enforced and the default limit.
+
+    Whitespace is collapsed, control characters are dropped and the text is cut at RUN_SETTING_MAX_CHARS characters.
+    """
+    raw = (environ if environ is not None else os.environ).get(RUN_SETTING_ENV, "")
+    text = " ".join("".join(ch for ch in str(raw) if ch.isprintable() or ch.isspace()).split())
+    return text[:RUN_SETTING_MAX_CHARS].rstrip() or None
+
+
 def get_system_snapshot(platform_name):
     """Aggregates all system info into a dictionary.
 
@@ -2288,6 +2308,10 @@ def get_system_snapshot(platform_name):
         "gpu_static_info": visible_gpu_static_info(get_gpu_static_info(platform_name)),
         "toolkit_version": get_toolkit_version(platform_name)
     }
+
+    declared_setting = run_setting()
+    if declared_setting:
+        snapshot["run_setting"] = declared_setting
 
     if psutil:
         vm = psutil.virtual_memory()
@@ -4477,6 +4501,8 @@ def main():
     
     log(f"Run ID: {timestamp_str}")
     incremental_snapshot = get_system_snapshot(platform)
+    if incremental_snapshot.get("run_setting"):
+        log(f"Run setting declared with {RUN_SETTING_ENV} and written to every report: {incremental_snapshot['run_setting']}")
     incremental_sequence = 0
     interconnect_before = nvidia_interconnect_snapshot() if platform == "CUDA" else None
     interconnect_line = describe_interconnect(interconnect_before)
