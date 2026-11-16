@@ -1,5 +1,5 @@
-# Shows the "Sponsor" button on the repository. The pantheongpu organisation is
-# the GitHub Sponsors account; the funding.json manifest at
+# Shows the "Sponsor" button on the repository. The GitHub Sponsors account is
+# saqibkh (https://github.com/sponsors/saqibkh); the funding.json manifest at
 # https://pantheongpu.com/funding.json describes what the money is for.
-github: [pantheongpu]
+github: [saqibkh]
 custom: ["https://pantheongpu.com"]
